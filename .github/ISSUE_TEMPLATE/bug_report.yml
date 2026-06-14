@@ -1,0 +1,66 @@
+name: Bug report
+description: 报告一个 cc-fleet 的功能性 bug
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢报告 bug。请尽量按下列字段描述清楚，能帮助维护者快速复现与定位。
+        安全漏洞**请勿走公开 issue**，参见 [SECURITY.md](../../SECURITY.md)。
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境
+      description: 操作系统、Python 版本、cc-fleet 版本（commit 或 tag）、claude CLI 版本
+      placeholder: |
+        - 操作系统：macOS 14.5
+        - Python：3.11.7
+        - cc-fleet：commit abcdef
+        - claude code CLI：1.x.x
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 我们要怎么操作才能看到这个 bug？
+      placeholder: |
+        1. 启动主控
+        2. 在企微发 `@my-repo 加一行 readme`
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志
+      description: |
+        优先粘贴：
+        - `$log_dir/app.log` 末尾 50 行
+        - `$workspace_root/sessions/<slug>/stream.jsonl` 末尾几条事件（如已脱敏）
+        - 报错的 traceback
+      render: shell
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 其它上下文
+      description: 可选——你已经排查过什么、有什么猜测、相关 issue 链接

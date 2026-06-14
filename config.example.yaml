@@ -1,0 +1,136 @@
+# cc-fleet 配置示例
+# 复制本文件为 config.yaml，按需填入实际值；敏感字段通过环境变量注入
+
+# 主控运行时根目录：放 worktree、session 流式日志、SQLite 文件
+workspace_root: ~/cc-fleet-workspace
+
+# 应用日志目录
+log_dir: ~/Library/Logs/cc-fleet
+
+# SQLite 数据库路径（默认放 workspace_root 下）
+db_path: ~/cc-fleet-workspace/state.db
+
+# ── 聊天平台选择 ───────────────────────────────────────────
+# 支持 wecom（企业微信）/ wechat（个人微信 ilink）。默认 wecom，旧配置不加此字段自动视为 wecom。
+# 只需配置所选平台对应的那一段；未选用的平台段即使留着也会被忽略、不要求其环境变量。
+platform: wecom
+
+# 企业微信智能机器人凭据（建议通过环境变量注入，不要明文写在配置里）
+wecom:
+  bot_id: ${env:WECOM_BOT_ID}
+  bot_secret: ${env:WECOM_BOT_SECRET}
+  # 仅允许特定 chatid 触发；为空表示不限制
+  allowed_chatids: []
+
+# 个人微信（ilink ClawBot，腾讯官方个人号 Bot 协议）。启用时把上面 platform 改为 wechat。
+# bot_token 用 `cc-fleet wechat-login` 扫码获取后写进 .env（WECHAT_BOT_TOKEN）。
+# 注意官方限制：单聊 1:1、消息按纯文本渲染、机器人不能发文件给用户。
+# wechat:
+#   bot_token: ${env:WECHAT_BOT_TOKEN}
+#   # base_url 默认官方端点；若 wechat-login 返回的 baseurl 不同则填它
+#   base_url: https://ilinkai.weixin.qq.com
+#   # 仅允许特定微信用户(from_user_id)触发；为空表示不限制
+#   allowed_user_ids: []
+
+# coding agent 工具配置。每个工具一个配置块（与未来 codex / opencode 对称）；目前仅 claude。
+claude:
+  binary: claude              # Claude Code CLI 可执行名 / 路径
+
+# 交付流水线阶段参数（工具无关：plan / dev / review 是状态机阶段，对所有 agent 通用，不随工具重复）
+pipeline:
+  plan_timeout_sec: 1800      # plan 阶段单次调用最长 30 分钟
+  dev_timeout_sec: 3600       # dev 阶段单次调用最长 60 分钟
+  review_timeout_sec: 1800    # Reviewer 单次审查（plan/code）超时；仅启用 reviewer 的 repo 用得到
+  max_clarify_rounds: 5       # plan ↔ awaiting_user 最多来回轮数
+
+# 工作仓库清单（初次接入建议先只配 1 个）
+# 提 MR/PR 按代码托管平台分流，均无需额外安装 glab / gh 等 CLI：
+#   - GitLab：`git push -o merge_request.create ...`（origin 指向 GitLab 即可）
+#   - GitHub：先普通 push 再走 REST API 建 PR（需在 .env 配 GITHUB_TOKEN / GH_TOKEN）
+#
+# 每个仓库的 mode 字段决定生命周期：
+#   - mode: local  → path 是本地 git 仓库，主控建 worktree + 主控提 MR（默认）
+#   - mode: remote → path 仅是 claude code 启动的本地壳子目录（不必是 git 仓库），
+#                    真正代码与 worktree 都在远端；claude 自己 ssh 过去开发与提 MR
+#   - mode: docker → path 是本地 git 仓库（同 local），代码 bind-mount 进一个运行中的容器；
+#                    worktree / commit / 提 MR 全在主机，仅编译/运行经 claude `docker exec` 进容器
+#
+# platform 字段决定提 MR/PR 的方式（可省略，默认 auto）：
+#   - auto   → local 模式按 origin URL 自动探测（含 github.com → github，否则 gitlab）；
+#              remote 模式无法本地探测，回退 gitlab
+#   - gitlab → 走 push option 建 MR
+#   - github → 先 push 再走 REST API 建 PR；GitHub Enterprise（自有域名）必须显式配此项
+#
+# reviewer 字段（可选，默认关闭）：启用独立 Reviewer agent——plan 阶段审查 plan、
+# dev 阶段审查代码，Coder 据其意见完善。建议只对关键仓库开启（多 1~2 次 claude 调用）。
+#   - plan 审查：local / remote / docker 都生效
+#   - code 审查：local / remote / docker 都生效（remote 经 defer-push：dev 只 commit，审查通过后才单独 push + 建 MR；docker 同 local：主机 git diff）
+#   - 单需求覆盖：用户可在某条需求里用 [review]（本次强制开）/ [review:off]（本次强制关）
+#     临时覆盖这里的 enabled，只对该 session 生效，不改仓库默认。
+repos:
+  - name: demo-repo
+    aliases: [demo]
+    path: ~/workspace/demo-repo
+    default_branch: main
+    keywords: []
+    # agent: claude（默认，可省略；驱动本仓库 Coder 的 AI coding 工具）
+    # mode: local（默认，可省略）
+    # platform: auto（默认，可省略；GitHub 仓库会自动探测，无需手填）
+    # 可选：启用独立 Reviewer（默认关闭）
+    # reviewer:
+    #   enabled: true
+    #   max_rounds: 1           # 「审查→修订」轮次上限，默认 1；0 等价于关闭
+
+  # GitHub 仓库示例（origin 指向 github.com）
+  # - name: my-gh-repo
+  #   aliases: [ghdemo]
+  #   path: ~/workspace/my-gh-repo
+  #   default_branch: main
+  #   keywords: []
+  #   platform: github        # github.com 可省略（auto 能探测）；GitHub Enterprise 必填
+  #   # 另需在 .env 配 GITHUB_TOKEN（或 GH_TOKEN）
+
+  # 远端开发仓库示例（按你公司环境改）
+  # - name: my-project
+  #   aliases: [myproj]
+  #   path: ~/my-project                         # 本地壳子目录，不是 git 仓库
+  #   default_branch: main
+  #   keywords: [my-project]
+  #   mode: remote
+  #   remote_ssh_alias: dev01.example.com
+  #   remote_repo_path: /home/youruser/my-project
+  #   remote_worktree_root: /home/youruser/my-project-worktrees
+
+  # docker 模式仓库示例（代码在主机，编译/运行进容器）
+  # - name: my-docker-project
+  #   aliases: [dockerproj]
+  #   path: ~/workspace/my-docker-project        # 本地 git 仓库（同 local，必须含 .git）
+  #   default_branch: main
+  #   keywords: [my-docker-project]
+  #   mode: docker
+  #   docker_container: my-docker-project-dev    # 容器名/ID（cc-fleet 用它 inspect / exec）
+  #   # 可选 bind-mount 前缀对；省略则容器内路径同主机。挂载须同时覆盖 path 与其 -worktrees 兄弟目录
+  #   # （建议挂二者的公共父目录，如下例 ~/workspace → /workspace）。
+  #   docker_host_root: ~/workspace
+  #   docker_container_root: /workspace
+  #   # 可选：容器自动起停（同配或同不配）。配了则每个任务前自动起、跑完自动销毁；不配则需用户自行保持容器
+  #   # 运行。docker_start_command 可为 docker run / compose up 等任意命令；用 docker run 时 --name 须与
+  #   # docker_container 一致，末尾用 tail -f /dev/null 保活。详见 docs/docker-mode.md 的「快速上手」。
+  #   docker_start_command: 'docker run -d --name my-docker-project-dev -v ~/workspace:/workspace my-image tail -f /dev/null'
+  #   docker_stop_command: 'docker rm -f my-docker-project-dev'
+
+# 运行时上限：同时驱动的 session 数（含 awaiting_user_clarification）。
+# 超出会进队列，dispatch 立即回 "已加入 @<repo> 队列（前面 N 个）"；前一个进终态后自动放行。
+# awaiting 的 session 仍占槽位——避免恢复时再排队。
+limits:
+  max_concurrent_sessions: 4
+
+# 本地只读 HTTP 面板（浏览器查看 session 状态、claude 事件流）
+# 默认开启、仅 127.0.0.1、无鉴权；要关掉就把 enabled 设为 false
+http:
+  enabled: true
+  bind: 127.0.0.1
+  port: 8787
+
+# 终态 worktree 自动清理（小时）
+worktree_retention_hours: 168       # 7 天

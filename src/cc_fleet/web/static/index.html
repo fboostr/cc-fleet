@@ -1,0 +1,1458 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>cc-fleet 面板</title>
+  <style>
+    :root {
+      --bg: #0f1216;
+      --panel: #161b22;
+      --panel-2: #1c232c;
+      --border: #2a3240;
+      --fg: #d8dee9;
+      --fg-dim: #8a94a6;
+      --accent: #5ab0ff;
+      --ok: #8ed18a;
+      --warn: #d8a657;
+      --err: #e08585;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--fg); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Helvetica, Arial, "PingFang SC", "Microsoft Yahei", sans-serif; font-size: 13px; }
+    code, pre, .mono { font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; }
+    a { color: var(--accent); }
+    /* layout / col / body 上的 min-height: 0 与 overflow: hidden 解决经典
+       grid + flex column 嵌套下 overflow-y: auto 不裁切的问题——grid item 与
+       flex item 默认 min-size: auto 会被内容撑高，超长 events 会把 .col 推过
+       100vh，进而触发整页滚动条；显式归零后三栏各自的 .body 才能真正独立滚动。 */
+    .layout { display: grid; grid-template-columns: 340px 1fr 1fr; height: 100vh; overflow: hidden; }
+    .col { border-right: 1px solid var(--border); display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+    .col:last-child { border-right: none; }
+    .col header { padding: 10px 12px; border-bottom: 1px solid var(--border); background: var(--panel); }
+    .col header .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .col header h2 { margin: 0; font-size: 13px; font-weight: 600; }
+    .col header .meta { font-size: 11px; color: var(--fg-dim); }
+    .col header .tz { font-size: 10px; color: var(--fg-dim); margin-top: 2px; }
+    .col .body { flex: 1; min-height: 0; overflow-y: auto; }
+    .session-item { padding: 10px 12px; border-bottom: 1px solid var(--border); cursor: pointer; }
+    .session-item:hover { background: var(--panel); }
+    .session-item.active { background: var(--panel-2); border-left: 3px solid var(--accent); padding-left: 9px; }
+    .session-item .top { display: flex; justify-content: space-between; gap: 8px; }
+    .session-item .slug { font-weight: 600; font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12px; }
+    .session-item .repo { color: var(--fg-dim); font-size: 11px; }
+    .session-item .second { margin-top: 4px; display: flex; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--fg-dim); }
+    .badge { padding: 1px 6px; border-radius: 3px; font-size: 11px; }
+    .b-new, .b-planning { background: #2a3240; color: var(--accent); }
+    .b-awaiting_user_clarification { background: #3a2f1c; color: var(--warn); }
+    .b-developing, .b-mr_submitting { background: #1c3a28; color: var(--ok); }
+    .b-completed { background: #1c3a28; color: var(--ok); }
+    .b-failed, .b-timeout { background: #3a1c1c; color: var(--err); }
+    .b-cancelled { background: #2a3240; color: var(--fg-dim); }
+    .empty { padding: 20px 12px; color: var(--fg-dim); text-align: center; }
+    .msg { padding: 8px 12px; border-bottom: 1px solid var(--border); white-space: pre-wrap; word-break: break-word; }
+    .msg .dir { font-size: 11px; color: var(--fg-dim); margin-bottom: 4px; }
+    .msg.in .dir::before { content: "↘ 用户 "; color: var(--accent); }
+    .msg.out .dir::before { content: "↗ 机器人 "; color: var(--ok); }
+    /* === Terminal Events View === */
+    .terminal {
+      padding: 0;
+      font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      color: #e5e9f0;
+      background: #080b0f;
+      min-height: 100%;
+    }
+    .term-group {
+      position: relative;            /* hover 原文按钮的定位锚点 */
+      padding: 6px 12px;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+    }
+    .term-group:hover { background: rgba(255,255,255,0.02); }
+
+    /* hover 时浮现的「{}」原文按钮 */
+    .term-raw-btn {
+      position: absolute;
+      top: 3px;
+      right: 6px;
+      font-family: "JetBrains Mono", "SF Mono", Menlo, monospace;
+      font-size: 10px;
+      line-height: 1.4;
+      color: #5c6370;
+      background: #11151b;
+      border: 1px solid #1a1e26;
+      border-radius: 3px;
+      padding: 0 4px;
+      cursor: pointer;
+      opacity: 0;
+      transition: opacity .12s;
+      z-index: 2;
+    }
+    .term-group:hover .term-raw-btn { opacity: .55; }
+    .term-raw-btn:hover { opacity: 1; color: #5ab0ff; border-color: #2a3340; }
+
+    /* 每条 entry 行首的时间戳前缀：本地时区，YYYY-MM-DD HH:MM:SS。
+       小字号 + 暗灰 + user-select:none，避免压住正文 / 不污染复制结果。 */
+    .term-ts {
+      color: #5c6370;
+      font-size: 10px;
+      font-family: "JetBrains Mono", "SF Mono", Menlo, monospace;
+      margin-right: 8px;
+      user-select: none;
+      white-space: nowrap;
+      opacity: 0.75;
+    }
+
+    /* tool_call 与紧跟的 tool_result 视觉贴成一组 */
+    .term-tool-group { border-bottom: none; padding-bottom: 2px; }
+    .term-tool-group + .term-result-group { padding-top: 0; }
+
+    /* Assistant text rendered as markdown */
+    .term-text.md {
+      font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.6;
+      color: #e5e9f0;
+      padding: 2px 0;
+    }
+    .term-text.md h1, .term-text.md h2, .term-text.md h3, .term-text.md h4 {
+      color: #e5e9f0;
+      margin: 0.6em 0 0.3em;
+    }
+    .term-text.md h1 { font-size: 1.2em; border-bottom: 1px solid #1a1e26; padding-bottom: 3px; }
+    .term-text.md h2 { font-size: 1.1em; border-bottom: 1px solid #1a1e26; padding-bottom: 2px; }
+    .term-text.md h3, .term-text.md h4 { font-size: 1em; }
+    .term-text.md p { margin: 0.3em 0; }
+    .term-text.md code {
+      background: #1a1e26;
+      color: #ffd580;
+      padding: 1px 4px;
+      border-radius: 2px;
+      font-size: 11px;
+    }
+    .term-text.md pre {
+      background: #0a0d11;
+      padding: 8px 10px;
+      border-radius: 4px;
+      overflow-x: auto;
+      line-height: 1.45;
+      border: 1px solid #1a1e26;
+    }
+    .term-text.md pre code { background: transparent; padding: 0; font-size: 11px; }
+    .term-text.md ul, .term-text.md ol { margin: 0.2em 0; padding-left: 1.6em; line-height: 1.6; }
+    .term-text.md li { margin: 0.1em 0; }
+    .term-text.md blockquote {
+      border-left: 2px solid #2a3240;
+      margin: 0.3em 0;
+      padding: 0.1em 10px;
+      color: #8a94a6;
+    }
+    .term-text.md table { font-size: 11px; border-collapse: collapse; margin: 0.4em 0; width: 100%; }
+    .term-text.md th, .term-text.md td { border: 1px solid #1a1e26; padding: 3px 6px; text-align: left; vertical-align: top; }
+    .term-text.md thead th { background: #0d1117; font-weight: 600; }
+    .term-text.md strong { color: #ffffff; }
+    .term-text.md em { color: #d8dee9; }
+    .term-text.md a { color: #5ab0ff; }
+    .term-text.md hr { border: none; border-top: 1px solid #1a1e26; margin: 0.6em 0; }
+
+    /* Tool call line */
+    .term-tool-call {
+      padding: 1px 0;
+      color: #d8a657;
+      display: flex;
+      align-items: baseline;
+      gap: 4px;
+      flex-wrap: wrap;
+    }
+    .term-tool-icon { color: #d8a657; margin-right: 2px; }
+    .term-tool-name { color: #e5c07b; font-weight: 600; }
+    .term-tool-param { color: #98c379; }
+    .term-tool-param code { background: #1a1e26; color: #98c379; padding: 1px 4px; border-radius: 2px; font-size: 11px; }
+
+    /* Tool result block（⎿ 连接符 + 折叠摘要，与上方 tool_call 配对） */
+    .term-tool-result {
+      display: flex;
+      gap: 6px;
+      padding: 0 0 0 6px;
+    }
+    .term-result-elbow { flex: none; color: #5c6370; user-select: none; }
+    .term-result-body { flex: 1; min-width: 0; }
+    .term-tool-result pre {
+      margin: 0;
+      padding: 4px 8px;
+      background: #0a0d11;
+      border-radius: 3px;
+      font-size: 11px;
+      line-height: 1.4;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: #abb2bf;
+    }
+    /* 「+N 行」展开按钮 */
+    .term-more {
+      margin-top: 2px;
+      font-family: inherit;
+      font-size: 11px;
+      color: #5c6370;
+      background: transparent;
+      border: none;
+      cursor: pointer;
+      padding: 1px 0;
+    }
+    .term-more:hover { color: #d8a657; }
+
+    /* State change line */
+    .term-state {
+      padding: 2px 12px;
+      font-size: 11px;
+      color: #5ab0ff;
+      background: rgba(90, 176, 255, 0.05);
+      border-bottom: 1px solid rgba(90, 176, 255, 0.08);
+    }
+
+    /* Result line */
+    .term-result {
+      padding: 4px 12px;
+      font-size: 11px;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+    }
+    .term-result.term-result-ok { color: #8ed18a; }
+    .term-result.term-result-err { color: #e08585; }
+
+    /* System / session_started line */
+    .term-system {
+      padding: 2px 12px;
+      font-size: 11px;
+      color: #7f8c9a;
+      font-style: italic;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+    }
+
+    /* Thinking block */
+    details.term-thinking { margin: 1px 0; }
+    details.term-thinking summary {
+      font-size: 11px;
+      color: #7f8c9a;
+      cursor: pointer;
+      user-select: none;
+      padding: 1px 0;
+    }
+    details.term-thinking summary:hover { color: #a8b4c2; }
+    details.term-thinking[open] summary { color: #5ab0ff; }
+    .term-thinking-icon { margin-right: 4px; }
+    .term-thinking-body {
+      padding: 6px 10px;
+      margin: 4px 0 4px 8px;
+      border-left: 2px solid rgba(90, 176, 255, 0.15);
+      font-size: 11px;
+      line-height: 1.5;
+      color: #8a94a6;
+      max-height: 20em;
+      overflow-y: auto;
+    }
+    .term-thinking-body p { margin: 0.3em 0; }
+    .term-thinking-body code { color: #ffd580; background: #1a1e26; padding: 1px 4px; border-radius: 2px; }
+    .toolbar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+    .toolbar button { background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); padding: 3px 8px; border-radius: 3px; cursor: pointer; font-size: 11px; }
+    .toolbar button:hover { background: var(--border); }
+    .toolbar .filter { font-size: 11px; color: var(--fg-dim); display: inline-flex; align-items: center; gap: 3px; }
+    .toolbar input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
+    .toolbar select { background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); padding: 2px 4px; border-radius: 3px; font-size: 11px; }
+    .filters { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+    .filters .line { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .filters .label { font-size: 11px; color: var(--fg-dim); min-width: 36px; }
+    .mr-link { font-size: 11px; }
+    .pill { padding: 1px 6px; border-radius: 8px; background: var(--panel-2); font-size: 10px; color: var(--fg-dim); margin-left: 6px; }
+
+    /* Plan modal */
+    .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: none; align-items: stretch; justify-content: center; z-index: 100; }
+    .modal-mask.show { display: flex; }
+    .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; margin: 5vh auto; width: min(880px, 92vw); max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 10px 40px rgba(0,0,0,0.5); }
+    .modal header { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--border); background: var(--panel-2); border-radius: 8px 8px 0 0; }
+    .modal header h2 { margin: 0; font-size: 13px; font-weight: 600; }
+    .modal header .meta { font-size: 11px; color: var(--fg-dim); margin-top: 2px; font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; word-break: break-all; }
+    .modal header button { background: var(--panel); color: var(--fg); border: 1px solid var(--border); padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+    .modal header button:hover { background: var(--border); }
+    .modal .body { flex: 1; overflow-y: auto; padding: 16px 20px; }
+    /* Plan modal tab 切换器：Plan / Plan 审查 / Code 审查 共用一个弹窗，靠 tab 切换内容。
+       原文 JSON 弹窗（showRaw）走同一 modal，会给 .plan-tabs 加 .hidden 隐藏 tab 行。 */
+    .plan-tabs { display: flex; gap: 4px; padding: 6px 10px; background: var(--panel-2); border-bottom: 1px solid var(--border); }
+    .plan-tabs.hidden { display: none; }
+    .plan-tab { background: transparent; color: var(--fg-dim); border: 1px solid transparent; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+    .plan-tab:hover { color: var(--fg); background: var(--panel); }
+    .plan-tab.active { color: var(--fg); background: var(--panel); border-color: var(--border); }
+    /* 原文弹窗：JSON 直出 */
+    .raw-json { font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; color: #abb2bf; margin: 0; }
+    /* markdown 渲染样式（暗色） */
+    .md h1, .md h2, .md h3, .md h4 { color: var(--fg); margin: 1em 0 0.4em; line-height: 1.3; }
+    .md h1 { font-size: 1.5em; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+    .md h2 { font-size: 1.25em; border-bottom: 1px solid var(--border); padding-bottom: 3px; }
+    .md h3 { font-size: 1.1em; }
+    .md h4 { font-size: 1em; color: var(--fg-dim); }
+    .md p { margin: 0.6em 0; line-height: 1.6; }
+    .md ul, .md ol { margin: 0.4em 0; padding-left: 1.6em; line-height: 1.6; }
+    .md li { margin: 0.2em 0; }
+    .md code { background: #0a0d11; color: #ffd580; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+    .md pre { background: #0a0d11; padding: 10px 12px; border-radius: 6px; overflow: auto; line-height: 1.5; }
+    .md pre code { background: transparent; padding: 0; color: var(--fg); font-size: 12px; }
+    .md blockquote { border-left: 3px solid var(--accent); margin: 0.6em 0; padding: 0.2em 12px; color: var(--fg-dim); background: var(--panel-2); }
+    .md hr { border: none; border-top: 1px solid var(--border); margin: 1em 0; }
+    .md a { color: var(--accent); }
+    .md strong { color: var(--fg); }
+    .md em { color: var(--fg); }
+    .md table { border-collapse: collapse; margin: 0.8em 0; width: 100%; font-size: 12px; }
+    .md th, .md td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; vertical-align: top; }
+    .md thead th { background: var(--panel-2); color: var(--fg); font-weight: 600; }
+    .md tbody tr:nth-child(even) { background: rgba(255,255,255,0.02); }
+    .md th.align-center, .md td.align-center { text-align: center; }
+    .md th.align-right, .md td.align-right { text-align: right; }
+    /* 左对齐为默认 text-align: left，因此 renderMarkdown 不会输出 align-left class */
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <div class="col" id="col-sessions">
+      <header>
+        <div class="row">
+          <div>
+            <h2>Sessions</h2>
+            <div class="meta" id="sessions-meta">加载中…</div>
+          </div>
+        </div>
+        <div class="filters">
+          <div class="line">
+            <span class="label">时间</span>
+            <select id="filter-range">
+              <option value="1">最近 1 天</option>
+              <option value="7" selected>最近 7 天</option>
+              <option value="30">最近 30 天</option>
+              <option value="0">全部</option>
+            </select>
+          </div>
+          <div class="line">
+            <span class="label">状态</span>
+            <label class="filter"><input type="checkbox" id="filter-working" checked /> 工作中</label>
+            <label class="filter"><input type="checkbox" id="filter-awaiting" checked /> 等待回复</label>
+            <label class="filter" title="已结案但仍可被引用回复唤醒：completed / failed / timeout"><input type="checkbox" id="filter-resumable" checked /> 已结案（可继续）</label>
+            <label class="filter" title="用户取消，不可恢复"><input type="checkbox" id="filter-closed" /> 已关闭</label>
+          </div>
+        </div>
+        <div class="tz" id="tz-hint"></div>
+      </header>
+      <div class="body" id="sessions-body"></div>
+    </div>
+    <div class="col" id="col-messages">
+      <header>
+        <div class="row">
+          <div>
+            <h2>Messages</h2>
+            <div class="meta" id="messages-meta">选择左侧 session</div>
+          </div>
+          <div class="toolbar">
+            <button id="btn-plan" disabled title="查看当前 session 的 plan.md">Plan</button>
+          </div>
+        </div>
+      </header>
+      <div class="body" id="messages-body"><div class="empty">尚未选择 session</div></div>
+    </div>
+    <div class="modal-mask" id="plan-modal" role="dialog" aria-modal="true" aria-labelledby="plan-modal-title">
+      <div class="modal">
+        <header>
+          <div>
+            <h2 id="plan-modal-title">Plan</h2>
+            <div class="meta" id="plan-modal-meta"></div>
+          </div>
+          <button id="plan-modal-close" type="button">关闭 (Esc)</button>
+        </header>
+        <div class="plan-tabs" id="plan-tabs" role="tablist">
+          <button type="button" class="plan-tab active" data-tab="plan" role="tab">Plan</button>
+          <button type="button" class="plan-tab" data-tab="plan_review" role="tab" title="独立 Reviewer 对 plan 的审查意见">Plan 审查</button>
+          <button type="button" class="plan-tab" data-tab="code_review" role="tab" title="独立 Reviewer 对编码的审查意见">Code 审查</button>
+        </div>
+        <div class="body md" id="plan-modal-body"></div>
+      </div>
+    </div>
+
+    <div class="col" id="col-events">
+      <header>
+        <div class="row">
+          <div>
+            <h2>Events</h2>
+            <div class="meta" id="events-meta">选择左侧 session</div>
+          </div>
+          <div class="toolbar">
+            <label class="filter"><input type="checkbox" id="filter-claude-only" checked /> 仅 claude</label>
+          </div>
+        </div>
+      </header>
+      <div class="body" id="events-body"><div class="empty">尚未选择 session</div></div>
+    </div>
+  </div>
+
+<script>
+const POLL_MS = 3000;
+// 旧版 v1 的 terminal 字段把 completed/failed/timeout/cancelled 混作一组、默认隐藏。
+// state.py 把 RESUMABLE_TERMINAL（completed/failed/timeout）从"已结案"里独立出来后，
+// 这里把 group 拆为 resumable + closed 两组：resumable 默认勾选，closed 默认隐藏。
+// LS_KEY 升 v2；浏览器残留的 v1 直接忽略走默认值，无迁移逻辑。
+const LS_KEY = 'cc-fleet.filters.v2';
+
+// 状态分组与 src/cc_fleet/core/state.py 一一对齐：
+//   working           ↔ WORKING_STATES
+//   awaiting          ↔ {AWAITING_USER_CLARIFICATION}
+//   resumable         ↔ RESUMABLE_TERMINAL_STATES（已结案但引用回复仍可唤醒）
+//   closed            ↔ {CANCELLED}（用户取消，不可恢复）
+const STATE_GROUPS = {
+  working: new Set(['new', 'planning', 'developing', 'mr_submitting']),
+  awaiting: new Set(['awaiting_user_clarification']),
+  resumable: new Set(['completed', 'failed', 'timeout']),
+  closed: new Set(['cancelled']),
+};
+
+const DEFAULT_FILTERS = {
+  rangeDays: 7,         // 0 表示不限
+  groups: { working: true, awaiting: true, resumable: true, closed: false },
+  claudeOnly: true,
+};
+
+function loadFilters() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return { ...DEFAULT_FILTERS, groups: { ...DEFAULT_FILTERS.groups } };
+    const parsed = JSON.parse(raw);
+    const g = parsed.groups || {};
+    return {
+      rangeDays: Number.isFinite(parsed.rangeDays) ? parsed.rangeDays : DEFAULT_FILTERS.rangeDays,
+      groups: {
+        working: !!g.working,
+        awaiting: !!g.awaiting,
+        resumable: !!g.resumable,
+        closed: !!g.closed,
+      },
+      claudeOnly: parsed.claudeOnly !== false,
+    };
+  } catch {
+    return { ...DEFAULT_FILTERS, groups: { ...DEFAULT_FILTERS.groups } };
+  }
+}
+
+function saveFilters() {
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify({
+      rangeDays: state.rangeDays,
+      groups: state.groups,
+      claudeOnly: state.claudeOnly,
+    }));
+  } catch {}
+}
+
+const state = {
+  selected: null,
+  sessions: [],
+  // 记录当前用户展开了 thinking 折叠块的 event id 集合。
+  // 否则每次 polling 重新 innerHTML 重建 DOM 后，<details> 都会回到折叠态，
+  // 看上去像是"展开 2~3 秒后自动收起"。仅内存维护，刷新页面回到默认折叠是预期。
+  expandedEventIds: new Set(),
+  // event id(string) → 该事件格式化后的原始 payload JSON。
+  // 终端视图默认不显示原文；用户 hover 某条 entry 时浮现「{}」按钮，点击从这里
+  // 取文本丢进弹窗。build 时填充（同 id 覆盖、幂等），切 session 清空。
+  rawById: new Map(),
+  // event id(string) → tool_result 的完整内容。超长结果默认折叠成摘要，
+  // 点「+N 行」时从这里取全文替换。切 session 清空。
+  fullById: new Map(),
+  // 当前 eventsBody 中已渲染的 event id 序列（时间正序，最旧→最新）。
+  // renderEvents 用它判断本次 polling 是否仅在尾部新增了 event：
+  // 若是，则只 append 增量到终端底部。
+  renderedEventIds: [],
+  // 终端视图：用户在底部时自动跟随新内容；用户上滚查看历史时不抢滚动。
+  _atBottom: true,
+  // 终端视图：最后一个渲染的 entry 类型，用于跨 polling 批次的 text 合并。
+  _lastEntryType: '',
+  ...loadFilters(),
+};
+
+const $ = (sel) => document.querySelector(sel);
+const sessionsBody = $('#sessions-body');
+const sessionsMeta = $('#sessions-meta');
+const messagesBody = $('#messages-body');
+const messagesMeta = $('#messages-meta');
+const eventsBody = $('#events-body');
+const eventsMeta = $('#events-meta');
+
+function badgeClass(s) { return 'badge b-' + s; }
+function shortMr(url) {
+  if (!url) return '';
+  const m = url.match(/\/merge_requests\/(\d+)/);
+  return m ? '!' + m[1] : url;
+}
+
+function pad2(n) { return String(n).padStart(2, '0'); }
+function fmtTs(ts) {
+  if (!ts) return '';
+  // Python datetime.isoformat() 默认 6 位微秒，Safari 等浏览器对超精度 ISO
+  // 字符串会返回 Invalid Date，从而走 fallback 直接截字符串显示。先把小数秒
+  // 截到 3 位毫秒，所有目标浏览器都能正常解析。
+  let s = String(ts).replace(/(\.\d{3})\d+(?=[+\-Z]|$)/, '$1');
+  // ES 规范规定无时区指示符的 date-time 形式按本地时间解析。这对历史 UTC
+  // 数据（util/time.py 旧版本 _now() 用 timezone.utc.isoformat()，commit
+  // e2f1b48 注明历史 UTC 数据保留不动）会算错——把 UTC 字符串误当本地时间，
+  // 显示比真实本地早 8 小时。这里显式补 Z 强制按 UTC 解释，与
+  // core/commands.py:_short_relative 中 tzinfo is None 按 UTC 兜底的语义一致。
+  // 现行新写数据带 +08:00 后缀，命中不了此分支。
+  if (
+    /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/.test(s) &&
+    !/(Z|[+\-]\d{2}:?\d{2})$/.test(s)
+  ) {
+    s = s.replace(' ', 'T') + 'Z';
+  }
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) {
+    return String(ts).slice(0, 19).replace('T', ' ');
+  }
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
+
+function localTimezone() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch { return ''; }
+}
+
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url} → ${r.status}`);
+  return r.json();
+}
+
+function applySessionFilters(list) {
+  // 时间筛选：以 updated_at 为准。0 = 不限。
+  let out = list;
+  if (state.rangeDays && state.rangeDays > 0) {
+    const cutoff = Date.now() - state.rangeDays * 86400000;
+    out = out.filter((s) => {
+      const t = Date.parse(s.updated_at);
+      return Number.isNaN(t) ? true : t >= cutoff;
+    });
+  }
+  // 状态分组：勾选了的组的并集；全勾或全不勾视为不筛。
+  const groups = state.groups;
+  const keys = ['working', 'awaiting', 'resumable', 'closed'];
+  const allOn = keys.every((k) => groups[k]);
+  const allOff = keys.every((k) => !groups[k]);
+  if (!allOn && !allOff) {
+    out = out.filter((s) => {
+      const st = s.state;
+      return keys.some((k) => groups[k] && STATE_GROUPS[k].has(st));
+    });
+  }
+  return out;
+}
+
+async function loadSessions() {
+  try {
+    const { sessions } = await fetchJSON('/api/sessions');
+    state.sessions = sessions || [];
+    rerenderSessions();
+  } catch (e) {
+    sessionsMeta.textContent = '加载失败：' + e.message;
+  }
+}
+
+function rerenderSessions() {
+  const filtered = applySessionFilters(state.sessions);
+  renderSessions(filtered);
+  sessionsMeta.textContent = `${filtered.length} / ${state.sessions.length} 条`;
+}
+
+function renderSessions(list) {
+  if (list.length === 0) {
+    sessionsBody.innerHTML = '<div class="empty">暂无 session</div>';
+    return;
+  }
+  sessionsBody.innerHTML = list.map((s) => {
+    const slug = s.display_slug || s.slug;
+    const active = state.selected === slug ? 'active' : '';
+    return `
+      <div class="session-item ${active}" data-slug="${slug}">
+        <div class="top">
+          <span class="slug">${slug}</span>
+          <span class="${badgeClass(s.state)}">${s.state}</span>
+        </div>
+        <div class="second">
+          <span class="repo">${s.repo}</span>
+          <span>${s.mr_url ? '<a class="mr-link" href="'+s.mr_url+'" target="_blank">'+shortMr(s.mr_url)+'</a>' : '—'} <span class="pill">${fmtTs(s.updated_at)}</span></span>
+        </div>
+      </div>`;
+  }).join('');
+  sessionsBody.querySelectorAll('.session-item').forEach((el) => {
+    el.addEventListener('click', () => selectSession(el.dataset.slug));
+  });
+}
+
+function selectSession(slug) {
+  state.selected = slug;
+  // 切 session 时清空展开记忆与原文/全文缓存，避免不同 session 之间 event id 串味。
+  state.expandedEventIds.clear();
+  state.rawById.clear();
+  state.fullById.clear();
+  // 切 session 必然要换一整套 events，强制下一次 renderEvents 走全量重建。
+  state.renderedEventIds = [];
+  state._lastEntryType = '';
+  state._atBottom = true;
+  sessionsBody.querySelectorAll('.session-item').forEach((el) => {
+    el.classList.toggle('active', el.dataset.slug === slug);
+  });
+  messagesMeta.textContent = slug;
+  eventsMeta.textContent = slug;
+  $('#btn-plan').disabled = false;
+  loadDetail();
+}
+
+async function loadDetail() {
+  if (!state.selected) return;
+  const slug = encodeURIComponent(state.selected);
+  try {
+    const [{ messages }, { events }] = await Promise.all([
+      fetchJSON(`/api/sessions/${slug}/messages`),
+      fetchJSON(`/api/sessions/${slug}/events`),
+    ]);
+    renderMessages(messages || []);
+    renderEvents(events || []);
+  } catch (e) {
+    messagesBody.innerHTML = `<div class="empty">加载失败：${e.message}</div>`;
+    eventsBody.innerHTML = `<div class="empty">加载失败：${e.message}</div>`;
+    // 错误回填打乱了 eventsBody 与 renderedEventIds 的对应；下一次成功时
+    // 若 events 列表未变，增量路径会判定为"DOM 不动"，导致错误信息卡住不被替换。
+    state.renderedEventIds = [];
+  }
+}
+
+function renderMessages(list) {
+  if (list.length === 0) { messagesBody.innerHTML = '<div class="empty">暂无消息</div>'; return; }
+  messagesBody.innerHTML = list.map((m) => `
+    <div class="msg ${m.direction}">
+      <div class="dir">${fmtTs(m.ts)}${m.quote_text ? '（含引用）' : ''}</div>
+      <div>${escapeHtml(m.text || '')}</div>
+    </div>
+  `).join('');
+  messagesBody.scrollTop = messagesBody.scrollHeight;
+}
+
+// ---------- 终端 Events 渲染 ----------
+// 将扁平的 claude.* event 数组按语义分组后，以终端风格时间正序渲染。
+// 核心管线：events → buildTerminalEntries() → entry[] → renderTerminalEntry() → HTML。
+//
+// 增量策略：events 表 append-only、id 自增，list_events 用 ORDER BY id DESC LIMIT 200。
+// 转为时间正序后，旧 id 序列是新 id 序列的「前缀」。前缀匹配时只 append 增量到终端底部；
+// 不匹配时（切 session / 切过滤 / 超 200 条截断）全量重建。
+
+// 辅助：判断 event 是否含 tool_use 块
+function hasToolUse(evt) {
+  const blocks = (evt.payload && evt.payload.message && evt.payload.message.content) || [];
+  return blocks.some((b) => b && b.type === 'tool_use');
+}
+
+// 按工具类型提取关键参数用于终端展示
+function summarizeToolInput(name, input) {
+  if (!input || typeof input !== 'object') return '';
+  switch (name) {
+    case 'Read':
+    case 'View':
+      return renderInline('`' + (input.file_path || input.path || '') + '`');
+    case 'Write':
+    case 'Edit':
+      return renderInline('`' + (input.file_path || '') + '`');
+    case 'Bash':
+    case 'PowerShell':
+    case 'Shell':
+      return escapeHtml(
+        (input.description ? input.description + ': ' : '') +
+        (input.command || '').slice(0, 120)
+      );
+    case 'Glob':
+    case 'Grep':
+    case 'Search':
+      return renderInline('`' + (input.pattern || input.query || '') + '`');
+    default:
+      // 兜底：显示前 2 个 key
+      const keys = Object.keys(input).slice(0, 2);
+      return keys.map((k) => escapeHtml(k) + ': ' + escapeHtml(JSON.stringify(input[k])).slice(0, 60)).join(', ');
+  }
+}
+
+// 智能截断工具结果内容
+function truncateContent(content, maxLines, maxChars) {
+  maxLines = maxLines || 25;
+  maxChars = maxChars || 3000;
+  let full;
+  if (typeof content === 'string') {
+    full = content;
+  } else if (Array.isArray(content)) {
+    full = content.map((b) => {
+      if (typeof b === 'string') return b;
+      if (b && b.type === 'text') return b.text || '';
+      if (b && b.type === 'image') return '[image]';
+      return JSON.stringify(b);
+    }).join('\n');
+  } else if (content && typeof content === 'object') {
+    full = JSON.stringify(content, null, 2);
+  } else {
+    full = String(content || '');
+  }
+  const totalLines = full.split('\n').length;
+  let preview = full;
+  let truncated = false;
+  if (full.length > maxChars) { preview = full.slice(0, maxChars); truncated = true; }
+  const lines = preview.split('\n');
+  if (lines.length > maxLines) { preview = lines.slice(0, maxLines).join('\n'); truncated = true; }
+  return {
+    preview,
+    full,
+    truncated,
+    totalLines,
+    totalChars: full.length,
+    previewLines: Math.min(totalLines, lines.length),
+  };
+}
+
+// 核心：将时间正序 event 数组分组为终端 entry 数组
+function buildTerminalEntries(events) {
+  const entries = [];
+  let pendingTextChunks = []; // 累积连续 assistant text
+
+  function flushText() {
+    if (pendingTextChunks.length === 0) return;
+    const combined = pendingTextChunks.join('');
+    if (combined.trim()) {
+      entries.push({
+        type: 'text',
+        text: combined,
+        eventIds: pendingTextChunks._eventIds ? pendingTextChunks._eventIds.slice() : [],
+        // 合并多条 assistant 文本时取首条 evt.ts —— 与"这段话什么时候开始说"
+        // 语义对齐，且增量路径里跨刷新合并后首 ts 不变，避免时间戳跳变。
+        ts: pendingTextChunks._firstTs || '',
+      });
+    }
+    pendingTextChunks = [];
+  }
+
+  // 跟踪未匹配 tool_use 以便 tool_result 显示对应工具名
+  const pendingToolCalls = [];
+
+  for (const evt of events) {
+    const kind = evt.kind;
+    const p = evt.payload || {};
+    const evId = evt.id != null ? String(evt.id) : '';
+    const evTs = evt.ts || '';
+    const raw = JSON.stringify(p, null, 2);
+    // 原文落进 Map，供 hover「{}」按钮按需弹窗取用（DOM 里不再内联原始 JSON）。
+    if (evId) state.rawById.set(evId, raw);
+
+    if (kind === 'claude.assistant') {
+      const blocks = (p.message && p.message.content) || [];
+      const textBlocks = blocks.filter((b) => b && b.type === 'text');
+      const toolBlocks = blocks.filter((b) => b && b.type === 'tool_use');
+      const thinkingBlocks = blocks.filter((b) => b && b.type === 'thinking');
+
+      if (textBlocks.length > 0) {
+        const text = textBlocks.map((b) => b.text || '').join('');
+        pendingTextChunks.push(text);
+        if (!pendingTextChunks._eventIds) pendingTextChunks._eventIds = [];
+        pendingTextChunks._eventIds.push(evId);
+        if (!pendingTextChunks._firstTs) pendingTextChunks._firstTs = evTs;
+      }
+
+      // thinking 块：渲染为可折叠的「思考中…」区域
+      if (thinkingBlocks.length > 0 && textBlocks.length === 0 && toolBlocks.length === 0) {
+        flushText();
+        const allThinking = thinkingBlocks.map((b) => b.thinking || '').join('\n');
+        if (allThinking.trim()) {
+          entries.push({
+            type: 'thinking',
+            thinking: allThinking,
+            eventId: evId,
+            raw: raw,
+            ts: evTs,
+          });
+        }
+      } else if (thinkingBlocks.length > 0) {
+        // 混合块：先 flush text，再 emit thinking
+        flushText();
+        const allThinking = thinkingBlocks.map((b) => b.thinking || '').join('\n');
+        if (allThinking.trim()) {
+          entries.push({
+            type: 'thinking',
+            thinking: allThinking,
+            eventId: evId,
+            raw: raw,
+            ts: evTs,
+          });
+        }
+      }
+
+      if (toolBlocks.length > 0) {
+        flushText();
+        for (const tb of toolBlocks) {
+          entries.push({
+            type: 'tool_call',
+            name: tb.name,
+            input: tb.input,
+            toolUseId: tb.id,
+            eventId: evId,
+            raw: raw,
+            ts: evTs,
+          });
+          pendingToolCalls.push({ id: tb.id, name: tb.name });
+        }
+      }
+    } else if (kind === 'claude.user') {
+      flushText();
+      const blocks = (p.message && p.message.content) || [];
+      for (const block of blocks) {
+        if (block && block.type === 'tool_result') {
+          const matched = pendingToolCalls.find((tc) => tc.id === block.tool_use_id);
+          entries.push({
+            type: 'tool_result',
+            content: block.content,
+            toolUseId: block.tool_use_id,
+            pairToolName: matched ? matched.name : 'unknown',
+            eventId: evId,
+            raw: raw,
+            ts: evTs,
+          });
+          const idx = pendingToolCalls.findIndex((tc) => tc.id === block.tool_use_id);
+          if (idx >= 0) pendingToolCalls.splice(idx, 1);
+        }
+      }
+    } else if (kind === 'claude.result') {
+      flushText();
+      entries.push({
+        type: 'result',
+        text: p.result || p.text || '',
+        subtype: p.subtype || '',
+        isError: !!p.is_error,
+        eventId: evId,
+        raw: raw,
+        ts: evTs,
+      });
+    } else if (kind === 'state') {
+      flushText();
+      entries.push({
+        type: 'state',
+        to: p.to || '',
+        extra: p,
+        eventId: evId,
+        ts: evTs,
+      });
+    } else if (kind === 'claude.system') {
+      // 只保留 init（含 session_id）这类里程碑；requesting 等纯「正在请求模型」
+      // 的状态噪声静默跳过：不产出 entry、不 flushText，让被它打断的相邻 text
+      // 自然合并，阅读更连贯。原文仍在 rawById 中（此处不挂按钮，无入口，无害）。
+      if (p.subtype === 'init') {
+        flushText();
+        entries.push({
+          type: 'system',
+          subtype: 'init',
+          payload: p,
+          eventId: evId,
+          raw: raw,
+          ts: evTs,
+        });
+      }
+    } else if (kind === 'session_started') {
+      flushText();
+      entries.push({
+        type: 'system',
+        subtype: 'session_started',
+        payload: p,
+        eventId: evId,
+        raw: raw,
+        ts: evTs,
+      });
+    } else {
+      // 兜底：reviewer.* 或其它未识别事件种类，生成基本条目
+      flushText();
+      entries.push({
+        type: 'generic',
+        kind: kind,
+        payload: p,
+        eventId: evId,
+        raw: raw,
+        ts: evTs,
+      });
+    }
+  }
+  flushText();
+  return entries;
+}
+
+// hover 时浮现在 .term-group 右上角的「{}」原文按钮。点击从 state.rawById
+// 按 id 取格式化 JSON 丢进弹窗。ids 可为多个（text entry 合并了多条事件）。
+function rawBtn(ids) {
+  const idAttr = (ids || []).filter(Boolean).join(',');
+  if (!idAttr) return '';
+  return '<button class="term-raw-btn" data-raw-ids="' + escapeHtml(idAttr) + '" title="查看原文">{}</button>';
+}
+
+// entry 行首的本地时间前缀；ts 为空时输出空串，避免出现裸 []。
+function tsTag(ts) {
+  if (!ts) return '';
+  return '<span class="term-ts">' + escapeHtml(fmtTs(ts)) + '</span>';
+}
+
+// 将单个 entry 渲染为 HTML
+function renderTerminalEntry(entry) {
+  const parts = [];
+
+  switch (entry.type) {
+    case 'text': {
+      parts.push('<div class="term-group">');
+      parts.push(rawBtn(entry.eventIds || []));
+      parts.push(tsTag(entry.ts));
+      parts.push('<div class="term-text md">' + renderMarkdown(entry.text) + '</div>');
+      parts.push('</div>');
+      break;
+    }
+
+    case 'thinking': {
+      const evId = entry.eventId || '';
+      const openAttr = evId && state.expandedEventIds.has(evId) ? ' open' : '';
+      parts.push('<div class="term-group">');
+      parts.push(rawBtn([evId]));
+      parts.push(tsTag(entry.ts));
+      parts.push('<details class="term-thinking"' + (evId ? ' data-event-id="' + escapeHtml(evId) + '"' : '') + openAttr + '>');
+      parts.push('<summary><span class="term-thinking-icon">💭</span> Thinking…</summary>');
+      parts.push('<div class="term-thinking-body">' + renderMarkdown(entry.thinking) + '</div>');
+      parts.push('</details>');
+      parts.push('</div>');
+      break;
+    }
+
+    case 'tool_call': {
+      const summary = summarizeToolInput(entry.name, entry.input);
+      const evId = entry.eventId || '';
+      parts.push('<div class="term-group term-tool-group">');
+      parts.push(rawBtn([evId]));
+      parts.push('<div class="term-tool-call">');
+      parts.push(tsTag(entry.ts));
+      parts.push('<span class="term-tool-icon">●</span>');
+      parts.push('<span class="term-tool-name">' + escapeHtml(entry.name) + '</span>');
+      if (summary) parts.push('<span class="term-tool-param">(' + summary + ')</span>');
+      parts.push('</div>');
+      parts.push('</div>');
+      break;
+    }
+
+    case 'tool_result': {
+      // 默认折叠到 6 行 / 1200 字摘要，保持紧凑；超出部分点「+N 行」展开。
+      const info = truncateContent(entry.content, 6, 1200);
+      const evId = entry.eventId || '';
+      parts.push('<div class="term-group term-result-group">');
+      parts.push(rawBtn([evId]));
+      parts.push('<div class="term-tool-result">');
+      parts.push('<span class="term-result-elbow">⎿</span>');
+      if (info.truncated) {
+        if (evId) state.fullById.set(evId, info.full);
+        parts.push('<div class="term-result-body">' + tsTag(entry.ts) + '<pre>' + escapeHtml(info.preview) + '</pre>');
+        parts.push('<button class="term-more" data-event-id="' + escapeHtml(evId) + '">+ ' + (info.totalLines - info.previewLines) + ' 行</button></div>');
+      } else {
+        parts.push('<div class="term-result-body">' + tsTag(entry.ts) + '<pre>' + escapeHtml(info.full) + '</pre></div>');
+      }
+      parts.push('</div>');
+      parts.push('</div>');
+      break;
+    }
+
+    case 'result': {
+      const isErr = entry.isError || entry.subtype === 'error';
+      const cls = isErr ? ' term-result-err' : ' term-result-ok';
+      const icon = isErr ? '✘' : '✔';
+      parts.push('<div class="term-result' + cls + '">' + tsTag(entry.ts) + icon + ' ' + escapeHtml(entry.text || entry.subtype || '完成') + '</div>');
+      break;
+    }
+
+    case 'state': {
+      const to = entry.to || 'unknown';
+      let extra = '';
+      if (entry.extra && entry.extra.last_error) {
+        extra = ' — ' + escapeHtml(entry.extra.last_error.slice(0, 120));
+      }
+      parts.push('<div class="term-state">' + tsTag(entry.ts) + '◆ ' + escapeHtml(to) + extra + '</div>');
+      break;
+    }
+
+    case 'system': {
+      if (entry.subtype === 'init') {
+        parts.push('<div class="term-system">' + tsTag(entry.ts) + 'Session: ' + escapeHtml(entry.payload.session_id || '') + '</div>');
+      } else if (entry.subtype === 'session_started') {
+        const pp = entry.payload;
+        parts.push('<div class="term-system">' + tsTag(entry.ts) + 'Session started — ' + escapeHtml(pp.repo || '') + ' (' + escapeHtml(pp.mode || '') + ')</div>');
+      }
+      // 其余 system subtype（requesting 等）已在 buildTerminalEntries 阶段丢弃，
+      // 不会走到这里，故无需裸 JSON 兜底。
+      break;
+    }
+
+    case 'generic': {
+      // reviewer.* 或其它未识别事件：显示 kind 标签 + hover 原文按钮
+      const evId = entry.eventId || '';
+      const kind = entry.kind || 'unknown';
+      const preview = (entry.payload && entry.payload.message)
+        ? (entry.payload.message.content || []).map((b) => b && b.type === 'text' ? (b.text || '').slice(0, 200) : b && b.type === 'tool_use' ? 'tool:' + b.name : '').filter(Boolean).join(' ')
+        : '';
+      parts.push('<div class="term-group">');
+      parts.push(rawBtn([evId]));
+      parts.push(tsTag(entry.ts));
+      parts.push('<span style="color:#7f8c9a;font-size:11px;font-family:monospace">' + escapeHtml(kind) + '</span>');
+      if (preview) parts.push(' <span style="color:#5c6370;font-size:11px">' + escapeHtml(preview).slice(0, 200) + '</span>');
+      parts.push('</div>');
+      break;
+    }
+
+    default:
+      parts.push('<div class="term-group">' + tsTag(entry.ts) + '<span style="color:#5c6370">' + escapeHtml(entry.type) + '</span></div>');
+  }
+
+  return parts.join('\n');
+}
+
+function renderEvents(list) {
+  // 始终排除 stream_event：它们是原始流式碎片（text_delta / input_json_delta ...），
+  // 已由 claude.assistant / claude.user 聚合为完整消息，渲染碎片没有可读性。
+  list = list.filter((e) => !(e.kind || '').endsWith('.stream_event'));
+  if (state.claudeOnly) list = list.filter((e) => (e.kind || '').startsWith('claude.') || e.kind === 'state');
+  if (list.length === 0) {
+    eventsBody.innerHTML = '<div class="empty">暂无事件</div>';
+    state.renderedEventIds = [];
+    return;
+  }
+
+  // 转为时间正序（API 返回 DESC，最新在前）
+  const chronological = [...list].reverse();
+  const newIds = chronological.map((e) => (e.id != null ? String(e.id) : ''));
+  const prev = state.renderedEventIds;
+
+  // 前缀匹配：旧 id 序列是否为新 id 序列的前缀（正序 append-only）
+  const isAppendOnly = prev.length > 0
+    && newIds.length > prev.length
+    && prev.every((id, idx) => id === newIds[idx]);
+
+  if (isAppendOnly) {
+    const newEvents = chronological.slice(prev.length);
+    const termEl = eventsBody.querySelector('.terminal') || eventsBody;
+
+    // 跨批 text 合并：如果上次最后一个 entry 是 text，且本轮第一个事件是纯 text assistant
+    const lastEntryIsText = state._lastEntryType === 'text';
+    const firstNewIsText = newEvents.length > 0
+      && newEvents[0].kind === 'claude.assistant'
+      && !hasToolUse(newEvents[0]);
+
+    if (lastEntryIsText && firstNewIsText && prev.length >= 1) {
+      // 移除最后一个已渲染的 term-group，与新事件合并重算
+      const allGroups = termEl.querySelectorAll('.term-group');
+      const lastGroup = allGroups[allGroups.length - 1];
+      if (lastGroup && lastGroup.querySelector('.term-text')) {
+        lastGroup.remove();
+        const lastProcessedEvent = chronological[prev.length - 1];
+        const mergedEvents = [lastProcessedEvent, ...newEvents];
+        const mergedEntries = buildTerminalEntries(mergedEvents);
+        const mergedHtml = mergedEntries.map(renderTerminalEntry).join('');
+        termEl.insertAdjacentHTML('beforeend', mergedHtml);
+        state._lastEntryType = mergedEntries[mergedEntries.length - 1]?.type || '';
+      }
+    } else if (newEvents.length > 0) {
+      // 标准增量 append
+      const newEntries = buildTerminalEntries(newEvents);
+      const html = newEntries.map(renderTerminalEntry).join('');
+      termEl.insertAdjacentHTML('beforeend', html);
+      state._lastEntryType = newEntries[newEntries.length - 1]?.type || '';
+    }
+    // newEvents.length === 0 时 DOM 完全不动，日常 3 秒一刷主路径。
+  } else {
+    // 全量重建
+    const entries = buildTerminalEntries(chronological);
+    const html = entries.map(renderTerminalEntry).join('');
+    eventsBody.innerHTML = '<div class="terminal">\n' + html + '\n</div>';
+    state._lastEntryType = entries[entries.length - 1]?.type || '';
+  }
+
+  state.renderedEventIds = newIds;
+
+  // 用户在底部时自动跟随
+  if (state._atBottom) {
+    eventsBody.scrollTop = eventsBody.scrollHeight;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// <details> 的 toggle 事件不冒泡，必须用 capture 才能在容器上委托监听。
+// 现仅 thinking 折叠块带 data-event-id，跟踪其展开态，全量重建时据
+// expandedEventIds 回填 open 属性，避免每次 polling 重建后误收起。
+eventsBody.addEventListener('toggle', (e) => {
+  const t = e.target;
+  if (!(t instanceof HTMLDetailsElement)) return;
+  const id = t.dataset.eventId;
+  if (id) {
+    if (t.open) state.expandedEventIds.add(id);
+    else state.expandedEventIds.delete(id);
+  }
+}, true);
+
+// 终端视图的点击委托（监听挂容器，对增量 append 的新节点天然生效）：
+//  - 「{}」原文按钮：按 data-raw-ids 从 rawById 取格式化 JSON 丢进弹窗；
+//  - 「+N 行」按钮：从 fullById 取完整 tool_result 替换摘要并移除按钮。
+eventsBody.addEventListener('click', (e) => {
+  const rawBtnEl = e.target.closest && e.target.closest('.term-raw-btn');
+  if (rawBtnEl) {
+    const ids = (rawBtnEl.dataset.rawIds || '').split(',').filter(Boolean);
+    const text = ids.map((id) => state.rawById.get(id) || '').filter(Boolean).join('\n\n');
+    showRaw(text);
+    return;
+  }
+  const moreEl = e.target.closest && e.target.closest('.term-more');
+  if (moreEl) {
+    const full = state.fullById.get(moreEl.dataset.eventId);
+    const body = moreEl.closest('.term-result-body');
+    const pre = body && body.querySelector('pre');
+    if (full != null && pre) {
+      pre.textContent = full;   // textContent 自动转义，免 XSS
+      moreEl.remove();
+    }
+  }
+});
+
+// 终端视图自动滚屏：用户在底部时跟随新内容；用户上滚查看历史时不抢滚动。
+eventsBody.addEventListener('scroll', () => {
+  const el = eventsBody;
+  const threshold = 40;
+  state._atBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < threshold;
+});
+
+// ---------- 初始化筛选控件并绑定事件 ----------
+
+$('#filter-range').value = String(state.rangeDays);
+$('#filter-range').addEventListener('change', (e) => {
+  state.rangeDays = Number(e.target.value) || 0;
+  saveFilters();
+  rerenderSessions();
+});
+
+const groupBindings = [
+  ['#filter-working', 'working'],
+  ['#filter-awaiting', 'awaiting'],
+  ['#filter-resumable', 'resumable'],
+  ['#filter-closed', 'closed'],
+];
+for (const [sel, key] of groupBindings) {
+  const el = $(sel);
+  el.checked = !!state.groups[key];
+  el.addEventListener('change', (e) => {
+    state.groups[key] = e.target.checked;
+    saveFilters();
+    rerenderSessions();
+  });
+}
+
+$('#filter-claude-only').checked = state.claudeOnly;
+$('#filter-claude-only').addEventListener('change', (e) => {
+  state.claudeOnly = e.target.checked;
+  saveFilters();
+  // 切过滤后渲染的 events 子集变了，已渲染 id 序列不再是新序列的前缀，
+  // 强制下一次 renderEvents 走全量重建。
+  state.renderedEventIds = [];
+  loadDetail();
+});
+
+const tz = localTimezone();
+if (tz) $('#tz-hint').textContent = `时间为本地时区：${tz}`;
+
+// ---------- Plan modal ----------
+// 迷你 markdown 渲染器：覆盖 plan.md 实际会用到的语法子集
+//   标题 #~####、段落、有序/无序列表、围栏代码块 ```lang、行内 `code`、
+//   **粗体**、*斜体*、[文本](URL)、> 引用、--- 分隔线、
+//   表格（GFM 子集，含 :--- / ---: / :---: 三种列对齐）
+// 渲染前所有内容先 escapeHtml，避免 XSS。
+function renderMarkdown(src) {
+  // 第一步：抽出围栏代码块占位，避免内容被后续规则误处理
+  const codeBlocks = [];
+  src = src.replace(/```([a-zA-Z0-9_+-]*)\n([\s\S]*?)```/g, (_m, lang, body) => {
+    const idx = codeBlocks.length;
+    codeBlocks.push({ lang, body });
+    return ` CODEBLOCK${idx} `;
+  });
+
+  const lines = src.split('\n');
+  const out = [];
+  let i = 0;
+  let listStack = []; // [{ type: 'ul'|'ol', indent: number }]
+
+  function closeListsTo(indent) {
+    while (listStack.length && listStack[listStack.length - 1].indent >= indent) {
+      const top = listStack.pop();
+      out.push(`</${top.type}>`);
+    }
+  }
+  function closeAllLists() { closeListsTo(-1); }
+
+  // GFM 表格判定与切分辅助
+  //   - 表格行：含 `|`
+  //   - 分隔行：每列至少 3 个 `-`，可加 `:` 标对齐
+  //   - 起始条件：当前行像表格行 && 下一行是分隔行；这条硬约束避免
+  //     普通段落里出现的孤立 `|` 字符被误判为表格
+  const isTableLine = (s) => /\|/.test(s);
+  const isTableSep = (s) => /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(s);
+  const splitTableCells = (s) => {
+    let t = s.trim();
+    if (t.startsWith('|')) t = t.slice(1);
+    if (t.endsWith('|')) t = t.slice(0, -1);
+    return t.split('|').map((c) => c.trim());
+  };
+  const parseAlign = (cell) => {
+    const c = cell.trim();
+    const left = c.startsWith(':');
+    const right = c.endsWith(':');
+    if (left && right) return 'center';
+    if (right) return 'right';
+    // 显式左对齐与默认都走 CSS 默认 text-align: left；不输出 class 省 DOM 字节
+    return '';
+  };
+
+  while (i < lines.length) {
+    const raw = lines[i];
+    const line = raw.replace(/\s+$/, '');
+
+    if (!line.trim()) { closeAllLists(); i++; continue; }
+
+    // 代码块占位独占一行
+    const cbMatch = line.match(/^ CODEBLOCK(\d+) $/);
+    if (cbMatch) {
+      closeAllLists();
+      const cb = codeBlocks[Number(cbMatch[1])];
+      const langClass = cb.lang ? ` class="lang-${escapeHtml(cb.lang)}"` : '';
+      out.push(`<pre><code${langClass}>${escapeHtml(cb.body)}</code></pre>`);
+      i++;
+      continue;
+    }
+
+    // 分隔线
+    if (/^---+$/.test(line.trim())) { closeAllLists(); out.push('<hr/>'); i++; continue; }
+
+    // 表格（GFM 子集）：当前行像表格行 + 下一行是分隔行
+    if (isTableLine(line) && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+      closeAllLists();
+      const headers = splitTableCells(line);
+      const aligns = splitTableCells(lines[i + 1]).map(parseAlign);
+      const ncols = headers.length;
+      i += 2;
+      const bodyRows = [];
+      while (i < lines.length && lines[i].trim() && isTableLine(lines[i])) {
+        const cells = splitTableCells(lines[i]);
+        while (cells.length < ncols) cells.push('');
+        if (cells.length > ncols) cells.length = ncols;
+        bodyRows.push(cells);
+        i++;
+      }
+      const alignAttr = (idx) => (aligns[idx] ? ` class="align-${aligns[idx]}"` : '');
+      const headHtml = headers
+        .map((c, idx) => `<th${alignAttr(idx)}>${renderInline(c)}</th>`)
+        .join('');
+      const bodyHtml = bodyRows
+        .map((row) => `<tr>${row.map((c, idx) => `<td${alignAttr(idx)}>${renderInline(c)}</td>`).join('')}</tr>`)
+        .join('');
+      out.push(`<table><thead><tr>${headHtml}</tr></thead><tbody>${bodyHtml}</tbody></table>`);
+      continue;
+    }
+
+    // 标题 #~####
+    const hMatch = line.match(/^(#{1,4})\s+(.*)$/);
+    if (hMatch) {
+      closeAllLists();
+      const lvl = hMatch[1].length;
+      out.push(`<h${lvl}>${renderInline(hMatch[2])}</h${lvl}>`);
+      i++;
+      continue;
+    }
+
+    // 引用
+    if (/^>\s?/.test(line)) {
+      closeAllLists();
+      const buf = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) {
+        buf.push(lines[i].replace(/^>\s?/, ''));
+        i++;
+      }
+      out.push(`<blockquote>${renderInline(buf.join(' '))}</blockquote>`);
+      continue;
+    }
+
+    // 列表项（支持嵌套：以 2 空格为一级）
+    const liMatch = line.match(/^(\s*)([-*+]|\d+\.)\s+(.*)$/);
+    if (liMatch) {
+      const indent = liMatch[1].length;
+      const isOl = /\d+\./.test(liMatch[2]);
+      const type = isOl ? 'ol' : 'ul';
+      // 关闭比当前更深的嵌套，或同级别但类型不同的列表
+      while (listStack.length) {
+        const top = listStack[listStack.length - 1];
+        if (top.indent > indent) { out.push(`</${top.type}>`); listStack.pop(); }
+        else if (top.indent === indent && top.type !== type) { out.push(`</${top.type}>`); listStack.pop(); }
+        else break;
+      }
+      const top = listStack[listStack.length - 1];
+      if (!top || top.indent < indent) {
+        out.push(`<${type}>`);
+        listStack.push({ type, indent });
+      }
+      out.push(`<li>${renderInline(liMatch[3])}</li>`);
+      i++;
+      continue;
+    }
+
+    // 普通段落：合并相邻非空、非块级行
+    closeAllLists();
+    const buf = [line];
+    i++;
+    while (i < lines.length) {
+      const nxt = lines[i];
+      if (!nxt.trim()) break;
+      if (/^(#{1,4})\s+/.test(nxt)) break;
+      if (/^>\s?/.test(nxt)) break;
+      if (/^(\s*)([-*+]|\d+\.)\s+/.test(nxt)) break;
+      if (/^---+$/.test(nxt.trim())) break;
+      if (/^ CODEBLOCK\d+ $/.test(nxt)) break;
+      if (isTableLine(nxt) && i + 1 < lines.length && isTableSep(lines[i + 1])) break;
+      buf.push(nxt);
+      i++;
+    }
+    out.push(`<p>${renderInline(buf.join(' '))}</p>`);
+  }
+  closeAllLists();
+  return out.join('\n');
+}
+
+function renderInline(text) {
+  // 行内：先抽 code、再处理 link / strong / em
+  const codes = [];
+  let s = escapeHtml(text);
+  s = s.replace(/`([^`\n]+)`/g, (_m, body) => {
+    const idx = codes.length;
+    codes.push(body);
+    return ` IC${idx} `;
+  });
+  // 链接 [text](url)
+  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_m, t, u) => `<a href="${u}" target="_blank" rel="noopener noreferrer">${t}</a>`);
+  // 粗体 **x**（先于 * 处理，避免冲突）
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  // 斜体 *x*
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+  // 还原行内 code
+  s = s.replace(/ IC(\d+) /g, (_m, idx) => `<code>${escapeHtml(codes[Number(idx)])}</code>`);
+  return s;
+}
+
+const planModal = $('#plan-modal');
+const planBody = $('#plan-modal-body');
+const planMeta = $('#plan-modal-meta');
+const planTitle = $('#plan-modal-title');
+const planTabs = $('#plan-tabs');
+
+// 3 个 tab 共用一个 modal。每个 tab 一份：endpoint / 标题 / 缺文件文案。
+// 后端 missing_error 分别是 no_plan / no_plan_review / no_code_review；
+// 这里精确匹配再回退到"未找到该 session"。
+const PLAN_TABS = {
+  plan: {
+    endpoint: 'plan',
+    title: 'Plan',
+    missingError: 'no_plan',
+    missingMsg: '该 session 还没有 plan.md（plan 阶段未产出或已被清理）',
+  },
+  plan_review: {
+    endpoint: 'plan-review',
+    title: 'Plan 审查',
+    missingError: 'no_plan_review',
+    missingMsg: '该 session 暂无 plan_review.md（未启用 Reviewer / 该阶段未产出）',
+  },
+  code_review: {
+    endpoint: 'code-review',
+    title: 'Code 审查',
+    missingError: 'no_code_review',
+    missingMsg: '该 session 暂无 code_review.md（未启用 Reviewer / 该阶段未产出）',
+  },
+};
+
+function openPlanModal() { planModal.classList.add('show'); }
+function closePlanModal() { planModal.classList.remove('show'); }
+
+function setActiveTab(tab) {
+  planTabs.querySelectorAll('.plan-tab').forEach((el) => {
+    el.classList.toggle('active', el.dataset.tab === tab);
+  });
+}
+
+// 复用同一个弹窗显示某条事件的原始 JSON（与 showPlan 互斥打开）。
+// 原文是 JSON，用 <pre> 直出、不走 markdown，故先摘掉 body 的 md class；
+// 同时隐藏 tab 行，避免与"原文"语义混淆。
+function showRaw(text) {
+  planTitle.textContent = '原文';
+  planMeta.textContent = 'Raw event JSON';
+  planTabs.classList.add('hidden');
+  planBody.classList.remove('md');
+  planBody.innerHTML = '<pre class="raw-json">' + escapeHtml(text || '') + '</pre>';
+  planBody.scrollTop = 0;
+  openPlanModal();
+}
+
+async function loadPlanTab(tab) {
+  if (!state.selected) return;
+  const cfg = PLAN_TABS[tab] || PLAN_TABS.plan;
+  setActiveTab(tab);
+  planTitle.textContent = cfg.title;
+  planBody.classList.add('md');
+  planMeta.textContent = '加载中…';
+  planBody.innerHTML = '<div class="empty">加载中…</div>';
+  const slug = encodeURIComponent(state.selected);
+  try {
+    const r = await fetch(`/api/sessions/${slug}/${cfg.endpoint}`);
+    if (r.status === 404) {
+      const j = await r.json().catch(() => ({}));
+      planMeta.textContent = j.path || '';
+      planBody.innerHTML = `<div class="empty">${j.error === cfg.missingError ? cfg.missingMsg : '未找到该 session'}</div>`;
+      return;
+    }
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    planMeta.textContent = `${data.path}　·　mtime ${data.mtime || ''}`;
+    planBody.innerHTML = renderMarkdown(data.plan || '');
+    planBody.scrollTop = 0;
+  } catch (e) {
+    planBody.innerHTML = `<div class="empty">加载失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function showPlan() {
+  if (!state.selected) return;
+  // 工具栏点 Plan 按钮：恢复 tab 行（可能被 showRaw 隐藏过），默认进 Plan tab。
+  planTabs.classList.remove('hidden');
+  openPlanModal();
+  await loadPlanTab('plan');
+}
+
+$('#btn-plan').addEventListener('click', showPlan);
+$('#plan-modal-close').addEventListener('click', closePlanModal);
+planTabs.addEventListener('click', (e) => {
+  const btn = e.target.closest('.plan-tab');
+  if (btn && btn.dataset.tab) loadPlanTab(btn.dataset.tab);
+});
+planModal.addEventListener('click', (e) => { if (e.target === planModal) closePlanModal(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && planModal.classList.contains('show')) closePlanModal(); });
+
+async function tick() {
+  await loadSessions();
+  if (state.selected) await loadDetail();
+}
+tick();
+setInterval(tick, POLL_MS);
+</script>
+</body>
+</html>

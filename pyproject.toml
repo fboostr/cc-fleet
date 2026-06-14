@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cc-fleet"
+version = "0.1.0"
+description = "A fleet of Claude Code agents, dispatched from chat — plan, branch, deliver in parallel."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "fboostr" }]
+keywords = [
+  "claude-code",
+  "agent",
+  "wecom",
+  "wechat",
+  "merge-request",
+  "git-worktree",
+  "automation",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: POSIX :: Linux",
+]
+
+dependencies = [
+  "wecom-aibot-python-sdk>=1.0.2",
+  "pydantic>=2.0",
+  "aiosqlite>=0.19",
+  "pyyaml>=6.0",
+  "python-dotenv>=1.0",
+  "aiohttp>=3.9",
+]
+
+[project.urls]
+Homepage = "https://github.com/fboostr/cc-fleet"
+Repository = "https://github.com/fboostr/cc-fleet"
+Issues = "https://github.com/fboostr/cc-fleet/issues"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "pytest-asyncio>=0.21",
+]
+
+[project.scripts]
+cc-fleet = "cc_fleet.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cc_fleet"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 本地凭据与运行时数据
+.env
+config.yaml
+workspace/
+*.db
+*.db-journal
+logs/
+
+# IDE / 编辑器
+.claude/
+.cursor/
+.vscode/
+.VSCodeCounter/
+.idea/
+*.swp
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
