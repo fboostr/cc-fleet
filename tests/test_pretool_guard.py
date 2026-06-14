@@ -363,32 +363,3 @@ def test_extra_roots_empty_pieces_ignored(
     }
     reason = pretool_guard.evaluate(payload)
     assert reason is not None and "工作目录外" in reason
-
-
-# --- docker 模式：docker exec / docker cp 包裹 ---
-
-def test_docker_exec_single_quoted_build_allowed(worktree: Path):
-    """单引号包裹的 docker exec 内层命令被整段剥掉，容器路径 + tee 重定向都不误拦。"""
-    cmd = (
-        "docker exec mydev bash -lc "
-        "'cd /workspace/proj-worktrees/s1 && make 2>&1 | tee build.log'"
-    )
-    payload = {"tool_name": "Bash", "tool_input": {"command": cmd}}
-    assert pretool_guard.evaluate(payload) is None
-
-
-def test_docker_unquoted_container_write_blocked_without_whitelist(worktree: Path):
-    """未加引号的容器绝对路径 + 写动作，未注入白名单时按越界拦（保守优先）。"""
-    cmd = "docker exec mydev tee /workspace/proj-worktrees/s1/out.log"
-    payload = {"tool_name": "Bash", "tool_input": {"command": cmd}}
-    assert pretool_guard.evaluate(payload) is not None
-
-
-def test_docker_unquoted_container_write_allowed_with_whitelist(
-    worktree: Path, monkeypatch: pytest.MonkeyPatch
-):
-    """注入容器内 worktree 路径到 EXTRA_WORKTREE_ROOTS 后，写到该前缀下放行（兜底未加引号写法）。"""
-    monkeypatch.setenv("CC_FLEET_EXTRA_WORKTREE_ROOTS", "/workspace/proj-worktrees/s1")
-    cmd = "docker exec mydev tee /workspace/proj-worktrees/s1/out.log"
-    payload = {"tool_name": "Bash", "tool_input": {"command": cmd}}
-    assert pretool_guard.evaluate(payload) is None

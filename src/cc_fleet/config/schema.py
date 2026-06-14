@@ -101,10 +101,7 @@ class RepoConfig(BaseModel):
     # - local：path 是本地 git 仓库，主控建 worktree、主控提 MR
     # - remote：path 仅是 claude code 启动壳子目录（**不必是 git 仓库**），
     #           真正代码与 worktree 都在远端 dev box；claude 自己 ssh 过去开发与提 MR
-    # - docker：path 是本地 git 仓库（同 local），代码 bind-mount 进一个**运行中的**容器。
-    #           查看/修改代码、worktree、commit、push、提 MR 全在主机本地（与 local 一致），
-    #           **仅**编译/测试/运行类命令由 claude 经 `docker exec` 在容器内执行。
-    mode: Literal["local", "remote", "docker"] = "local"
+    mode: Literal["local", "remote"] = "local"
 
     # 代码托管平台，决定提 MR/PR 的方式：
     # - auto（默认）：mode=local 时按 origin remote URL 自动探测（含 github.com → github，
@@ -118,27 +115,6 @@ class RepoConfig(BaseModel):
     remote_ssh_alias: str | None = None
     remote_repo_path: str | None = None
     remote_worktree_root: str | None = None
-
-    # mode=docker 时必填：容器名/ID，claude 用 `docker exec <此名>` 进容器跑编译/运行。
-    # 若配了 docker_start_command / docker_stop_command，主控会在 dev 阶段前后自动起停容器；
-    # 未配则需用户自行保持容器运行（旧行为）。
-    docker_container: str | None = None
-    # 可选 bind-mount 前缀对：把主机 worktree 路径前缀替换成容器内路径。不配则容器内路径
-    # 与主机完全一致（同路径 bind-mount）；两者必须同时配或同时不配（model_validator 校验）。
-    # 注意：worktree 是 `<path>-worktrees/<slug>`（path 的兄弟目录），故挂载需同时覆盖 path
-    # 与该兄弟目录——即挂它们的公共父目录。
-    docker_host_root: str | None = None
-    docker_container_root: str | None = None
-
-    # mode=docker 时可选：dev 阶段前执行的容器启动命令（shell）。
-    # 例如："docker compose -f ~/project/compose.yml up -d" 或
-    #        "docker run -d --name my-dev -v /host:/container image tail -f /dev/null"
-    # 与 docker_stop_command 配对使用（二者必须同时配置或同时不配）。
-    docker_start_command: str | None = None
-
-    # mode=docker 时可选：dev 阶段结束后执行的容器销毁命令（shell）。
-    # 无论 session 成功/失败/超时都会执行；销毁失败只记日志，不掩盖 session 结果。
-    docker_stop_command: str | None = None
 
     # 驱动本 repo 的 AI coding 工具（Coder）。默认 claude，旧配置零感知、向后兼容。
     agent: AgentTool = AgentTool.CLAUDE
@@ -163,31 +139,6 @@ class RepoConfig(BaseModel):
             if missing:
                 raise ValueError(
                     f"repo {self.name!r} mode=remote 但缺少字段：{', '.join(missing)}"
-                )
-        return self
-
-    @model_validator(mode="after")
-    def _check_docker_fields(self) -> "RepoConfig":
-        if self.mode == "docker":
-            if not (self.docker_container or "").strip():
-                raise ValueError(
-                    f"repo {self.name!r} mode=docker 但缺少字段：docker_container"
-                )
-            # 前缀映射对：要么都配、要么都不配（都不配 = 容器内路径同主机）
-            host = (self.docker_host_root or "").strip()
-            container = (self.docker_container_root or "").strip()
-            if bool(host) != bool(container):
-                raise ValueError(
-                    f"repo {self.name!r} mode=docker 的 docker_host_root / "
-                    "docker_container_root 必须同时配置或同时省略（用作 bind-mount 前缀对）"
-                )
-            # 容器起停命令对：要么都配、要么都不配
-            start_cmd = (self.docker_start_command or "").strip()
-            stop_cmd = (self.docker_stop_command or "").strip()
-            if bool(start_cmd) != bool(stop_cmd):
-                raise ValueError(
-                    f"repo {self.name!r} mode=docker 的 docker_start_command / "
-                    "docker_stop_command 必须同时配置或同时省略"
                 )
         return self
 
@@ -274,10 +225,8 @@ class AppConfig(BaseModel):
     def validate_runtime(self) -> list[str]:
         """启动期对每个 repo 做静态校验，把"配置漏改"在拉起进程前就拦住。
 
-        - mode=local / docker 的 path 必须存在，且看起来是 git 仓库（含 `.git` 目录或文件）
+        - mode=local 的 path 必须存在，且看起来是 git 仓库（含 `.git` 目录或文件）
         - mode=remote 的 path 必须存在（壳子目录）
-        - mode=docker 若配了前缀映射，worktree（`<path>-worktrees/<slug>`）与 path
-          都必须落在 docker_host_root 之下
 
         返回错误清单（空表示通过）；caller 用它决定是否拒绝启动。
         """
@@ -286,30 +235,13 @@ class AppConfig(BaseModel):
             if not r.path.exists():
                 errs.append(f"repo {r.name!r}: path {r.path} 不存在")
                 continue
-            if r.mode in ("local", "docker") and not (r.path / ".git").exists():
-                if r.mode == "local":
-                    hint = (
-                        "若代码在远端，请改为 mode: remote 并配"
-                        " remote_ssh_alias / remote_repo_path / remote_worktree_root。"
-                    )
-                else:
-                    hint = "docker 模式下代码与 worktree 仍在主机本地，path 必须是本地 git 仓库。"
+            if r.mode == "local" and not (r.path / ".git").exists():
+                hint = (
+                    "若代码在远端，请改为 mode: remote 并配"
+                    " remote_ssh_alias / remote_repo_path / remote_worktree_root。"
+                )
                 errs.append(
                     f"repo {r.name!r}: mode={r.mode} 但 {r.path} 不是 git 仓库"
                     f"（缺少 .git）。{hint}"
                 )
-            if r.mode == "docker" and (r.docker_host_root or "").strip():
-                # 配了前缀映射：path 与其 `-worktrees` 兄弟目录都得在 docker_host_root 下，
-                # 否则容器内路径前缀替换会静默产出容器里不存在的路径。
-                host_root = Path(r.docker_host_root).expanduser().resolve()
-                worktree_root = r.path.with_name(r.path.name + "-worktrees")
-                for p, label in ((r.path, "path"), (worktree_root, "worktree 根")):
-                    try:
-                        p.resolve().relative_to(host_root)
-                    except ValueError:
-                        errs.append(
-                            f"repo {r.name!r}: mode=docker 配了 docker_host_root={host_root}，"
-                            f"但 {label}（{p}）不在其下；bind-mount 前缀映射需同时覆盖 path"
-                            " 及其 `-worktrees` 兄弟目录（建议挂二者的公共父目录）。"
-                        )
         return errs

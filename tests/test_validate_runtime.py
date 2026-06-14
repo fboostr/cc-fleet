@@ -4,9 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-from pydantic import ValidationError
-
 from cc_fleet.config.schema import (
     AppConfig,
     ClaudeConfig,
@@ -92,88 +89,6 @@ def test_remote_missing_shell_dir_fails(tmp_path: Path):
     )
     errs = cfg.validate_runtime()
     assert len(errs) == 1 and "不存在" in errs[0]
-
-
-def test_docker_with_git_passes(tmp_path: Path):
-    repo = tmp_path / "proj"
-    repo.mkdir()
-    (repo / ".git").mkdir()
-    cfg = _make_cfg(
-        tmp_path,
-        [RepoConfig(name="x", path=repo, mode="docker", docker_container="c")],
-    )
-    assert cfg.validate_runtime() == []
-
-
-def test_docker_without_git_fails(tmp_path: Path):
-    repo = tmp_path / "no-git"
-    repo.mkdir()
-    cfg = _make_cfg(
-        tmp_path,
-        [RepoConfig(name="dk", path=repo, mode="docker", docker_container="c")],
-    )
-    errs = cfg.validate_runtime()
-    assert len(errs) == 1
-    assert "dk" in errs[0] and ".git" in errs[0] and "docker" in errs[0]
-
-
-def test_docker_missing_container_raises_at_construction(tmp_path: Path):
-    with pytest.raises(ValidationError, match="docker_container"):
-        RepoConfig(name="r", path=tmp_path, mode="docker")
-
-
-def test_docker_single_root_raises_at_construction(tmp_path: Path):
-    with pytest.raises(ValidationError, match="docker_host_root"):
-        RepoConfig(
-            name="r",
-            path=tmp_path,
-            mode="docker",
-            docker_container="c",
-            docker_host_root="/h",  # 只配单边，缺 docker_container_root
-        )
-
-
-def test_docker_mapping_worktree_under_host_root_passes(tmp_path: Path):
-    repo = tmp_path / "proj"
-    repo.mkdir()
-    (repo / ".git").mkdir()
-    cfg = _make_cfg(
-        tmp_path,
-        [
-            RepoConfig(
-                name="x",
-                path=repo,
-                mode="docker",
-                docker_container="c",
-                docker_host_root=str(tmp_path),       # path 与 proj-worktrees 都在其下
-                docker_container_root="/workspace",
-            )
-        ],
-    )
-    assert cfg.validate_runtime() == []
-
-
-def test_docker_mapping_worktree_outside_host_root_fails(tmp_path: Path):
-    repo = tmp_path / "proj"
-    repo.mkdir()
-    (repo / ".git").mkdir()
-    cfg = _make_cfg(
-        tmp_path,
-        [
-            RepoConfig(
-                name="x",
-                path=repo,
-                mode="docker",
-                docker_container="c",
-                docker_host_root=str(tmp_path / "elsewhere"),  # path 不在其下
-                docker_container_root="/workspace",
-            )
-        ],
-    )
-    errs = cfg.validate_runtime()
-    # path 与 worktree 根都不在 docker_host_root 下 → 两条映射错误
-    assert len(errs) == 2
-    assert all("docker_host_root" in e for e in errs)
 
 
 def test_multiple_repos_collect_all_errors(tmp_path: Path):

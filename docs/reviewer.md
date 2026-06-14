@@ -69,8 +69,8 @@ repos:
 
 ## 模式范围
 
-- **plan 审查**：local / remote / docker 都生效
-- **code 审查**：local / remote / docker **都生效**（remote 经 defer-push：dev 只 commit，审查通过后才单独 push + 建 MR；docker 同 local，主机 worktree `git diff`）
+- **plan 审查**：local / remote 都生效
+- **code 审查**：local / remote **都生效**（remote 经 defer-push：dev 只 commit，审查通过后才单独 push + 建 MR）
 - remote 模式下 Reviewer 经 SSH 只读 `git diff` 远端 worktree
 
 代价：remote 发布从 dev 内联拆成单独一次 claude 调用（独立的"发布"阶段），元数据规范从 `dev_protocol_remote.md` 挪到 `publish_protocol_remote.md`。

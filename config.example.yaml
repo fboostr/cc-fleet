@@ -52,8 +52,6 @@ pipeline:
 #   - mode: local  → path 是本地 git 仓库，主控建 worktree + 主控提 MR（默认）
 #   - mode: remote → path 仅是 claude code 启动的本地壳子目录（不必是 git 仓库），
 #                    真正代码与 worktree 都在远端；claude 自己 ssh 过去开发与提 MR
-#   - mode: docker → path 是本地 git 仓库（同 local），代码 bind-mount 进一个运行中的容器；
-#                    worktree / commit / 提 MR 全在主机，仅编译/运行经 claude `docker exec` 进容器
 #
 # platform 字段决定提 MR/PR 的方式（可省略，默认 auto）：
 #   - auto   → local 模式按 origin URL 自动探测（含 github.com → github，否则 gitlab）；
@@ -63,8 +61,8 @@ pipeline:
 #
 # reviewer 字段（可选，默认关闭）：启用独立 Reviewer agent——plan 阶段审查 plan、
 # dev 阶段审查代码，Coder 据其意见完善。建议只对关键仓库开启（多 1~2 次 claude 调用）。
-#   - plan 审查：local / remote / docker 都生效
-#   - code 审查：local / remote / docker 都生效（remote 经 defer-push：dev 只 commit，审查通过后才单独 push + 建 MR；docker 同 local：主机 git diff）
+#   - plan 审查：local / remote 都生效
+#   - code 审查：local / remote 都生效（remote 经 defer-push：dev 只 commit，审查通过后才单独 push + 建 MR）
 #   - 单需求覆盖：用户可在某条需求里用 [review]（本次强制开）/ [review:off]（本次强制关）
 #     临时覆盖这里的 enabled，只对该 session 生效，不改仓库默认。
 repos:
@@ -100,24 +98,6 @@ repos:
   #   remote_ssh_alias: dev01.example.com
   #   remote_repo_path: /home/youruser/my-project
   #   remote_worktree_root: /home/youruser/my-project-worktrees
-
-  # docker 模式仓库示例（代码在主机，编译/运行进容器）
-  # - name: my-docker-project
-  #   aliases: [dockerproj]
-  #   path: ~/workspace/my-docker-project        # 本地 git 仓库（同 local，必须含 .git）
-  #   default_branch: main
-  #   keywords: [my-docker-project]
-  #   mode: docker
-  #   docker_container: my-docker-project-dev    # 容器名/ID（cc-fleet 用它 inspect / exec）
-  #   # 可选 bind-mount 前缀对；省略则容器内路径同主机。挂载须同时覆盖 path 与其 -worktrees 兄弟目录
-  #   # （建议挂二者的公共父目录，如下例 ~/workspace → /workspace）。
-  #   docker_host_root: ~/workspace
-  #   docker_container_root: /workspace
-  #   # 可选：容器自动起停（同配或同不配）。配了则每个任务前自动起、跑完自动销毁；不配则需用户自行保持容器
-  #   # 运行。docker_start_command 可为 docker run / compose up 等任意命令；用 docker run 时 --name 须与
-  #   # docker_container 一致，末尾用 tail -f /dev/null 保活。详见 docs/docker-mode.md 的「快速上手」。
-  #   docker_start_command: 'docker run -d --name my-docker-project-dev -v ~/workspace:/workspace my-image tail -f /dev/null'
-  #   docker_stop_command: 'docker rm -f my-docker-project-dev'
 
 # 运行时上限：同时驱动的 session 数（含 awaiting_user_clarification）。
 # 超出会进队列，dispatch 立即回 "已加入 @<repo> 队列（前面 N 个）"；前一个进终态后自动放行。

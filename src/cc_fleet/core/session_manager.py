@@ -303,10 +303,10 @@ class SessionManager:
                 "无法恢复。"
             )
 
-        # local / docker 模式 worktree 在主机本地,resume 前校验存在。NEW 状态 _do_new
+        # local 模式 worktree 在主机本地,resume 前校验存在。NEW 状态 _do_new
         # 还会自己创建,跳过。remote 模式 worktree 在远端,不在主控侧预判,让 claude 自己报错走 _fail。
         if (
-            repo_cfg.mode in ("local", "docker")
+            repo_cfg.mode == "local"
             and state != SessionState.NEW
             and not _worktree_exists(row.get("worktree_path"))
         ):

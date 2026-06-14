@@ -147,23 +147,6 @@ repos:
 
 Full lifecycle differences (defer-push / publish phase / local-vs-remote table) are in [docs/remote-mode.md](./docs/remote-mode.md) (Chinese).
 
-## Containerized build repos (`mode=docker`)
-
-Some projects live locally, but their build / test / run toolchain lives inside a docker container. With `mode: docker`, the code and worktree, commits, and MR creation all stay on the host (exactly like `local`); **only** build/run commands are wrapped by Claude in `docker exec` and executed inside the container:
-
-```yaml
-repos:
-  - name: my-project
-    path: ~/workspace/my-project      # local git repo (same as local; must contain .git)
-    default_branch: main
-    mode: docker
-    docker_container: my-project-dev  # a RUNNING container name/ID (cc-fleet only execs into it)
-    docker_host_root: ~/workspace     # optional bind-mount prefix pair; omit for identical paths
-    docker_container_root: /workspace
-```
-
-The container can be managed two ways: by default you **start and keep it running** yourself (cc-fleet only execs into it); or set `docker_start_command` / `docker_stop_command` to let cc-fleet **auto start/stop** it around each task (a plain `docker run` with your image works). The bind-mount must cover both `path` and its `-worktrees` sibling (mount their common parent). A quickstart (spin up a container from an existing image in 3 steps) and full details are in [docs/docker-mode.md](./docs/docker-mode.md) (Chinese).
-
 ## Local HTTP panel
 
 The main process also serves a read-only aiohttp panel at `http://127.0.0.1:8787/` by default — open it to see every session's state, user/bot chat history, and the Claude SDK event stream.
@@ -193,7 +176,6 @@ Detailed docs are in **Chinese**:
 - [docs/state-machine.md](./docs/state-machine.md) — full session state machine
 - [docs/reviewer.md](./docs/reviewer.md) — independent Reviewer design
 - [docs/remote-mode.md](./docs/remote-mode.md) — `mode=remote` lifecycle
-- [docs/docker-mode.md](./docs/docker-mode.md) — `mode=docker` lifecycle
 - [docs/security.md](./docs/security.md) / [SECURITY.md](./SECURITY.md) — security boundary & deployment checklist
 - [docs/troubleshooting.md](./docs/troubleshooting.md) — troubleshooting by platform / state
 

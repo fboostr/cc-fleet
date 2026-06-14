@@ -38,7 +38,7 @@
 
    任务中途**不**单独 push；同分支后续追加 commit 时，每次 push 仍带相同 push option（GitLab 对 `merge_request.create` 幂等，已有 MR 的 title/description 会被覆盖更新）。例外：用户明确要求"先别推"时跳过自动 push。
 
-   **MR / PR 标题与描述的质量约束**（落实细节见 `src/cc_fleet/prompts/dev_protocol_local.md` 与 `publish_protocol_remote.md` 中的"MR 元数据规范"段。remote 模式经 defer-push 改造后，dev 阶段只 commit；push + 建 MR 挪到审查后的独立"发布"阶段，元数据规范也随之挪到 `publish_protocol_remote.md`。docker 模式与 local 同流水线——主控本地提 MR，元数据规范见 `dev_protocol_docker.md`，仅编译/运行经 `docker exec` 进容器）：
+   **MR / PR 标题与描述的质量约束**（落实细节见 `src/cc_fleet/prompts/dev_protocol_local.md` 与 `publish_protocol_remote.md` 中的"MR 元数据规范"段。remote 模式经 defer-push 改造后，dev 阶段只 commit；push + 建 MR 挪到审查后的独立"发布"阶段，元数据规范也随之挪到 `publish_protocol_remote.md`）：
 
    - **标题应是工作内容的概括，不是用户需求的原话**（动宾结构、≤60 字符、无句号、无祈使语气）。如目标仓库已有 MR/commit 规范（`.gitlab/merge_request_templates/`、`MERGE_REQUEST_TEMPLATE.md`、`CONTRIBUTING.md` 或近期 commit 风格）按项目约定，否则强制 `feat:/fix:/docs:/refactor:/test:/chore:` 等前缀。
    - **描述按多小节 Markdown 模板写**，必含「背景 / 用户原始需求 / 改动概要 / 测试与验证 / 文档与注释同步 / 风险与回滚」六节。其中"测试与验证""文档与注释同步"是本规范第 4、5 条的硬要求，没做也必须明确表态而非省略小节。

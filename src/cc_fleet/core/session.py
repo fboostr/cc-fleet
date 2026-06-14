@@ -61,7 +61,7 @@ import asyncio
 import importlib.resources as resources
 import logging
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from ..config.schema import AppConfig, RepoConfig
@@ -206,7 +206,6 @@ class Session:
                 "repo": self.repo_cfg.name,
                 "mode": self.repo_cfg.mode,
                 "remote_ssh_alias": self.repo_cfg.remote_ssh_alias if self.repo_cfg.mode == "remote" else None,
-                "docker_container": self.repo_cfg.docker_container if self.repo_cfg.mode == "docker" else None,
             },
         )
         logger.info(
@@ -447,113 +446,99 @@ class Session:
         stream_log = self._session_dir() / "stream.jsonl"
         dev_protocol_text = self._render_dev_system_prompt()
 
-        try:
-            # docker 模式：若配置了起停命令，dev 开始前先确保容器在运行。
-            # 启动失败时 _ensure_docker_container 已置 FAILED 并通知用户，这里**必须**中止：
-            # 否则会对没起来的容器跑完整个 dev，且末尾 _set_state(MR_SUBMITTING/CODE_REVIEWING)
-            # 会把刚写的 FAILED 覆盖回工作态，导致误推一个未成功编译/测试的 MR。
-            # 放在 try 内 return —— finally 仍会执行销毁命令，清理可能的半启动容器。
-            if self._is_docker() and (self.repo_cfg.docker_start_command or "").strip():
-                if not await self._ensure_docker_container():
-                    return
-
-            followup = self.pending_user_message
-            self.pending_user_message = None
-            if self._pending_revision_feedback is not None:
-                # 从 CODE_REVIEWING 回来：把 Reviewer 代码审查意见作为修订指令注入。
-                # approved 由配对标志 _pending_revision_was_approved 决定 prompt 语气；同时消费并清零。
-                prompt = self._format_code_revision_prompt(
-                    self._pending_revision_feedback,
-                    approved=self._pending_revision_was_approved,
-                )
-                self._pending_revision_feedback = None
-                self._pending_revision_was_approved = False
-            elif followup:
-                # 引用回复唤醒（failed/timeout/completed → DEVELOPING）时把用户消息注入 prompt
-                prompt = (
-                    f"用户对上一轮开发结果的追加反馈：\n{followup}\n\n"
-                    "请按以上反馈继续开发；其它规则见已注入的 system prompt。\n"
-                    "若遇阻塞，请在回复中明确说明，并附上原始命令与原始报错。"
-                )
-            else:
-                prompt = (
-                    "现在按上一阶段的 plan 完成开发；具体规则见已注入的 system prompt。\n"
-                    "若遇阻塞，请在回复中明确说明，并附上原始命令与原始报错。"
-                )
-
-            result = await self.runner.run(
-                prompt=prompt,
-                cwd=worktree,
-                permission=AgentPermission.WRITE,
-                protocol_text=dev_protocol_text,
-                session_id=self.row["claude_session_id"],
-                resume_from=self.row["claude_session_id"],
-                guardrail=guardrail,
-                timeout_sec=self.config.pipeline.dev_timeout_sec,
-                stream_log_path=stream_log,
-                extra_env=self._claude_extra_env(worktree),
-                on_event=self._persist_claude_event,
+        followup = self.pending_user_message
+        self.pending_user_message = None
+        if self._pending_revision_feedback is not None:
+            # 从 CODE_REVIEWING 回来：把 Reviewer 代码审查意见作为修订指令注入。
+            # approved 由配对标志 _pending_revision_was_approved 决定 prompt 语气；同时消费并清零。
+            prompt = self._format_code_revision_prompt(
+                self._pending_revision_feedback,
+                approved=self._pending_revision_was_approved,
+            )
+            self._pending_revision_feedback = None
+            self._pending_revision_was_approved = False
+        elif followup:
+            # 引用回复唤醒（failed/timeout/completed → DEVELOPING）时把用户消息注入 prompt
+            prompt = (
+                f"用户对上一轮开发结果的追加反馈：\n{followup}\n\n"
+                "请按以上反馈继续开发；其它规则见已注入的 system prompt。\n"
+                "若遇阻塞，请在回复中明确说明，并附上原始命令与原始报错。"
+            )
+        else:
+            prompt = (
+                "现在按上一阶段的 plan 完成开发；具体规则见已注入的 system prompt。\n"
+                "若遇阻塞，请在回复中明确说明，并附上原始命令与原始报错。"
             )
 
-            if result.timed_out:
-                await self._timeout("dev 阶段超时")
-                await self._notify(f"开发超时{self._tag()}")
+        result = await self.runner.run(
+            prompt=prompt,
+            cwd=worktree,
+            permission=AgentPermission.WRITE,
+            protocol_text=dev_protocol_text,
+            session_id=self.row["claude_session_id"],
+            resume_from=self.row["claude_session_id"],
+            guardrail=guardrail,
+            timeout_sec=self.config.pipeline.dev_timeout_sec,
+            stream_log_path=stream_log,
+            extra_env=self._claude_extra_env(worktree),
+            on_event=self._persist_claude_event,
+        )
+
+        if result.timed_out:
+            await self._timeout("dev 阶段超时")
+            await self._notify(f"开发超时{self._tag()}")
+            return
+        if result.exit_code not in (0, None) or result.result_is_error:
+            await self._fail(format_run_failure(result, "dev"))
+            return
+
+        # dev 阶段两种模式都只到 commit 为止（remote defer-push 后也不再在 dev 内 push/建 MR），
+        # 闸门：确认确有新 commit（local 直接查本地 worktree，remote 经 SSH 查远端 worktree）。
+        base = f"origin/{self.row['default_branch']}"
+        if self._is_remote():
+            remote_worktree = self._remote_worktree_path()
+            try:
+                ahead = await repo_module.has_commits_ahead_remote(
+                    self.repo_cfg.remote_ssh_alias or "", remote_worktree, base
+                )
+            except Exception as e:  # noqa: BLE001
+                await self._fail(f"检查远端 worktree 提交状态失败：{e}")
                 return
-            if result.exit_code not in (0, None) or result.result_is_error:
-                await self._fail(format_run_failure(result, "dev"))
+            if not ahead:
+                await self._fail("dev 阶段结束但远端 worktree 无新 commit。")
+                return
+            # 远端 MR 元数据由 publish 阶段 claude 产出，主控此处不解析。
+        else:
+            # 本地模式：claude 应该已经 commit；主控负责 push + 提 MR
+            try:
+                ahead = await repo_module.has_commits_ahead(worktree, base)
+            except Exception as e:  # noqa: BLE001
+                await self._fail(f"检查 worktree 提交状态失败：{e}")
+                return
+            if not ahead:
+                await self._fail("dev 阶段结束但 worktree 无新 commit。")
                 return
 
-            # dev 阶段两种模式都只到 commit 为止（remote defer-push 后也不再在 dev 内 push/建 MR），
-            # 闸门：确认确有新 commit（local 直接查本地 worktree，remote 经 SSH 查远端 worktree）。
-            base = f"origin/{self.row['default_branch']}"
-            if self._is_remote():
-                remote_worktree = self._remote_worktree_path()
-                try:
-                    ahead = await repo_module.has_commits_ahead_remote(
-                        self.repo_cfg.remote_ssh_alias or "", remote_worktree, base
-                    )
-                except Exception as e:  # noqa: BLE001
-                    await self._fail(f"检查远端 worktree 提交状态失败：{e}")
-                    return
-                if not ahead:
-                    await self._fail("dev 阶段结束但远端 worktree 无新 commit。")
-                    return
-                # 远端 MR 元数据由 publish 阶段 claude 产出，主控此处不解析。
-            else:
-                # 本地模式：claude 应该已经 commit；主控负责 push + 提 MR
-                try:
-                    ahead = await repo_module.has_commits_ahead(worktree, base)
-                except Exception as e:  # noqa: BLE001
-                    await self._fail(f"检查 worktree 提交状态失败：{e}")
-                    return
-                if not ahead:
-                    await self._fail("dev 阶段结束但 worktree 无新 commit。")
-                    return
+            # 从 claude 输出抽 MR 元数据缓存到 self；MR_SUBMITTING 阶段优先用，
+            # 缺失则在 _mr_title / _mr_description 内走 git log 兜底。
+            meta = parse_mr_metadata(result.text_output)
+            self._pending_mr_title = meta.title
+            self._pending_mr_description = meta.description
+            if meta.title is None or meta.description is None:
+                logger.warning(
+                    "session %s dev 阶段未按协议输出完整 MR 元数据（title=%s description=%s），"
+                    "将走 git log 兜底",
+                    self.slug,
+                    "ok" if meta.title else "missing",
+                    "ok" if meta.description else "missing",
+                )
 
-                # 从 claude 输出抽 MR 元数据缓存到 self；MR_SUBMITTING 阶段优先用，
-                # 缺失则在 _mr_title / _mr_description 内走 git log 兜底。
-                meta = parse_mr_metadata(result.text_output)
-                self._pending_mr_title = meta.title
-                self._pending_mr_description = meta.description
-                if meta.title is None or meta.description is None:
-                    logger.warning(
-                        "session %s dev 阶段未按协议输出完整 MR 元数据（title=%s description=%s），"
-                        "将走 git log 兜底",
-                        self.slug,
-                        "ok" if meta.title else "missing",
-                        "ok" if meta.description else "missing",
-                    )
-
-            # 两模式统一：commit 完成后，开了审查就先审代码，否则直接进发布
-            if self._code_review_enabled():
-                # 发布前先交独立 Reviewer 审查代码；通知在 _do_code_reviewing 内发
-                await self._set_state(SessionState.CODE_REVIEWING)
-            else:
-                await self._set_state(SessionState.MR_SUBMITTING)
-        finally:
-            # docker 模式：无论成败都执行销毁命令
-            if self._is_docker() and (self.repo_cfg.docker_stop_command or "").strip():
-                await self._destroy_docker_container()
+        # 两模式统一：commit 完成后，开了审查就先审代码，否则直接进发布
+        if self._code_review_enabled():
+            # 发布前先交独立 Reviewer 审查代码；通知在 _do_code_reviewing 内发
+            await self._set_state(SessionState.CODE_REVIEWING)
+        else:
+            await self._set_state(SessionState.MR_SUBMITTING)
 
     async def _do_mr_submitting(self) -> None:
         # remote：发布由 claude 经 SSH 完成（push + 建 MR/PR）；local：主控直接提 MR。
@@ -975,112 +960,6 @@ class Session:
     def _is_remote(self) -> bool:
         return self.repo_cfg.mode == "remote"
 
-    def _is_docker(self) -> bool:
-        return self.repo_cfg.mode == "docker"
-
-    def _container_worktree_path(self, host_worktree: Path) -> str:
-        """docker 模式下，主机 worktree 在容器内对应的路径（供 `docker exec ... cd <此路径>`）。
-
-        配了 bind-mount 前缀对（docker_host_root : docker_container_root）则做前缀替换；
-        未配则容器内路径与主机完全一致（同路径 bind-mount）。schema 已校验两者 both-or-neither，
-        故此处只需判其一。前缀替换用 posix 形式拼接（容器内一律 Linux 路径分隔符）。
-        """
-        host_root = (self.repo_cfg.docker_host_root or "").strip()
-        container_root = (self.repo_cfg.docker_container_root or "").strip()
-        if not host_root:
-            return str(host_worktree)
-        rel = host_worktree.resolve().relative_to(Path(host_root).expanduser().resolve())
-        return str(PurePosixPath(container_root) / rel.as_posix())
-
-    async def _ensure_docker_container(self) -> bool:
-        """docker 模式：确保容器在运行；未运行则执行 docker_start_command 拉起。
-
-        先 docker inspect 检查状态 —— 若已 running 则跳过（可能上次 session crash
-        时 finally 没来得及销毁）；若不存在或已停止则执行 docker_start_command 并轮询
-        等待 running（最多 60s）。
-
-        返回是否就绪：``True`` 容器已在运行。失败（启动命令非零/异常、轮询超时）时
-        已调 ``_fail`` 把 session 置 FAILED 并通知用户，返回 ``False``——调用方**必须**
-        据此中止 dev，不能继续对没起来的容器跑开发（否则末尾 ``_set_state`` 会把刚写的
-        FAILED 覆盖回工作态，导致误推 MR）。
-        """
-        container = (self.repo_cfg.docker_container or "").strip()
-        cmd = (self.repo_cfg.docker_start_command or "").strip()
-
-        # 1. 检查容器是否已在运行
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                f"docker inspect -f '{{{{.State.Running}}}}' {container}",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _stderr = await proc.communicate()
-            if proc.returncode == 0 and stdout.decode().strip() == "true":
-                logger.info("session %s docker 容器 %s 已在运行，跳过启动", self.slug, container)
-                return True
-        except Exception as exc:  # noqa: BLE001 - inspect 失败不阻塞，继续走启动路径
-            logger.warning("session %s docker inspect %s 失败：%s，尝试执行启动命令", self.slug, container, exc)
-
-        # 2. 执行启动命令
-        logger.info("session %s 执行 docker 启动命令：%s", self.slug, cmd)
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                err_msg = stderr.decode().strip() or stdout.decode().strip() or "（无输出）"
-                await self._fail(f"Docker 容器启动命令失败（exit={proc.returncode}）：\n{cmd}\n{err_msg}")
-                return False
-        except Exception as exc:  # noqa: BLE001
-            await self._fail(f"Docker 容器启动命令异常：{cmd}\n{exc}")
-            return False
-
-        # 3. 轮询等待容器进入 running 状态（最多 60s，每秒检查一次）
-        for _ in range(60):
-            await asyncio.sleep(1)
-            try:
-                proc = await asyncio.create_subprocess_shell(
-                    f"docker inspect -f '{{{{.State.Running}}}}' {container}",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _stderr = await proc.communicate()
-                if proc.returncode == 0 and stdout.decode().strip() == "true":
-                    logger.info("session %s docker 容器 %s 启动成功", self.slug, container)
-                    return True
-            except Exception:  # noqa: BLE001
-                pass  # 轮询中 inspect 失败继续等
-        await self._fail(f"Docker 容器启动超时（已等 60s）：{container} 未进入 running 状态")
-        return False
-
-    async def _destroy_docker_container(self) -> None:
-        """docker 模式：执行 docker_stop_command 销毁容器（finally 中调用）。
-
-        销毁失败只记 warning，不掩盖 session 结果。
-        """
-        cmd = (self.repo_cfg.docker_stop_command or "").strip()
-        logger.info("session %s 执行 docker 销毁命令：%s", self.slug, cmd)
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                err_msg = stderr.decode().strip() or stdout.decode().strip() or "（无输出）"
-                logger.warning(
-                    "session %s docker 销毁命令失败（exit=%s）：%s\n%s",
-                    self.slug, proc.returncode, cmd, err_msg,
-                )
-            else:
-                logger.info("session %s docker 容器已销毁", self.slug)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("session %s docker 销毁命令异常：%s\n%s", self.slug, cmd, exc)
-
     def _remote_worktree_path(self) -> str:
         """remote 模式远端 worktree 的确定性路径，与 dev_protocol_remote.md 约定一致：
         ``{remote_worktree_root}/{display_slug}``。主控据此拼 SSH diff / 提交校验命令。"""
@@ -1113,12 +992,9 @@ class Session:
         """统一构造 plan / dev 阶段 claude 子进程的 extra_env。
 
         - `CC_FLEET_WORKTREE`：本地 cwd，hook 用作白名单主前缀。
-        - `CC_FLEET_EXTRA_WORKTREE_ROOTS`（remote / docker 模式注入）：
-          * remote：把远端项目根与远端 worktree 根以 `os.pathsep` 分隔注入，让 hook 不把
-            claude 经 `ssh <host> '…'` 操作的远端绝对路径误判成"工作目录外的写"。
-          * docker：当配了前缀映射、容器内路径与主机不同 时，注入容器内 worktree 路径。
-            单引号包裹的 `docker exec <c> bash -lc '…'` 内层命令本就会被 hook 的引号剥离
-            放行；此注入仅兜底未加引号的容器绝对路径 / `docker cp c:/path` 这类写法。
+        - `CC_FLEET_EXTRA_WORKTREE_ROOTS`（remote 模式注入）：把远端项目根与远端 worktree 根
+          以 `os.pathsep` 分隔注入，让 hook 不把 claude 经 `ssh <host> '…'` 操作的远端绝对
+          路径误判成"工作目录外的写"。
         """
         env: dict[str, str] = {"CC_FLEET_WORKTREE": str(worktree)}
         if self._is_remote():
@@ -1129,10 +1005,6 @@ class Session:
             joined = os.pathsep.join(p for p in extras if p.strip())
             if joined:
                 env["CC_FLEET_EXTRA_WORKTREE_ROOTS"] = joined
-        elif self._is_docker():
-            container_wt = self._container_worktree_path(worktree)
-            if container_wt != str(worktree):
-                env["CC_FLEET_EXTRA_WORKTREE_ROOTS"] = container_wt
         return env
 
     def _render_dev_system_prompt(self) -> str:
@@ -1149,11 +1021,6 @@ class Session:
         if self._is_remote():
             tpl = _prompt_text("dev_protocol_remote.md").read_text(encoding="utf-8")
             content = self._format_remote_prompt(tpl)
-        elif self._is_docker():
-            # docker 模式：与 local 同构（主机 worktree、commit、主控提 MR），仅追加
-            # 「编译/运行经 docker exec」的容器规约；占位由 _format_docker_prompt 展开。
-            tpl = _prompt_text("dev_protocol_docker.md").read_text(encoding="utf-8")
-            content = self._format_docker_prompt(tpl)
         else:
             content = _prompt_text("dev_protocol_local.md").read_text(encoding="utf-8")
         out.write_text(content, encoding="utf-8")
@@ -1183,21 +1050,6 @@ class Session:
             remote_ssh_alias=self.repo_cfg.remote_ssh_alias or "",
             remote_repo_path=self.repo_cfg.remote_repo_path or "",
             remote_worktree_root=self.repo_cfg.remote_worktree_root or "",
-            default_branch=self.row["default_branch"],
-            display_slug=self.row.get("display_slug") or self.slug,
-        )
-
-    def _format_docker_prompt(self, tpl: str) -> str:
-        """展开 docker dev prompt 模板里的占位符。
-
-        host_worktree 是主机 cwd（claude 读写代码处）；container_worktree 是它在容器内
-        bind-mount 后的对应路径，claude 用 `docker exec ... cd <container_worktree>` 跑编译/运行。
-        """
-        host_worktree = Path(self.row["worktree_path"])
-        return tpl.format(
-            docker_container=self.repo_cfg.docker_container or "",
-            host_worktree_path=str(host_worktree),
-            container_worktree_path=self._container_worktree_path(host_worktree),
             default_branch=self.row["default_branch"],
             display_slug=self.row.get("display_slug") or self.slug,
         )

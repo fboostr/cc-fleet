@@ -39,17 +39,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 f"ssh={r.remote_ssh_alias} remote_repo={r.remote_repo_path}",
                 file=sys.stderr,
             )
-        elif r.mode == "docker":
-            mount = (
-                f" mount={r.docker_host_root}→{r.docker_container_root}"
-                if r.docker_host_root
-                else " mount=同路径"
-            )
-            print(
-                f"[config] repo {r.name} mode=docker → path={r.path} "
-                f"container={r.docker_container}{mount}",
-                file=sys.stderr,
-            )
         else:
             print(f"[config] repo {r.name} mode=local → path={r.path}", file=sys.stderr)
     run_app(cfg)

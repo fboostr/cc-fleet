@@ -37,7 +37,7 @@ sequenceDiagram
         F->>C: 继续 plan
     end
     F->>C: dev 阶段（acceptEdits，写 worktree）
-    C->>G: git commit（local/docker 直接；remote 经 ssh）
+    C->>G: git commit（local 直接；remote 经 ssh）
     F->>G: push + 建 MR/PR
     G-->>F: MR/PR URL
     F->>U: 开发完成 ✅ + MR 链接
@@ -231,25 +231,6 @@ repos:
 
 完整生命周期差异（defer-push / 发布阶段 / 与 local 的对比表）见 [docs/remote-mode.md](./docs/remote-mode.md)。
 
-## 容器内构建仓库（mode=docker）
-
-部分项目代码在本地，但编译 / 测试 / 运行依赖一个 docker 容器里的工具链。这种仓库在 `config.yaml` 里把 `mode` 设为 `docker`：代码与 worktree、commit、提 MR 全在主机本地（与 local 一致），**仅**编译 / 运行类命令由 claude 经 `docker exec` 丢进容器执行。
-
-```yaml
-repos:
-  - name: my-project
-    aliases: [myproj]
-    path: ~/workspace/my-project                # 本地 git 仓库（同 local，必须含 .git）
-    default_branch: main
-    keywords: [my-project]
-    mode: docker
-    docker_container: my-project-dev            # 运行中的容器名 / ID（cc-fleet 只 exec 进去）
-    docker_host_root: ~/workspace               # 可选：bind-mount 前缀对；不配则容器内同主机路径
-    docker_container_root: /workspace
-```
-
-容器有两种管理方式：默认须**预先起好并保持运行**（cc-fleet 只 `docker exec`）；也可配 `docker_start_command` / `docker_stop_command` 让 cc-fleet 在每个任务前后**自动起停**（用现成镜像 `docker run` 即可）。bind-mount 须同时覆盖 `path` 与其 `-worktrees` 兄弟目录（建议挂公共父目录）。快速上手（用现成镜像 3 步起容器）与完整说明（两种方式 / 对比表 / 路径映射 / 失败即阻塞）见 [docs/docker-mode.md](./docs/docker-mode.md)。
-
 ## 安全护栏
 
 > ⚠️ **当前版本适用于内部信任环境，绝不要暴露公网**。软护栏只能在 claude code 走标准工具时拦截危险操作；被 prompt-injection 后通过 shell 字符串混淆仍可能绕过。对外暴露前需要补 macOS `sandbox-exec` 硬隔离（后续路线）。
@@ -349,7 +330,6 @@ src/cc_fleet/
 └── prompts/                        # plan / dev / 审查 / 发布阶段注入到 claude 的 system prompt
                                     #   含 plan_review_protocol.md / code_review_protocol.md（Reviewer）
                                     #   含 publish_protocol_remote.md（remote 模式发布阶段）
-                                    #   含 dev_protocol_docker.md（docker 模式：主机 commit + 容器编译）
 ```
 
 ## 贡献

@@ -50,7 +50,7 @@ cc-fleet 在架构上把「驱动一个 coding agent」做成可插拔的 runner
 
 ### 设计意图
 
-整条交付链路（session 状态机、协议解析、模式分支 local/remote/docker、worktree·MR）**与具体工具无关**；真正的工具耦合只集中在三处：① 子进程驱动、② 安全护栏、③ 少量配置 / 措辞。因此支持多 agent 是「补一层 runner 抽象 + 逐工具适配」，而非为每个工具复制整条流程。
+整条交付链路（session 状态机、协议解析、模式分支 local/remote、worktree·MR）**与具体工具无关**；真正的工具耦合只集中在三处：① 子进程驱动、② 安全护栏、③ 少量配置 / 措辞。因此支持多 agent 是「补一层 runner 抽象 + 逐工具适配」，而非为每个工具复制整条流程。
 
 ### 分层（`core/runners/`）
 
@@ -72,7 +72,7 @@ flowchart TB
 
 ### tool × mode 正交（加法不是乘法）
 
-工具（claude / codex / …）与模式（local / remote / docker）是两条正交的轴：runner / interpreter / guardrail 随**工具** ×N；模式编排（worktree 落点、SSH、`docker exec`、算护栏「允许写的根」）随**模式** ×1，已存在且工具无关。给已支持的工具加新模式、或给已支持的模式加新工具，几乎没有新的 per-(工具 × 模式) 代码 —— 是加法不是乘法。
+工具（claude / codex / …）与模式（local / remote）是两条正交的轴：runner / interpreter / guardrail 随**工具** ×N；模式编排（worktree 落点、SSH、算护栏「允许写的根」）随**模式** ×1，已存在且工具无关。给已支持的工具加新模式、或给已支持的模式加新工具，几乎没有新的 per-(工具 × 模式) 代码 —— 是加法不是乘法。
 
 ### 扩展一个新工具
 
@@ -113,7 +113,7 @@ P1 已把「子进程驱动 + 护栏」工具无关化，但有三处 claude 耦
 | `state` | TEXT | `SessionState` 枚举字面量 |
 | `claude_session_id` | TEXT | Coder 的 claude `--session-id` |
 | `reviewer_session_id` | TEXT | 独立 Reviewer 的 claude `--session-id`（懒生成） |
-| `worktree_path` | TEXT | local / docker 模式 worktree 绝对路径（主机本地）；remote 模式 = 壳子目录 |
+| `worktree_path` | TEXT | local 模式 worktree 绝对路径（主机本地）；remote 模式 = 壳子目录 |
 | `branch` | TEXT | `claude/<slug>` |
 | `default_branch` | TEXT | 目标分支（一般 `main`） |
 | `initial_request` | TEXT | 用户最初输入（已剥 `[review]` 内联指令） |
