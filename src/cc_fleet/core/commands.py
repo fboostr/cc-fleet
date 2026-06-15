@@ -59,6 +59,38 @@ _DEFAULT_VIEW_STATES: set[str] = {s.value for s in WORKING_STATES} | {
 # 被拒收，把这里调小到 1300 即可（中文场景下约对应 4K 字节）。
 _PLAN_CHUNK_LIMIT = 4000
 
+# /plan 可查的三份文档（与 HTTP 面板的 Plan / Plan 审查 / Code 审查三个 tab 一一对应）。
+# 用户输入的选择器关键词 -> 规范 doc key；省略选择器或写 "plan" 都回退到原始 plan。
+# dispatcher 也会 import 本表，用来识别「引用 + 选择器」（如 `/plan review`）。
+PLAN_SELECTOR_ALIASES: dict[str, str] = {
+    "plan": "plan",
+    "review": "plan-review",
+    "plan-review": "plan-review",
+    "code": "code-review",
+    "code-review": "code-review",
+}
+
+# 规范 doc key -> (磁盘文件名, 面向用户的标签, 文件缺失时的补充说明)。文件名与落盘逻辑
+# （Session._write_plan_md / _write_review_md）对齐；缺失说明沿用 HTTP 前端口径，便于
+# 用户判断是没启用 Reviewer 还是阶段尚未产出。
+_PLAN_DOCS: dict[str, tuple[str, str, str]] = {
+    "plan": (
+        "plan.md",
+        "plan",
+        "可能是 plan 阶段尚未跑过、或文件已被清理。",
+    ),
+    "plan-review": (
+        "plan_review.md",
+        "plan 审查",
+        "未启用 Reviewer / 该阶段尚未产出。",
+    ),
+    "code-review": (
+        "code_review.md",
+        "code 审查",
+        "未启用 Reviewer / 该阶段尚未产出。",
+    ),
+}
+
 
 def _short_slug(row: dict[str, Any]) -> str:
     return row.get("display_slug") or row["slug"]
@@ -204,7 +236,7 @@ def render_help() -> str:
         f"- `/list all`：列出最近 {_RECENT_DAYS} 天活跃过的所有状态 session（含已取消 / 已完成 / 失败 / 超时）\n"
         "- `/cancel <slug>`：取消指定 session（也可引用某 session 消息发 `/cancel`，无需带参数）\n"
         "- `/resume <slug>`：显式拉起 working 状态的孤儿 session（主控曾被中断时留下的）；awaiting / 终态请用引用回复\n"
-        "- `/plan <slug>`：查看指定 session 的 plan 文件全文（也可引用某 session 消息发 `/plan`，无需带参数）\n"
+        "- `/plan <slug> [review|code]`：查看指定 session 的 plan 全文；`review`=plan 审查、`code`=code 审查、省略=原始 plan（也可引用某 session 消息发 `/plan [review|code]`，无需带 slug）\n"
         "- `/repos`：列出当前配置的所有仓库及其 alias / keywords\n"
         "- `/help`：查看本帮助\n\n"
         f"超过 {_RECENT_DAYS} 天未活跃的 session 不在聊天里显示，请到本地网页端查看完整历史。\n\n"
@@ -294,46 +326,72 @@ async def render_plan(
 ) -> list[str]:
     """渲染 /plan 命令的应答。返回 list[str]：单条消息时长度为 1，超长时多条。
 
-    slug 解析顺序：display_slug 优先，回退 internal slug（与 /cancel 一致）。
-    路径与 ``Session._session_dir`` 对齐：``<workspace_root>/sessions/<internal>/plan.md``。
-    所有状态的 session 都可查（含 CANCELLED），只要 plan.md 还在磁盘上。
-    """
-    if not arg:
-        return [
-            "用法：`/plan <slug>`，或引用某 session 的消息发 `/plan`（无需带参数）。"
-        ]
+    支持文档选择器：``/plan <slug> [review|code]``。末尾 token 命中
+    ``PLAN_SELECTOR_ALIASES`` 时取作选择器（review=plan 审查、code=code 审查），其余
+    token 拼回 slug；省略选择器或写 ``plan`` 都回退到原始 ``plan.md``。引用某 session
+    消息发 ``/plan [review|code]`` 时，slug 由 dispatcher 从 quote 注入到 arg 开头。
 
-    row = await db.get_session_by_display_slug(arg)
+    slug 解析顺序：display_slug 优先，回退 internal slug（与 /cancel 一致）。
+    路径与 ``Session._session_dir`` 对齐：``<workspace_root>/sessions/<internal>/<file>``。
+    所有状态的 session 都可查（含 CANCELLED），只要对应文件还在磁盘上。
+    """
+    usage = (
+        "用法：`/plan <slug> [review|code]`，或引用某 session 的消息发 "
+        "`/plan [review|code]`（无需带 slug）。review=plan 审查，code=code 审查，"
+        "省略=原始 plan。"
+    )
+    if not arg:
+        return [usage]
+
+    # 解析末尾的文档选择器；其余 token 拼回 slug。slug 不含空格，正常至多两段。
+    parts = arg.split()
+    selector = "plan"
+    if len(parts) >= 2 and parts[-1].lower() in PLAN_SELECTOR_ALIASES:
+        selector = PLAN_SELECTOR_ALIASES[parts[-1].lower()]
+        parts = parts[:-1]
+    elif (
+        len(parts) == 1
+        and parts[0].lower() in PLAN_SELECTOR_ALIASES
+        and parts[0].lower() != "plan"
+    ):
+        # 直接 `/plan review` 但没给 slug（非引用场景）：提示需带 slug，不静默失败。
+        return [usage]
+    slug = " ".join(parts).strip()
+    if not slug:
+        return [usage]
+
+    filename, label, missing_hint = _PLAN_DOCS[selector]
+
+    row = await db.get_session_by_display_slug(slug)
     if row is None:
-        row = await db.get_session(arg)
+        row = await db.get_session(slug)
     if row is None:
-        return [f"未找到 session [{arg}]。"]
+        return [f"未找到 session [{slug}]。"]
 
     internal = row["slug"]
     display = row.get("display_slug") or internal
-    plan_path = (workspace_root / "sessions" / internal / "plan.md").expanduser()
+    doc_path = (workspace_root / "sessions" / internal / filename).expanduser()
 
-    if not plan_path.exists():
+    if not doc_path.exists():
         return [
-            f"session [{display}] 暂无 plan 文件（路径：{plan_path}）。"
-            "可能是 plan 阶段尚未跑过、或文件已被清理。"
+            f"session [{display}] 暂无 {label} 文件（路径：{doc_path}）。{missing_hint}"
         ]
 
     try:
-        body = plan_path.read_text(encoding="utf-8")
+        body = doc_path.read_text(encoding="utf-8")
     except OSError as e:
-        logger.exception("读取 plan 文件失败 slug=%s path=%s", internal, plan_path)
-        return [f"读取 plan 文件失败：{e}"]
+        logger.exception("读取 %s 文件失败 slug=%s path=%s", label, internal, doc_path)
+        return [f"读取 {label} 文件失败：{e}"]
 
     if not body.strip():
-        return [f"session [{display}] 的 plan 文件为空（路径：{plan_path}）。"]
+        return [f"session [{display}] 的 {label} 文件为空（路径：{doc_path}）。"]
 
     pieces = _split_for_chat(body)
     total = len(pieces)
     if total == 1:
         return pieces
     return [
-        f"**plan [{display}] ({i}/{total})**\n\n{piece}"
+        f"**{label} [{display}] ({i}/{total})**\n\n{piece}"
         for i, piece in enumerate(pieces, start=1)
     ]
 

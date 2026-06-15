@@ -24,6 +24,7 @@ from typing import Awaitable, Callable
 from ..bot.message import IncomingMessage
 from ..config.schema import AppConfig, RepoConfig
 from ..util.ids import extract_quote_context
+from .commands import PLAN_SELECTOR_ALIASES
 
 
 class DispatchKind(str, Enum):
@@ -139,6 +140,12 @@ async def classify(
                 quote_ctx = extract_quote_context(quote)
                 if quote_ctx.slug:
                     arg = quote_ctx.slug
+            # /plan 「引用 + 仅选择器」（如引用消息发 `/plan review`）：quote 提供 slug,
+            # 用户输入当文档选择器,拼成 `<slug> <selector>` 交给 render_plan 解析。
+            elif normalized == "plan" and arg is not None and arg.lower() in PLAN_SELECTOR_ALIASES:
+                quote_ctx = extract_quote_context(quote)
+                if quote_ctx.slug:
+                    arg = f"{quote_ctx.slug} {arg}"
             return DispatchDecision(
                 kind=DispatchKind.COMMAND,
                 command=normalized,

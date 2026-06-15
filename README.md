@@ -162,7 +162,7 @@ git push 默认走 SSH（macOS 请保证 `ssh-agent` 已加载 key）。提 MR/P
 | `/list` | 列出最近 7 天活跃过的工作中 / 等待回复 session；`/list all` 列出最近 7 天所有状态 session |
 | `/cancel <slug>` | 取消指定 session；也可引用某 session 消息后发 `/cancel` 无参 |
 | `/resume <slug>` | 显式拉起 working 状态的孤儿 session（主控曾被 kill 留下的）；同样支持引用回复无参 |
-| `/plan <slug>` | 查看指定 session 当前的 `plan.md` 全文；plan 文件超过 4K 字符时会自动拆多条发送 |
+| `/plan <slug> [review\|code]` | 查看指定 session 的 plan 全文：省略选择器看原始 `plan.md`，`review` 看 `plan_review.md`（Reviewer 对 plan 的审查），`code` 看 `code_review.md`（Reviewer 对编码的审查）；也可引用某 session 消息后发 `/plan [review\|code]` 无需带 slug；文件超过 4K 字符时自动拆多条发送 |
 | `/repos` | 列出 `config.yaml` 当前配置的所有仓库及其 `aliases` / `keywords` / `mode` |
 | `/help` | 查看帮助 |
 

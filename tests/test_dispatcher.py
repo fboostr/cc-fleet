@@ -603,3 +603,50 @@ async def test_plan_command_ignores_quote_continue_route(cfg: AppConfig):
     assert d.kind == DispatchKind.COMMAND and d.command == "plan"
     # quote 里有 slug 时无参回退
     assert d.command_arg == "add-login"
+
+
+async def test_plan_explicit_slug_with_selector(cfg: AppConfig):
+    """`/plan <slug> review` 显式带选择器时 command_arg 原样透传给 commands 层解析。"""
+    msg = IncomingMessage(
+        text="/plan add-login review", quote_text="", chatid="c", userid="u"
+    )
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.COMMAND
+    assert d.command == "plan"
+    assert d.command_arg == "add-login review"
+
+
+async def test_plan_quote_with_selector_only(cfg: AppConfig):
+    """引用某 session 消息发 `/plan review`：quote 提供 slug，选择器拼到 slug 之后。"""
+    msg = IncomingMessage(
+        text="/plan review",
+        quote_text="[session: add-login @feed-web sid: abcd1234-aaaa-bbbb-cccc-ddddeeeeffff]",
+        chatid="c",
+        userid="u",
+    )
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.COMMAND
+    assert d.command == "plan"
+    assert d.command_arg == "add-login review"
+
+
+async def test_plan_quote_with_selector_code(cfg: AppConfig):
+    """引用 + `/plan code` 同理拼成 `<slug> code`。"""
+    msg = IncomingMessage(
+        text="/plan code",
+        quote_text="[session: add-login]",
+        chatid="c",
+        userid="u",
+    )
+    d = await classify(msg, cfg, _always_open)
+    assert d.kind == DispatchKind.COMMAND
+    assert d.command_arg == "add-login code"
+
+
+async def test_plan_selector_only_no_quote_passes_through(cfg: AppConfig):
+    """`/plan review` 没有引用时不拼 slug，原样透传，由 commands 层回用法提示。"""
+    msg = IncomingMessage(text="/plan review", quote_text="", chatid="c", userid="u")
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.COMMAND
+    assert d.command == "plan"
+    assert d.command_arg == "review"

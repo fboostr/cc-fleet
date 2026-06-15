@@ -446,11 +446,19 @@ async def test_dispatch_command_repos(
 
 def _write_plan(workspace_root: Path, internal_slug: str, body: str) -> Path:
     """模拟 Session._write_plan_md：在 workspace_root/sessions/<slug>/ 下写 plan.md。"""
+    return _write_doc(workspace_root, internal_slug, "plan.md", body)
+
+
+def _write_doc(
+    workspace_root: Path, internal_slug: str, filename: str, body: str
+) -> Path:
+    """在 workspace_root/sessions/<slug>/ 下写任意文档（plan.md / plan_review.md /
+    code_review.md），模拟 Session 的落盘行为。"""
     sdir = workspace_root / "sessions" / internal_slug
     sdir.mkdir(parents=True, exist_ok=True)
-    plan_path = sdir / "plan.md"
-    plan_path.write_text(body, encoding="utf-8")
-    return plan_path
+    path = sdir / filename
+    path.write_text(body, encoding="utf-8")
+    return path
 
 
 async def test_plan_without_arg(db: Database, cfg: AppConfig):
@@ -528,6 +536,68 @@ async def test_dispatch_plan_routes_through_dispatch_command(
     assert isinstance(out, list)
     assert len(out) == 1
     assert "plan 正文 via dispatch" in out[0]
+
+
+# ---------- /plan 文档选择器（review / code） ----------
+
+
+async def test_plan_review_selector_reads_plan_review(db: Database, cfg: AppConfig):
+    """`/plan <slug> review` 读 plan_review.md，而非 plan.md。"""
+    await _insert(db, slug="tmp-rev", state=SessionState.PLANNING, display="rev-plan")
+    _write_plan(cfg.workspace_root, "tmp-rev", "原始 plan 正文")
+    _write_doc(cfg.workspace_root, "tmp-rev", "plan_review.md", "Plan 审查意见正文")
+    out = await render_plan(db, cfg.workspace_root, "rev-plan review")
+    assert len(out) == 1
+    assert "Plan 审查意见正文" in out[0]
+    assert "原始 plan 正文" not in out[0]
+
+
+async def test_plan_code_selector_reads_code_review(db: Database, cfg: AppConfig):
+    """`/plan <slug> code` 读 code_review.md。"""
+    await _insert(db, slug="tmp-code", state=SessionState.DEVELOPING, display="code-plan")
+    _write_doc(cfg.workspace_root, "tmp-code", "code_review.md", "Code 审查意见正文")
+    out = await render_plan(db, cfg.workspace_root, "code-plan code")
+    assert len(out) == 1
+    assert "Code 审查意见正文" in out[0]
+
+
+async def test_plan_explicit_plan_selector_reads_plan(db: Database, cfg: AppConfig):
+    """`/plan <slug> plan` 显式选 plan，与省略选择器等价。"""
+    await _insert(db, slug="tmp-exp", state=SessionState.PLANNING, display="exp-plan")
+    _write_plan(cfg.workspace_root, "tmp-exp", "原始 plan via explicit")
+    out = await render_plan(db, cfg.workspace_root, "exp-plan plan")
+    assert len(out) == 1
+    assert "原始 plan via explicit" in out[0]
+
+
+async def test_plan_review_missing_file(db: Database, cfg: AppConfig):
+    """未启用 Reviewer / 审查文件未产出时，给明确提示而非空白。"""
+    await _insert(db, slug="tmp-norev", state=SessionState.PLANNING, display="norev-plan")
+    _write_plan(cfg.workspace_root, "tmp-norev", "只有原始 plan")
+    out = await render_plan(db, cfg.workspace_root, "norev-plan review")
+    assert len(out) == 1
+    assert "暂无 plan 审查" in out[0]
+    assert "未启用 Reviewer" in out[0]
+
+
+async def test_plan_selector_without_slug_returns_usage(db: Database, cfg: AppConfig):
+    """直接 `/plan review`（无引用、无 slug）→ 用法提示，不静默失败。"""
+    out = await render_plan(db, cfg.workspace_root, "review")
+    assert len(out) == 1
+    assert "用法" in out[0]
+
+
+async def test_plan_review_selector_long_split_uses_label(db: Database, cfg: AppConfig):
+    """选择器场景下超长分页头用对应文档标签（plan 审查），而非写死的 plan。"""
+    await _insert(db, slug="tmp-revlong", state=SessionState.PLANNING, display="revlong")
+    paragraph = "审查内容 " * 80
+    body = "\n\n".join(f"## 第 {i} 节\n\n{paragraph}" for i in range(20))
+    assert len(body) > _PLAN_CHUNK_LIMIT
+    _write_doc(cfg.workspace_root, "tmp-revlong", "plan_review.md", body)
+    out = await render_plan(db, cfg.workspace_root, "revlong review")
+    assert len(out) >= 2
+    for i, piece in enumerate(out, start=1):
+        assert piece.startswith(f"**plan 审查 [revlong] ({i}/{len(out)})**")
 
 
 # ---------- _split_for_chat ----------
