@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 from enum import Enum
 from pathlib import Path
 from typing import Literal
@@ -153,6 +154,27 @@ class HttpConfig(BaseModel):
     enabled: bool = True
     bind: str = "127.0.0.1"
     port: int = 8787
+
+    @field_validator("bind")
+    @classmethod
+    def _validate_bind(cls, v: str) -> str:
+        v = v.strip()
+        # 允许合法的 IPv4 / IPv6 地址
+        try:
+            ipaddress.ip_address(v)
+            return v
+        except ValueError:
+            pass
+        # 也允许主机名（如 localhost），但拒绝明显非法的格式：
+        # 冒号分隔 + 恰好 4 段 + 每段纯数字 → 看起来像 IPv4 打错了分隔符（如 0:0:0:0）
+        if ":" in v:
+            parts = v.split(":")
+            if len(parts) == 4 and all(p.isdigit() for p in parts):
+                raise ValueError(
+                    f"bind 地址 '{v}' 看起来像 IPv4 但用了冒号分隔，"
+                    f"你可能想写的是 '{v.replace(':', '.')}'？"
+                )
+        return v
 
 
 class AppConfig(BaseModel):
