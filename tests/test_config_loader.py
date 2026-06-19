@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from cc_fleet.config.loader import load_config
-from cc_fleet.config.schema import PlatformType
+from cc_fleet.config.schema import HttpConfig, PlatformType
 
 
 @pytest.fixture(autouse=True)
@@ -67,3 +67,30 @@ def test_selected_platform_still_requires_its_env(tmp_path, monkeypatch):
     monkeypatch.setenv("WECOM_BOT_SECRET", "sec-1")
     with pytest.raises(ValueError, match="WECOM_BOT_ID"):
         load_config(_write(tmp_path, "wecom"))
+
+
+# ── HttpConfig.bind 格式校验 ──────────────────────────────────────────
+
+
+class TestHttpConfigBind:
+    """HttpConfig._validate_bind：IP 地址 / 主机名格式校验与笔误拦截。"""
+
+    def test_valid_ipv4(self):
+        cfg = HttpConfig(bind="0.0.0.0")
+        assert cfg.bind == "0.0.0.0"
+
+    def test_valid_ipv6(self):
+        cfg = HttpConfig(bind="::1")
+        assert cfg.bind == "::1"
+
+    def test_valid_hostname(self):
+        cfg = HttpConfig(bind="localhost")
+        assert cfg.bind == "localhost"
+
+    def test_colon_typo_rejected(self):
+        with pytest.raises(ValueError, match="0.0.0.0"):
+            HttpConfig(bind="0:0:0:0")
+
+    def test_colon_typo_192_168_rejected(self):
+        with pytest.raises(ValueError, match="192.168.1.1"):
+            HttpConfig(bind="192:168:1:1")
