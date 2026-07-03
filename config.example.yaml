@@ -25,12 +25,13 @@ wecom:
 # 个人微信（ilink ClawBot，腾讯官方个人号 Bot 协议）。启用时把上面 platform 改为 wechat。
 # bot_token 用 `cc-fleet wechat-login` 扫码获取后写进 .env（WECHAT_BOT_TOKEN）。
 # 注意官方限制：单聊 1:1、消息按纯文本渲染、机器人不能发文件给用户。
-# wechat:
-#   bot_token: ${env:WECHAT_BOT_TOKEN}
-#   # base_url 默认官方端点；若 wechat-login 返回的 baseurl 不同则填它
-#   base_url: https://ilinkai.weixin.qq.com
-#   # 仅允许特定微信用户(from_user_id)触发；为空表示不限制
-#   allowed_user_ids: []
+# 默认取消注释，方便个人微信用户直接改 platform 即可用；platform=wecom 时本段会被自动忽略、不要求 WECHAT_BOT_TOKEN。
+wechat:
+  bot_token: ${env:WECHAT_BOT_TOKEN}
+  # base_url 默认官方端点；若 wechat-login 返回的 baseurl 不同则填它
+  base_url: https://ilinkai.weixin.qq.com
+  # 仅允许特定微信用户(from_user_id)触发；为空表示不限制
+  allowed_user_ids: []
 
 # coding agent 工具配置。每个工具一个配置块（与未来 codex / opencode 对称）；目前仅 claude。
 claude:
