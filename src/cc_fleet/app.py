@@ -93,6 +93,34 @@ class App:
                     chatid,
                     f"未找到未结案的 session [{decision.session_slug}]。请重新发起需求。",
                 )
+        elif decision.kind == DispatchKind.CHAT:
+            message = decision.cleaned_text.strip()
+            if not message:
+                await self._bot.reply(
+                    chatid,
+                    "用法：`@<repo> /chat <消息>` 开始对话（也可省略 @repo 用回退目录）。",
+                )
+                return
+            display, fallback_note = await self._manager.new_chat_session(
+                repo_cfg=decision.repo,
+                text=message,
+                chatid=chatid,
+                userid=msg.userid,
+            )
+            # ack 末尾挂 tag（含 display_slug + repo），用户可立即引用回复续聊；
+            # 首轮输出会补上带 sid 的完整 tag。
+            tag = format_session_tag(
+                display, repo=decision.repo.name if decision.repo else None
+            )
+            lead = f"💬 已开始对话 [{display}]，claude 正在思考…"
+            if fallback_note:
+                lead = f"{fallback_note}\n\n{lead}"
+            await self._bot.reply(chatid, f"{lead}\n\n{tag}")
+            logger.info(
+                "dispatch CHAT slug=%s repo=%s",
+                display,
+                decision.repo.name if decision.repo else "-",
+            )
         elif decision.kind == DispatchKind.COMMAND:
             assert decision.command is not None
             reply_texts = await dispatch_command(

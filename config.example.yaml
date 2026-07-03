@@ -105,6 +105,15 @@ repos:
 limits:
   max_concurrent_sessions: 4
 
+# ── /chat 自由对话通道（可选，独立于交付流水线）─────────────
+# `@<repo> /chat <消息>` 开一条与 claude 的多轮对话：在该 repo 的专用 worktree 里可写运行，
+# 引用机器人回复即续聊。省略 @repo 时回退到 default_cwd（不配则用户 home 目录）并给出警告。
+# 整段可省略，全部字段都有默认值。
+chat:
+  default_cwd: ~/cc-fleet-chat   # 省略 @repo 时的回退工作目录；不配则回退到用户 home
+  max_concurrent: 4              # chat 独立并发上限（不占用 limits.max_concurrent_sessions）
+  turn_timeout_sec: 3600         # 单轮 claude 子进程超时（秒）
+
 # 本地只读 HTTP 面板（浏览器查看 session 状态、claude 事件流）
 # 默认开启、仅 127.0.0.1、无鉴权；要关掉就把 enabled 设为 false
 http:

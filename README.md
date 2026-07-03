@@ -164,6 +164,7 @@ git push 默认走 SSH（macOS 请保证 `ssh-agent` 已加载 key）。提 MR/P
 | `/resume <slug>` | 显式拉起 working 状态的孤儿 session（主控曾被 kill 留下的）；同样支持引用回复无参 |
 | `/plan <slug> [review\|code]` | 查看指定 session 的 plan 全文：省略选择器看原始 `plan.md`，`review` 看 `plan_review.md`（Reviewer 对 plan 的审查），`code` 看 `code_review.md`（Reviewer 对编码的审查）；也可引用某 session 消息后发 `/plan [review\|code]` 无需带 slug；文件超过 4K 字符时自动拆多条发送 |
 | `/repos` | 列出 `config.yaml` 当前配置的所有仓库及其 `aliases` / `keywords` / `mode` |
+| `/chat <消息>` | 进入与 claude 的多轮自由对话（可写、隔离在专用 worktree）；`@<repo> /chat <消息>` 绑定仓库，省略 `@repo` 则用回退目录并给出警告。详见下方「多轮自由对话」 |
 | `/help` | 查看帮助 |
 
 队列反馈：同时驱动的 session 数受 `limits.max_concurrent_sessions` 限制（默认 4）；超出时 dispatch 会立即回包 "已加入 @\<repo\> 队列（前面 N 个）"，前一个进终态后再起后台 task。awaiting 状态仍占槽位，避免恢复时再排队。
@@ -176,6 +177,32 @@ git push 默认走 SSH（macOS 请保证 `ssh-agent` 已加载 key）。提 MR/P
 @my-repo [review] 实现登录接口的限流        # 本次强制开启 Reviewer（即使仓库默认关）
 @my-repo [review:off] 修个错别字            # 本次强制关闭 Reviewer（即使仓库默认开）
 ```
+
+### 多轮自由对话（/chat）
+
+`/chat` 开一条**独立于交付流水线**的对话通道：把 claude 当成通过微信透出来的多轮聊天窗口 —— cc-fleet 只做 I/O 管道，把 claude 的输出原样转发给你、把你的后续输入原样喂回同一个 claude 会话。
+
+```
+@my-repo /chat 帮我看看这个项目的入口在哪     # 绑定 my-repo，在其专用 worktree 里开对话
+```
+
+- **绑定仓库 + 隔离**：`@<repo> /chat` 会为本次对话在 `<repo>-worktrees/<slug>` 建一个专用 worktree（分支 `chat/<slug>`），claude 拥有完整工具、**可写、可跑命令**，但被限制在该 worktree 内（复用与开发流程同一套 PreToolUse 安全护栏）。
+- **省略 `@repo` 的回退**：直接发 `/chat <消息>` 会回退到 `chat.default_cwd`（未配置则用户 home 目录）运行、**不建 worktree**，并回一条警告说明用了哪个回退路径。建议尽量带 `@repo`。
+- **多轮续聊**：每条 claude 回复末尾都带 `[session: <slug>]`，**引用该消息**追加内容即可续下一轮（复用与交付 session 相同的引用回复机制）；claude 会话上下文通过 `--resume` 连续。
+- **转发形式**：turn-by-turn —— 你发一条，claude 跑完这一轮，完整输出按 ~4000 字自动分段回发。
+- **并发**：chat 用独立并发池 `chat.max_concurrent`（默认 4），**不占用** `limits.max_concurrent_sessions`，长对话不会饿死 plan/dev 流水线。
+- **结束**：`/cancel <chat-slug>`，或引用 chat 消息发 `/cancel`。
+
+配置见 `config.yaml` 的 `chat:` 段：
+
+```yaml
+chat:
+  default_cwd: ~/cc-fleet-chat   # 省略 @repo 时的回退工作目录；不配则回退到用户 home
+  max_concurrent: 4              # chat 独立并发上限
+  turn_timeout_sec: 3600         # 单轮 claude 子进程超时（秒）
+```
+
+> 注意：`/chat` 里 claude 可写、可执行命令，安全边界与开发流程一致（内部信任环境专用）；回退到 home 目录时写范围较宽，建议配置专用 `chat.default_cwd` 收窄。
 
 ## 管理 CLI
 
@@ -305,11 +332,12 @@ src/cc_fleet/
 │   ├── runner.py                   # 企微 WebSocket 接入（包 aibot SDK）
 │   └── message.py                  # IncomingMessage / OutgoingReply 数据类
 ├── core/
-│   ├── dispatcher.py               # 消息分类（new/continue/command/noise）
+│   ├── dispatcher.py               # 消息分类（new/continue/command/chat/noise）
 │   ├── session.py                  # 单 session 的状态机
-│   ├── session_manager.py          # 并发驱动（Semaphore + 后台 task）
+│   ├── session_manager.py          # 并发驱动（Semaphore + 后台 task；含 chat 独立池）
 │   ├── commands.py                 # /list /cancel /plan /help 实现
-│   ├── state.py                    # SessionState 枚举与语义集合
+│   ├── chat.py                     # /chat 多轮自由对话会话（独立于交付流水线）
+│   ├── state.py                    # SessionState 枚举与语义集合（含 chat 状态）
 │   ├── claude_runner.py            # claude 子进程封装（stream-json 解析）
 │   ├── slug.py                     # SLUG/STATUS 协议解析
 │   ├── mr_meta.py                  # MR_TITLE/MR_DESCRIPTION 协议解析
@@ -327,9 +355,10 @@ src/cc_fleet/
 │   └── static/index.html           # 单文件前端（原生 JS）
 ├── config/                         # pydantic schema + YAML loader
 ├── util/                           # ids / time / logging 工具
-└── prompts/                        # plan / dev / 审查 / 发布阶段注入到 claude 的 system prompt
+└── prompts/                        # plan / dev / 审查 / 发布 / chat 阶段注入到 claude 的 system prompt
                                     #   含 plan_review_protocol.md / code_review_protocol.md（Reviewer）
                                     #   含 publish_protocol_remote.md（remote 模式发布阶段）
+                                    #   含 chat_protocol.md（/chat 自由对话）
 ```
 
 ## 贡献

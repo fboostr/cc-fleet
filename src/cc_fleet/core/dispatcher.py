@@ -31,6 +31,7 @@ class DispatchKind(str, Enum):
     NEW = "new"
     CONTINUE = "continue"
     COMMAND = "command"
+    CHAT = "chat"
     NOISE = "noise"
 
 
@@ -99,6 +100,21 @@ def _new_decision(repo: RepoConfig, text: str) -> DispatchDecision:
     )
 
 
+# `/chat` 指令头（大小写不敏感）：识别裸 `/chat <msg>` 与 `@repo /chat <msg>`。
+_CHAT_COMMAND = "/chat"
+
+
+def _extract_chat_command(text: str) -> str | None:
+    """若 text 以 `/chat`（后接空格或结尾）开头，返回其后的消息正文（可空串）；否则 None。
+
+    `/chatxxx` 这类非精确前缀不误判（partition 出的 head 必须恰好等于 `/chat`）。
+    """
+    head, _, rest = text.partition(" ")
+    if head.lower() == _CHAT_COMMAND:
+        return rest.strip()
+    return None
+
+
 def _match_by_keyword(text: str, repos: list[RepoConfig]) -> RepoConfig | None:
     for repo in repos:
         for kw in repo.keywords:
@@ -131,6 +147,13 @@ async def classify(
         head, _, rest = text.partition(" ")
         if head == text:
             head, rest = text, ""
+        # /chat：进入自由对话通道（未带 @repo，回退目录由 SessionManager 解析并警告）。
+        if head.lower() == _CHAT_COMMAND:
+            return DispatchDecision(
+                kind=DispatchKind.CHAT,
+                repo=None,
+                cleaned_text=rest.strip(),
+            )
         normalized = _COMMAND_ALIASES.get(head.lower())
         if normalized is not None:
             arg = rest.strip() or None
@@ -178,6 +201,14 @@ async def classify(
         alias, rest = m.group(1), m.group(2).strip()
         repo = config.repo_by_name_or_alias(alias)
         if repo is not None:
+            # `@repo /chat <msg>` → 绑定该 repo 的自由对话；否则常规新需求。
+            chat_msg = _extract_chat_command(rest)
+            if chat_msg is not None:
+                return DispatchDecision(
+                    kind=DispatchKind.CHAT,
+                    repo=repo,
+                    cleaned_text=chat_msg,
+                )
             # 显式 @ 优先：忽略 quote 里的隐式信息
             return _new_decision(repo, rest)
         last_unknown_alias = alias

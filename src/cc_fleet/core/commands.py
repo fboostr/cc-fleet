@@ -31,7 +31,8 @@ from typing import TYPE_CHECKING, Any
 
 from ..config.schema import AppConfig
 from ..storage.db import Database
-from .state import WORKING_STATES, SessionState
+from ..util.text import split_for_chat
+from .state import CHAT_STATES, WORKING_STATES, SessionState
 
 if TYPE_CHECKING:
     from .session_manager import SessionManager
@@ -49,9 +50,12 @@ _RECENT_DAYS = 7
 # code_reviewing）+ 等待用户回复。从 WORKING_STATES 派生，避免新增工作态时这里漏更新。
 # RESUMABLE_TERMINAL（FAILED/TIMEOUT/COMPLETED）虽然 is_open=True、可被引用回复唤醒，
 # 但用户口径里不算"工作中或等待回复"，统一归 /list all 才看得到。
-_DEFAULT_VIEW_STATES: set[str] = {s.value for s in WORKING_STATES} | {
-    SessionState.AWAITING_USER_CLARIFICATION.value,
-}
+_DEFAULT_VIEW_STATES: set[str] = (
+    {s.value for s in WORKING_STATES}
+    | {SessionState.AWAITING_USER_CLARIFICATION.value}
+    # chat 通道的 chatting / chat_awaiting 也算"工作中/等待回复"，默认视图可见。
+    | {s.value for s in CHAT_STATES}
+)
 
 # /plan 单条消息字符上限。企微 markdown 单条上限约 4K，这里以 4000 字符为切片阈值，
 # 预留少量空间给分页头（"**plan [slug] (i/N)**\n\n"）。中文场景一字符 ~3 字节时，
@@ -238,9 +242,12 @@ def render_help() -> str:
         "- `/resume <slug>`：显式拉起 working 状态的孤儿 session（主控曾被中断时留下的）；awaiting / 终态请用引用回复\n"
         "- `/plan <slug> [review|code]`：查看指定 session 的 plan 全文；`review`=plan 审查、`code`=code 审查、省略=原始 plan（也可引用某 session 消息发 `/plan [review|code]`，无需带 slug）\n"
         "- `/repos`：列出当前配置的所有仓库及其 alias / keywords\n"
+        "- `/chat <消息>`：进入与 claude 的多轮自由对话（可写、隔离在专用 worktree）；"
+        "带 `@<repo>` 绑定仓库，省略则用回退目录并给出警告\n"
         "- `/help`：查看本帮助\n\n"
         f"超过 {_RECENT_DAYS} 天未活跃的 session 不在聊天里显示，请到本地网页端查看完整历史。\n\n"
         "**发起新需求**：`@<repo> 需求描述`\n"
+        "**多轮对话**：`@<repo> /chat <消息>`，之后**引用**机器人回复即可继续对话\n"
         "**单需求开关 Reviewer**：需求里加 `[review]`（本次强制开审查）或 `[review:off]`（本次强制关），覆盖该仓库默认；标记会从需求中剥除\n"
         "**补充已有 session**：引用机器人含 `[session: <slug>]` 的消息回复即可"
     )
@@ -281,42 +288,9 @@ def render_repos(config: AppConfig) -> str:
     return "\n".join(lines)
 
 
-def _split_for_chat(text: str, limit: int = _PLAN_CHUNK_LIMIT) -> list[str]:
-    """把长文本切成不超过 ``limit`` 字符的多段，尽量在段落/行边界处切。
-
-    策略：
-    1. 整体 <= limit：原样返回单元素列表。
-    2. 超长：贪心切片，先在 ``\\n\\n`` 段落边界回退，找不到再退到 ``\\n`` 行边界，
-       最后退到硬切。每片末尾的空白裁掉、下一片开头同样跳过紧贴的空白。
-    """
-    if not text:
-        return [""]
-    if len(text) <= limit:
-        return [text]
-
-    chunks: list[str] = []
-    pos = 0
-    n = len(text)
-    while pos < n:
-        end = pos + limit
-        if end >= n:
-            chunks.append(text[pos:].rstrip())
-            break
-        # 优先在段落（\n\n）边界回退
-        cut = text.rfind("\n\n", pos, end)
-        if cut == -1 or cut <= pos:
-            # 退到行边界
-            cut = text.rfind("\n", pos, end)
-        if cut == -1 or cut <= pos:
-            # 没有合适边界，硬切
-            cut = end
-        chunks.append(text[pos:cut].rstrip())
-        # 跳过紧贴的换行/空白，避免下一片开头一堆空行
-        pos = cut
-        while pos < n and text[pos] in ("\n", " ", "\t"):
-            pos += 1
-    # 极端情况下可能产生空 chunk（如开头就一堆空白），剔除
-    return [c for c in chunks if c]
+# `_split_for_chat` 的实现已迁到 util.text.split_for_chat（供 core/chat.py 等复用，避免
+# 依赖本模块）。此处保留同名别名，兼容既有导入（如 tests/test_commands.py）。
+_split_for_chat = split_for_chat
 
 
 async def render_plan(
@@ -386,7 +360,7 @@ async def render_plan(
     if not body.strip():
         return [f"session [{display}] 的 {label} 文件为空（路径：{doc_path}）。"]
 
-    pieces = _split_for_chat(body)
+    pieces = split_for_chat(body, _PLAN_CHUNK_LIMIT)
     total = len(pieces)
     if total == 1:
         return pieces

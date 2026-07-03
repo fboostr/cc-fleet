@@ -69,6 +69,47 @@ def test_selected_platform_still_requires_its_env(tmp_path, monkeypatch):
         load_config(_write(tmp_path, "wecom"))
 
 
+# ── /chat 配置段 ──────────────────────────────────────────────────────
+
+
+def test_chat_section_parsed(tmp_path, monkeypatch):
+    monkeypatch.setenv("WECOM_BOT_ID", "id-1")
+    monkeypatch.setenv("WECOM_BOT_SECRET", "sec-1")
+    body = textwrap.dedent(
+        f"""
+        workspace_root: {tmp_path}/ws
+        log_dir: {tmp_path}/logs
+        db_path: {tmp_path}/state.db
+        platform: wecom
+        wecom:
+          bot_id: ${{env:WECOM_BOT_ID}}
+          bot_secret: ${{env:WECOM_BOT_SECRET}}
+        chat:
+          default_cwd: {tmp_path}/chatdir
+          max_concurrent: 2
+          turn_timeout_sec: 120
+        repos:
+          - name: demo
+            path: {tmp_path}
+        """
+    )
+    p = tmp_path / "config.yaml"
+    p.write_text(body, encoding="utf-8")
+    cfg = load_config(p)
+    assert cfg.chat.max_concurrent == 2
+    assert cfg.chat.turn_timeout_sec == 120
+    assert str(cfg.chat.default_cwd) == f"{tmp_path}/chatdir"
+
+
+def test_chat_section_defaults_when_absent(tmp_path, monkeypatch):
+    monkeypatch.setenv("WECOM_BOT_ID", "id-1")
+    monkeypatch.setenv("WECOM_BOT_SECRET", "sec-1")
+    cfg = load_config(_write(tmp_path, "wecom"))
+    assert cfg.chat.default_cwd is None
+    assert cfg.chat.max_concurrent == 4
+    assert cfg.chat.turn_timeout_sec == 3600
+
+
 # ── HttpConfig.bind 格式校验 ──────────────────────────────────────────
 
 

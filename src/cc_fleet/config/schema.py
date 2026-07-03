@@ -177,6 +177,28 @@ class HttpConfig(BaseModel):
         return v
 
 
+class ChatConfig(BaseModel):
+    """`/chat` 自由对话通道的配置（独立于 plan→dev→MR 交付流水线）。
+
+    - default_cwd：`/chat` 未带 `@repo` 时的回退工作目录；为空则回退到用户 home。
+      有 `@repo` 时忽略本项，cwd 用新建的 worktree。
+    - max_concurrent：并发 chat 轮次上限。独立于 ``limits.max_concurrent_sessions``，
+      chat 常长时间挂着等用户，用独立池避免饿死交付流水线。
+    - turn_timeout_sec：单轮 claude 子进程超时秒数（chat 可写、可能跑得久）。
+    """
+
+    default_cwd: Path | None = None
+    max_concurrent: int = 4
+    turn_timeout_sec: int = 3600
+
+    @field_validator("default_cwd", mode="before")
+    @classmethod
+    def _expand_cwd(cls, v: str | Path | None) -> Path | None:
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        return Path(v).expanduser()
+
+
 class AppConfig(BaseModel):
     workspace_root: Path
     log_dir: Path
@@ -193,6 +215,7 @@ class AppConfig(BaseModel):
     repos: list[RepoConfig]
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     http: HttpConfig = Field(default_factory=HttpConfig)
+    chat: ChatConfig = Field(default_factory=ChatConfig)
     worktree_retention_hours: int = 168
 
     @model_validator(mode="before")
