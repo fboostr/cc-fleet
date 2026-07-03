@@ -334,6 +334,7 @@ def test_help_text_lists_new_commands():
     assert "/plan" in text
     assert "/repos" in text
     assert "/chat" in text
+    assert "/dev" in text
     # 文案明确"超过 7 天到网页端查看"
     assert "网页端" in text
 

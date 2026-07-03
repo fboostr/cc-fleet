@@ -167,6 +167,8 @@ class Session:
         chatid: str,
         userid: str,
         review_override: bool | None = None,
+        claude_session_id: str | None = None,
+        origin_chat_slug: str | None = None,
     ) -> None:
         """同步建 db 行 + 落第一条消息 + session_started 事件；不 drive。
 
@@ -175,6 +177,10 @@ class Session:
 
         ``review_override``：单需求级 Reviewer 覆盖（None 跟随 repo 配置 / True 强制开 /
         False 强制关），落 ``review_override`` 列；SQLite 无原生 bool，存 NULL/1/0。
+
+        ``claude_session_id`` / ``origin_chat_slug``：由 /dev handoff 预置——前者复用被转
+        入的 /chat 会话 id（``_do_new`` 会保留、``_do_planning`` 首轮据此 --resume 整段讨论），
+        后者标记本 row 由哪条 chat 转入。普通新需求两者都为 None，行为与改动前完全一致。
         """
         self.slug = new_internal_slug()
         await self.db.insert_session(
@@ -183,7 +189,7 @@ class Session:
                 "display_slug": None,
                 "repo": self.repo_cfg.name,
                 "state": SessionState.NEW.value,
-                "claude_session_id": None,
+                "claude_session_id": claude_session_id,
                 "worktree_path": None,
                 "branch": None,
                 "default_branch": self.repo_cfg.default_branch,
@@ -196,6 +202,7 @@ class Session:
                 "review_override": (
                     None if review_override is None else int(review_override)
                 ),
+                "origin_chat_slug": origin_chat_slug,
             }
         )
         await self.db.add_message(self.slug, "in", initial_request)
@@ -365,6 +372,7 @@ class Session:
         guardrail = self.runner.guardrail.prepare(settings_dir=self._session_dir() / ".cc-fleet")
         stream_log = self._session_dir() / "stream.jsonl"
 
+        resumed_handoff = False
         # prompt 优先级：Reviewer 修订反馈 > 用户澄清回路 > 首次 plan
         if self._pending_revision_feedback is not None:
             # 从 PLAN_REVIEWING 回来：把 Reviewer 意见作为修订指令，resume Coder 会话完善 plan。
@@ -380,8 +388,15 @@ class Session:
             # 首次 plan vs 澄清回路
             is_first = self.row["clarify_rounds"] == 0 and not self.pending_user_message
             if is_first:
-                prompt = self.row["initial_request"]
-                resume_from = None
+                if self.row.get("origin_chat_slug"):
+                    # /dev handoff：首轮 --resume 被转入的 /chat 会话（claude_session_id 已由
+                    # create_row 预置、_do_new 保留），基于讨论直接进入规划，不重述需求。
+                    prompt = self._format_handoff_plan_prompt()
+                    resume_from = self.row["claude_session_id"]
+                    resumed_handoff = True
+                else:
+                    prompt = self.row["initial_request"]
+                    resume_from = None
             else:
                 prompt = self.pending_user_message or ""
                 self.pending_user_message = None
@@ -408,6 +423,16 @@ class Session:
         if result.exit_code not in (0, None) or result.result_is_error:
             await self._fail(format_run_failure(result, "plan"))
             return
+
+        # /dev handoff 首轮 --resume 的是外部（chat）建的会话，claude 可能 fork 出新 id；
+        # 采纳它，否则后续轮会 resume 到陈旧 id。普通 pipeline 首轮走 --session-id 不受影响，
+        # 故以 resumed_handoff 守卫，对普通路径零副作用（与 chat.py:run_turn 同类处理对称）。
+        if (
+            resumed_handoff
+            and result.session_id
+            and result.session_id != self.row["claude_session_id"]
+        ):
+            await self._update(claude_session_id=result.session_id)
 
         protocol = parse_plan_output(result.text_output)
         if protocol.status is None:
@@ -897,6 +922,21 @@ class Session:
         if clar:
             parts.append("## plan 阶段澄清问答\n" + "\n".join(clar))
         return "\n\n".join(parts)
+
+    def _format_handoff_plan_prompt(self) -> str:
+        """/dev handoff 首轮 plan prompt：基于已 --resume 的 /chat 讨论直接规划。
+
+        关键是提示 claude **不要**把需求重问一遍 / 从零发散——讨论已在被 resume 的会话
+        上下文里。附上转入时组装的 initial_request（含对话最初需求 + 转开发补充说明）兜底。
+        """
+        req = (self.row.get("initial_request") or "").strip()
+        return (
+            "我们刚才已经在对话中把这个需求讨论清楚了。现在进入正式的规划（plan）阶段：\n"
+            "请**基于我们前面对话中已经达成的理解与结论**产出实施 plan，不要把需求重新问一遍，"
+            "也不要从零重新发散。\n\n"
+            f"{req}\n\n"
+            "其余输出要求见已注入的 plan 协议（正文给出 plan，末尾按格式输出 SLUG / STATUS）。"
+        )
 
     def _format_plan_revision_prompt(self, feedback: str, *, approved: bool = False) -> str:
         if approved:

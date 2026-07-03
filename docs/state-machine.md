@@ -8,7 +8,7 @@ cc-fleet 一个 session 的完整生命周期由 `core/session.py:Session.drive(
 
 ```mermaid
 stateDiagram-v2
-    [*] --> new: new_session
+    [*] --> new: new_session / handoff（/dev，预置 chat 的 claude 会话）
     new --> planning: _do_new
     planning --> awaiting_user_clarification: NEED_CLARIFICATION
     awaiting_user_clarification --> planning: apply_clarification

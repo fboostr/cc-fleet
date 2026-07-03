@@ -39,7 +39,9 @@ flowchart LR
 1. `dispatcher.classify(msg, config, is_open_session)` 把消息归类
 2. 按 `DispatchKind` 走分支：
    - `NEW` → `SessionManager.new_session()` 同步建 db 行 + 起后台 task
-   - `CONTINUE` → `SessionManager.continue_session()`（awaiting：唤醒已等的 task；resumable_terminal：起新 task 复活）
+   - `CONTINUE` → `SessionManager.continue_session()`（awaiting：唤醒已等的 task；resumable_terminal：起新 task 复活；chat 分流到 `_continue_chat`）
+   - `CHAT` → `SessionManager.new_chat_session()` 起 `/chat` 独立对话通道
+   - `HANDOFF`（`/dev`）→ `SessionManager.new_pipeline_from_chat()` 把被引用的 chat 讨论复用同一 claude 会话转成 pipeline，并归档原 chat
    - `COMMAND` → `commands.dispatch_command()` 同步算结果
    - `NOISE` → 直接 reply 提示
 3. 后台 `_session_loop` acquire semaphore → 反复 `Session.drive()`，遇 awaiting 等 `resume_event`，遇终态退出
@@ -121,6 +123,8 @@ P1 已把「子进程驱动 + 护栏」工具无关化，但有三处 claude 耦
 | `clarify_rounds` | INT | plan ↔ awaiting 已发生轮数 |
 | `plan_review_rounds` / `code_review_rounds` | INT | Reviewer 已发生轮数 |
 | `review_override` | INT NULL | 单需求覆盖：NULL=跟随 repo / 1=强制开 / 0=强制关 |
+| `session_kind` | TEXT | `pipeline`（默认，交付流水线）/ `chat`（`/chat` 自由对话） |
+| `origin_chat_slug` | TEXT NULL | `/dev` handoff 转入时记录来源 chat 的内部 slug；NULL=普通新需求（部分唯一索引保证一条 chat 只转一次） |
 | `mr_url` | TEXT | MR/PR URL |
 | `last_error` / `failed_phase` | TEXT | 失败时记录，决定 follow-up resume 目标 |
 | `created_at` / `updated_at` | TEXT | ISO8601 + 本地时区 |

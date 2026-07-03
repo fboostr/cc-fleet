@@ -109,6 +109,7 @@ git push uses SSH by default (load your key into `ssh-agent` on macOS). MR/PR cr
 | `/plan <slug>` | Show the session's current `plan.md` in full |
 | `/repos` | List configured repos with their `aliases` / `keywords` / `mode` |
 | `/chat <msg>` | Start a multi-turn free-form conversation with the agent (writable, isolated in a dedicated worktree); `@<repo> /chat <msg>` binds a repo, omit `@repo` to use a fallback dir (with a warning). See "Free-form chat" below |
+| `/dev [notes]` | **Quote** a `/chat` message to turn that discussion into a real delivery task (reuses the chat context, runs the full plan→dev→MR pipeline). See "Hand a chat off to development" below |
 | `/help` | Help text |
 
 Concurrency is capped by `limits.max_concurrent_sessions` (default 4); excess requests are queued.
@@ -128,7 +129,21 @@ You can also override the Reviewer per request: add `[review]` (force on) or `[r
 - **Multi-turn**: every reply ends with `[session: <slug>]`; **quote that message** and add text to continue the next turn (same quote-reply mechanism as delivery sessions); context continuity is via `--resume`.
 - **Turn-by-turn**: you send one message, the agent finishes that turn, and the full output is auto-split into ~4000-char chunks.
 - **Concurrency**: chat uses its own pool `chat.max_concurrent` (default 4) and does **not** consume `limits.max_concurrent_sessions`, so long chats never starve the plan/dev pipeline.
-- **End it**: `/cancel <chat-slug>`, or quote a chat message and send `/cancel`.
+- **End it**: `/cancel <chat-slug>`, or quote a chat message and send `/cancel`; once the requirement is nailed down you can also `/dev` it into real development (see below).
+
+#### Hand a chat off to development (`/dev`)
+
+When a requirement takes several rounds to pin down, discuss it in `/chat` first, then **quote** any bot message from that chat and send `/dev [notes]` to turn the discussion straight into a real delivery task:
+
+```
+/dev also add unit tests please      # send this while quoting a chat reply
+```
+
+- **Zero context loss**: the new delivery session **reuses the same agent session** (`--resume`), so the whole discussion carries into planning with no need to restate it. The first plan turn is told to plan *from the agreed conclusions* rather than re-exploring.
+- **Full pipeline**: it starts at **planning**, producing `plan.md` (optionally plan review), then dev → (optional code review) → MR, exactly like a normal request.
+- **Repo inherited from the chat**: a task handed off from `@<repo> /chat` develops in a clean worktree of that repo (`<repo>-worktrees/<slug>`, branch `claude/<slug>`); context rides on `--resume`, not on the chat worktree's scratch changes. A **bare `/chat` (no repo) cannot be `/dev`'d** — re-run it as `@<repo> /chat`, or just `@<repo> <request>`.
+- **Chat archived**: after handoff the original chat is archived (no more replies); follow up by quoting the **delivery task's** messages instead. A chat can be handed off only once.
+- **Preconditions**: the chat must have replied at least once (agent session established) and not be mid-reply.
 
 Config lives under the `chat:` block in `config.yaml`:
 

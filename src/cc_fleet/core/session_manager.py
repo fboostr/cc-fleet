@@ -25,13 +25,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from pathlib import Path
 from typing import Any
 
 from ..config.schema import AppConfig, RepoConfig
 from ..storage.db import Database
 from ..util.ids import format_session_tag
-from .chat import ChatSession
+from .chat import _NO_REPO, ChatSession
 from .session import ReplyFunc, Session
 from .state import SessionState, is_open, is_resumable_terminal, is_terminal
 
@@ -428,6 +429,123 @@ class SessionManager:
         except Exception:  # noqa: BLE001
             logger.exception("chat %s 回复失败", row.get("slug") or "")
 
+    # ---------- /chat → pipeline handoff（/dev） ----------
+
+    async def new_pipeline_from_chat(
+        self,
+        *,
+        chat_slug: str,
+        supplement: str,
+        chatid: str,
+        userid: str,
+        review_override: bool | None = None,
+    ) -> tuple[str | None, str | None, int, str | None]:
+        """把一条 /chat 对话转成正式开发 pipeline（/dev handoff）。
+
+        复用被转入 chat 的 ``claude_session_id``（新 pipeline 首轮 --resume 整段讨论），新建
+        一个 ``session_kind='pipeline'`` 的 row 从 NEW 起走完整流水线；随后归档原 chat。
+
+        返回 ``(internal_slug, repo_name, ahead, error)``：error 非 None 时前三项为占位
+        （None/None/0），由上层原样回给用户。所有前置校验失败都在这里以中文 error 返回，
+        不建 row、不起 task。
+        """
+        row = await self.db.get_session_by_display_slug(chat_slug)
+        if row is None:
+            row = await self.db.get_session(chat_slug)
+        if row is None:
+            return None, None, 0, (
+                f"未找到该 /chat 会话 [{chat_slug}]。请引用一条 /chat 对话的机器人消息再发 /dev。"
+            )
+
+        display = row.get("display_slug") or row["slug"]
+        if row.get("session_kind") != "chat":
+            return None, None, 0, (
+                f"/dev 只能把 /chat 对话转成开发任务；[{display}] 不是 chat 会话。"
+            )
+
+        state = SessionState(row["state"])
+        if state == SessionState.CHATTING:
+            return None, None, 0, (
+                f"chat [{display}] 正在生成回复，请等它回复完再 /dev。"
+            )
+
+        repo_name = row["repo"]
+        if repo_name == _NO_REPO:
+            return None, None, 0, (
+                "这条 chat 没有绑定仓库（当初用的是裸 /chat），无法直接转开发。"
+                "请用 `@<repo> /chat` 重新聊清楚后再 /dev，或直接 `@<repo> 需求` 开发。"
+            )
+
+        repo_cfg = self.config.repo_by_name_or_alias(repo_name)
+        if repo_cfg is None:
+            return None, None, 0, (
+                f"chat 所属仓库 `{repo_name}` 不在当前配置中，无法转开发。"
+            )
+
+        csid = row.get("claude_session_id")
+        if not csid:
+            return None, None, 0, (
+                "这条 chat 还没成功回复过（claude 会话尚未建立），无法 /dev。"
+                "请等它回复后再试。"
+            )
+
+        chat_internal = row["slug"]
+        if await self.db.session_exists_with_origin(chat_internal):
+            return None, None, 0, (
+                "这条 chat 已经转过开发任务了，请引用该开发任务的机器人消息继续。"
+            )
+
+        session = self._build(repo_cfg)
+        initial_request = _compose_handoff_request(row.get("initial_request"), supplement)
+        try:
+            await session.create_row(
+                initial_request=initial_request,
+                chatid=chatid,
+                userid=userid,
+                review_override=review_override,
+                claude_session_id=csid,
+                origin_chat_slug=chat_internal,
+            )
+        except sqlite3.IntegrityError:
+            # 并发双 /dev：部分唯一索引 idx_sessions_origin_chat 原子挡住第二个。
+            return None, None, 0, (
+                "这条 chat 已经转过开发任务了，请引用该开发任务的机器人消息继续。"
+            )
+
+        # 归档原 chat：置 CANCELLED + 提示。放在起 task 之前，确保原 chat loop 不会再起一轮
+        # 而与新 pipeline 抢同一个 claude 会话。
+        await self._archive_chat_after_handoff(chat_internal, session.slug)
+
+        ahead = self._pending  # 自己尚未计入
+        self._pending += 1
+        ctx = _SessionCtx(session)
+        self._sessions[session.slug] = ctx
+        ctx.task = asyncio.create_task(
+            self._session_loop(ctx),
+            name=f"session:{session.slug}:handoff",
+        )
+        logger.info(
+            "handoff：chat %s → pipeline %s（复用 csid，从 PLANNING 重规划）",
+            chat_internal, session.slug,
+        )
+        return session.slug, repo_cfg.name, ahead, None
+
+    async def _archive_chat_after_handoff(
+        self, chat_internal: str, pipeline_slug: str
+    ) -> None:
+        """把被转入的 chat 归档为 CANCELLED（复用内存 ctx 或建临时对象），并唤醒其 loop 退出。"""
+        ctx = self._chats.get(chat_internal)
+        if ctx is not None:
+            ctx.cancel_requested = True
+            await ctx.chat.mark_handed_off(pipeline_slug)
+            ctx.resume_event.set()
+            return
+        chat = ChatSession(
+            db=self.db, config=self.config, reply=self.reply, repo_cfg=None
+        )
+        await chat.resume(chat_internal)
+        await chat.mark_handed_off(pipeline_slug)
+
     # ---------- 显式恢复 ----------
 
     async def resume_session(self, slug: str) -> tuple[bool, str]:
@@ -643,3 +761,19 @@ def _worktree_exists(path: str | None) -> bool:
     if not path:
         return False
     return Path(path).is_dir()
+
+
+def _compose_handoff_request(chat_first: str | None, supplement: str | None) -> str:
+    """组装 handoff pipeline 的 initial_request：对话最初需求 + 转开发补充说明。
+
+    真正的讨论上下文靠 --resume 复用 chat 会话承载，这里的文本只作兜底 / 审计（也会喂给
+    独立 Reviewer——它不 resume chat）。任一为空则省略对应段落。
+    """
+    parts = ["【由 /chat 对话转入的开发任务】"]
+    first = (chat_first or "").strip()
+    if first:
+        parts.append(f"对话最初的需求描述：\n{first}")
+    sup = (supplement or "").strip()
+    if sup:
+        parts.append(f"转开发时的补充说明：\n{sup}")
+    return "\n\n".join(parts)
