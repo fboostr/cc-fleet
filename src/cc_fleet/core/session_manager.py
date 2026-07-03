@@ -31,6 +31,7 @@ from typing import Any
 from ..config.schema import AppConfig, RepoConfig
 from ..storage.db import Database
 from ..util.ids import format_session_tag
+from .chat import ChatSession
 from .session import ReplyFunc, Session
 from .state import SessionState, is_open, is_resumable_terminal, is_terminal
 
@@ -49,14 +50,29 @@ class _SessionCtx:
         self.cancel_requested = False
 
 
+class _ChatCtx:
+    """单 chat 会话的内存上下文：task + 用户回复事件 + 取消标志（结构同 _SessionCtx）。"""
+
+    __slots__ = ("chat", "task", "resume_event", "cancel_requested")
+
+    def __init__(self, chat: ChatSession) -> None:
+        self.chat = chat
+        self.task: asyncio.Task | None = None
+        self.resume_event = asyncio.Event()
+        self.cancel_requested = False
+
+
 class SessionManager:
     def __init__(self, db: Database, config: AppConfig, reply: ReplyFunc) -> None:
         self.db = db
         self.config = config
         self.reply = reply
         self._slot = asyncio.Semaphore(config.limits.max_concurrent_sessions)
+        # /chat 独立并发池：与交付流水线的 _slot 完全隔离，避免长对话饿死 plan/dev。
+        self._chat_slot = asyncio.Semaphore(config.chat.max_concurrent)
         self._repo_locks: dict[str, asyncio.Lock] = {}
         self._sessions: dict[str, _SessionCtx] = {}
+        self._chats: dict[str, _ChatCtx] = {}
         # dispatch 路径上看见的 in-flight 数（已建 row 但尚未进 terminal）；用来算"前面 N 个"。
         self._pending = 0
 
@@ -140,6 +156,10 @@ class SessionManager:
             row = await self.db.get_session(slug)
         if row is None or not is_open(row["state"]):
             return False
+
+        # chat 会话走独立分流：状态语义（chatting/chat_awaiting）与 pipeline 不同。
+        if row.get("session_kind") == "chat":
+            return await self._continue_chat(row, text, quote_text)
 
         internal = row["slug"]
         display = row.get("display_slug") or internal
@@ -239,6 +259,174 @@ class SessionManager:
             await self.reply(chatid, f"{text}\n\n{tag}")
         except Exception:  # noqa: BLE001 - ack 失败不应阻塞 drive
             logger.exception("session %s continue ack 发送失败", row.get("slug") or "")
+
+    # ---------- /chat 通道 ----------
+
+    async def new_chat_session(
+        self,
+        *,
+        repo_cfg: RepoConfig | None,
+        text: str,
+        chatid: str,
+        userid: str,
+    ) -> tuple[str, str | None]:
+        """同步建 chat row + 起后台 _chat_loop。返回 (display_slug, 回退警告或 None)。
+
+        无 @repo 时回退到 chat.default_cwd → 用户 home，并生成一条警告文案由上层拼进 ack。
+        chat 不占用 ``_slot``，也不计入 ``_pending``（走独立 ``_chat_slot`` 池）。
+        """
+        fallback_cwd: Path | None = None
+        note: str | None = None
+        if repo_cfg is None:
+            cfg_cwd = self.config.chat.default_cwd
+            fallback_cwd = (cfg_cwd or Path.home()).expanduser()
+            src = "chat.default_cwd 配置" if cfg_cwd else "用户 home 目录"
+            note = (
+                f"⚠️ 未指定 @repo，本次 chat 在回退目录 `{fallback_cwd}`（{src}）中运行，"
+                "不创建隔离 worktree。建议改用 `@<repo> /chat …` 绑定仓库以获得隔离。"
+            )
+        fetch_lock = self._repo_lock(repo_cfg.name) if repo_cfg is not None else None
+        chat = ChatSession(
+            db=self.db,
+            config=self.config,
+            reply=self.reply,
+            repo_cfg=repo_cfg,
+            fallback_cwd=fallback_cwd,
+            fetch_lock=fetch_lock,
+        )
+        display = await chat.create_row(text=text, chatid=chatid, userid=userid)
+        ctx = _ChatCtx(chat)
+        self._chats[chat.slug] = ctx
+        ctx.task = asyncio.create_task(self._chat_loop(ctx), name=f"chat:{chat.slug}")
+        return display, note
+
+    async def _continue_chat(
+        self, row: dict[str, Any], text: str, quote_text: str | None
+    ) -> bool:
+        """把用户后续输入喂给一个 open 的 chat 会话。
+
+        - 内存有活跃 ctx：CHATTING（上一轮在跑）回"稍候"；CHAT_AWAITING/可恢复终态 →
+          apply_user_message + 唤醒 resume_event。
+        - 无 ctx（进程重启 / loop 已退出，含 CHATTING 孤儿）→ 重建 task 复活。
+        """
+        internal = row["slug"]
+        display = row.get("display_slug") or internal
+        ctx = self._chats.get(internal)
+        if ctx is not None:
+            ok = await ctx.chat.apply_user_message(text, quote_text=quote_text)
+            if not ok:
+                await self._reply_safe(
+                    row, f"chat [{display}] 正在处理上一条消息，请等它回复后再发。"
+                )
+                return True
+            ctx.resume_event.set()
+            return True
+        return await self._revive_chat(row, text, quote_text)
+
+    async def _revive_chat(
+        self, row: dict[str, Any], text: str, quote_text: str | None
+    ) -> bool:
+        """无内存 ctx 时重建 ChatSession + 起新 _chat_loop（抗进程重启）。"""
+        internal = row["slug"]
+        display = row.get("display_slug") or internal
+        repo_cfg = self.config.repo_by_name_or_alias(row["repo"])
+        fallback_cwd = None
+        if repo_cfg is None:
+            fallback_cwd = (self.config.chat.default_cwd or Path.home()).expanduser()
+        fetch_lock = self._repo_lock(repo_cfg.name) if repo_cfg is not None else None
+        chat = ChatSession(
+            db=self.db,
+            config=self.config,
+            reply=self.reply,
+            repo_cfg=repo_cfg,
+            fallback_cwd=fallback_cwd,
+            fetch_lock=fetch_lock,
+        )
+        await chat.resume(internal)
+        # 无条件注入用户消息 + 转 CHATTING（孤儿可能停在任意 open 态）。
+        await self.db.add_message(internal, "in", text, quote_text=quote_text)
+        chat.pending_user_message = text
+        await chat._set_state(SessionState.CHATTING)
+        ctx = _ChatCtx(chat)
+        self._chats[internal] = ctx
+        ctx.task = asyncio.create_task(
+            self._chat_loop(ctx), name=f"chat:{internal}:revive"
+        )
+        await self._reply_safe(row, f"已收到，继续 chat [{display}]。")
+        return True
+
+    async def _cancel_chat(self, row: dict[str, Any]) -> bool:
+        internal = row["slug"]
+        ctx = self._chats.get(internal)
+        if ctx is not None:
+            ctx.cancel_requested = True
+            await ctx.chat.cancel()
+            ctx.resume_event.set()
+            return True
+        chat = ChatSession(
+            db=self.db, config=self.config, reply=self.reply, repo_cfg=None
+        )
+        await chat.resume(internal)
+        await chat.cancel()
+        return True
+
+    async def _chat_loop(self, ctx: _ChatCtx) -> None:
+        """一个 chat 会话的后台驱动：反复 run_turn，CHAT_AWAITING 时挂起等用户回复。
+
+        与 _session_loop 的关键区别：用独立 ``_chat_slot``，且**只在跑一轮时**占槽——
+        CHAT_AWAITING 挂起期间释放，避免闲置 chat 长期占并发。
+        """
+        slug = ctx.chat.slug
+        try:
+            while not ctx.cancel_requested:
+                async with self._chat_slot:
+                    if ctx.cancel_requested:
+                        break
+                    await ctx.chat.run_turn()  # 首轮内部会 ensure_setup（建 worktree）
+                state = SessionState(ctx.chat.row["state"])
+                if state != SessionState.CHAT_AWAITING:
+                    break  # FAILED / CANCELLED → 退出
+                await ctx.resume_event.wait()
+                ctx.resume_event.clear()
+        except asyncio.CancelledError:
+            logger.info("chat %s 后台 task 被取消", slug)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("chat %s loop 异常", slug)
+            await self._mark_chat_failed(ctx, exc)
+        finally:
+            self._chats.pop(slug, None)
+
+    async def _mark_chat_failed(self, ctx: _ChatCtx, exc: BaseException) -> None:
+        """chat loop 抛异常后兜底转 FAILED（已终态则跳过，避免覆盖已发的失败）。"""
+        chat = ctx.chat
+        try:
+            state = SessionState(chat.row.get("state") or "")
+        except ValueError:
+            state = None
+        if state is not None and is_terminal(state):
+            return
+        first_line = (str(exc).strip().splitlines() or [""])[0]
+        summary = (
+            f"{type(exc).__name__}: {first_line}" if first_line else type(exc).__name__
+        )
+        try:
+            await chat._set_state(
+                SessionState.FAILED, last_error=f"chat 主控异常：{summary}"
+            )
+            await chat._notify(f"❌ chat 会话异常中断：{summary}{chat._tag()}")
+        except Exception:  # noqa: BLE001
+            logger.exception("chat %s 兜底 fail 失败", chat.slug)
+
+    async def _reply_safe(self, row: dict[str, Any], text: str) -> None:
+        """给 chat 用户回一句短消息（chatid 缺失降级 userid）；失败只记日志。"""
+        chatid = row.get("chatid") or row.get("userid") or ""
+        if not chatid:
+            return
+        try:
+            await self.reply(chatid, text)
+        except Exception:  # noqa: BLE001
+            logger.exception("chat %s 回复失败", row.get("slug") or "")
 
     # ---------- 显式恢复 ----------
 
@@ -343,6 +531,8 @@ class SessionManager:
             row = await self.db.get_session(slug)
         if row is None or not is_open(row["state"]):
             return False
+        if row.get("session_kind") == "chat":
+            return await self._cancel_chat(row)
         internal = row["slug"]
         ctx = self._sessions.get(internal)
         if ctx is not None:
@@ -361,8 +551,8 @@ class SessionManager:
         return True
 
     async def shutdown(self) -> None:
-        """主进程退出：取消所有 task，等 drain。"""
-        ctxs = list(self._sessions.values())
+        """主进程退出：取消所有 task，等 drain（含 chat）。"""
+        ctxs = list(self._sessions.values()) + list(self._chats.values())
         for c in ctxs:
             c.cancel_requested = True
             c.resume_event.set()

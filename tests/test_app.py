@@ -58,22 +58,30 @@ class _FakeBot(BotRunner):
 
 
 class _FakeManager:
-    """只实现 new_session 的最小 SessionManager 替身——本测试只走 NEW 分支。"""
+    """最小 SessionManager 替身：实现 new_session（NEW 分支）与 new_chat_session（CHAT 分支）。"""
 
-    def __init__(self, *, ahead: int) -> None:
+    def __init__(self, *, ahead: int, chat_note: str | None = None) -> None:
         self._ahead = ahead
+        self._chat_note = chat_note
         self.calls: list[tuple[str, str, str, str]] = []
+        self.chat_calls: list[tuple[str | None, str, str, str]] = []
 
     async def new_session(self, *, repo_cfg, text, chatid, userid, review_override=None):
         self.calls.append((repo_cfg.name, text, chatid, userid))
         self.last_review_override = review_override
         return "internal-slug", self._ahead
 
+    async def new_chat_session(self, *, repo_cfg, text, chatid, userid):
+        self.chat_calls.append(
+            (repo_cfg.name if repo_cfg else None, text, chatid, userid)
+        )
+        return "chat-xy", self._chat_note
 
-def _build_app(tmp_path: Path, *, max_concurrent: int, ahead: int):
+
+def _build_app(tmp_path: Path, *, max_concurrent: int, ahead: int, chat_note: str | None = None):
     app = App(_make_config(tmp_path, max_concurrent=max_concurrent))
     bot = _FakeBot()
-    mgr = _FakeManager(ahead=ahead)
+    mgr = _FakeManager(ahead=ahead, chat_note=chat_note)
     app._bot = bot
     app._manager = mgr  # type: ignore[assignment]
     return app, bot, mgr
@@ -177,3 +185,45 @@ async def test_new_session_no_directive_override_none(tmp_path):
     assert mgr.last_review_override is None
     _, ack = bot.replies[0]
     assert "Reviewer 审查" not in ack
+
+
+# ---------- /chat 分支 ----------
+
+
+async def test_chat_command_binds_repo_and_acks_with_tag(tmp_path):
+    """`@repo /chat <msg>` → 调 new_chat_session（绑定 repo），ack 带可引用的 tag、无回退警告。"""
+    app, bot, mgr = _build_app(tmp_path, max_concurrent=4, ahead=0)
+    await app._on_message(IncomingMessage(
+        text="@my-project /chat 看看入口在哪", quote_text="", chatid="c1", userid="u1",
+    ))
+    assert mgr.chat_calls == [("my-project", "看看入口在哪", "c1", "u1")]
+    chatid, ack = bot.replies[0]
+    assert chatid == "c1"
+    assert "已开始对话 [chat-xy]" in ack
+    assert "[session: chat-xy @my-project]" in ack
+
+
+async def test_chat_command_no_repo_includes_fallback_note(tmp_path):
+    """裸 `/chat <msg>`（无 @repo）→ ack 包含回退警告；tag 不带 @repo。"""
+    app, bot, mgr = _build_app(
+        tmp_path, max_concurrent=4, ahead=0, chat_note="⚠️ 未指定 @repo，回退目录 X"
+    )
+    await app._on_message(IncomingMessage(
+        text="/chat 你好", quote_text="", chatid="c1", userid="u1",
+    ))
+    assert mgr.chat_calls == [(None, "你好", "c1", "u1")]
+    _, ack = bot.replies[0]
+    assert "⚠️ 未指定 @repo，回退目录 X" in ack
+    assert "[session: chat-xy]" in ack
+    assert "@my-project" not in ack
+
+
+async def test_chat_command_empty_message_usage_hint(tmp_path):
+    """空 `/chat`（无正文）→ 回用法提示，不建会话。"""
+    app, bot, mgr = _build_app(tmp_path, max_concurrent=4, ahead=0)
+    await app._on_message(IncomingMessage(
+        text="/chat", quote_text="", chatid="c1", userid="u1",
+    ))
+    assert mgr.chat_calls == []
+    _, ack = bot.replies[0]
+    assert "用法" in ack and "/chat" in ack

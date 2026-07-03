@@ -650,3 +650,74 @@ async def test_plan_selector_only_no_quote_passes_through(cfg: AppConfig):
     assert d.kind == DispatchKind.COMMAND
     assert d.command == "plan"
     assert d.command_arg == "review"
+
+
+# ---------- /chat 通道 ----------
+
+
+async def test_chat_command_no_repo_routes_to_chat(cfg: AppConfig):
+    msg = IncomingMessage(text="/chat 你好呀", quote_text="", chatid="c", userid="u")
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.CHAT
+    assert d.repo is None
+    assert d.cleaned_text == "你好呀"
+
+
+async def test_chat_command_case_insensitive(cfg: AppConfig):
+    msg = IncomingMessage(text="/CHAT hi", quote_text="", chatid="c", userid="u")
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.CHAT and d.cleaned_text == "hi"
+
+
+async def test_chat_command_empty_message(cfg: AppConfig):
+    """裸 /chat 无正文：仍归类 CHAT（空消息由 app 层提示用法）。"""
+    msg = IncomingMessage(text="/chat", quote_text="", chatid="c", userid="u")
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.CHAT and d.cleaned_text == ""
+
+
+async def test_chat_command_with_repo_binds(cfg: AppConfig):
+    msg = IncomingMessage(text="@feed /chat 看看入口在哪", quote_text="", chatid="c", userid="u")
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.CHAT
+    assert d.repo and d.repo.name == "feed-web"
+    assert d.cleaned_text == "看看入口在哪"
+
+
+async def test_chat_command_group_chat_bot_prefix(cfg: AppConfig):
+    """群聊里企微前置 @ChatBot，再 @feed /chat —— 两个 @ 都要剥对。"""
+    msg = IncomingMessage(
+        text="@ChatBot @feed /chat 讲讲状态机", quote_text="", chatid="c", userid="u"
+    )
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.CHAT
+    assert d.repo and d.repo.name == "feed-web"
+    assert d.cleaned_text == "讲讲状态机"
+
+
+async def test_chat_prefix_not_misdetected_bare(cfg: AppConfig):
+    """`/chatxxx` 不是 /chat：不误判为 CHAT（走未知指令 NOISE）。"""
+    msg = IncomingMessage(text="/chatxxx foo", quote_text="", chatid="c", userid="u")
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.NOISE
+
+
+async def test_at_repo_chatxxx_is_new_not_chat(cfg: AppConfig):
+    """`@feed /chatxxx ...` 里 /chatxxx 非 /chat：回落到 NEW（整体当需求）。"""
+    msg = IncomingMessage(text="@feed /chatxxx 干点啥", quote_text="", chatid="c", userid="u")
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.NEW and d.repo.name == "feed-web"
+
+
+async def test_quote_open_chat_routes_to_continue(cfg: AppConfig):
+    """引用一个 open 的 chat 消息（tag 里是 chat slug）→ CONTINUE（由 session_kind 再分流）。"""
+    msg = IncomingMessage(
+        text="那 dispatcher 在哪个文件",
+        quote_text="回复...\n\n[session: chat-ab12 @feed-web sid: abcd1234-aaaa-bbbb-cccc-ddddeeeeffff]",
+        chatid="c",
+        userid="u",
+    )
+    d = await classify(msg, cfg, _always_open)
+    assert d.kind == DispatchKind.CONTINUE
+    assert d.session_slug == "chat-ab12"
+    assert d.cleaned_text == "那 dispatcher 在哪个文件"

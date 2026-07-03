@@ -89,4 +89,9 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE sessions ADD COLUMN review_override INTEGER;
     """,
+    # session 类型：pipeline（默认，plan→dev→MR 交付流水线）/ chat（/chat 自由对话通道，
+    # 见 core/chat.py）。老 row 无该列，迁移后一律回填为 pipeline，行为与改动前完全一致。
+    """
+    ALTER TABLE sessions ADD COLUMN session_kind TEXT NOT NULL DEFAULT 'pipeline';
+    """,
 ]

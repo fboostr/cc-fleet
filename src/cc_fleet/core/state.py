@@ -40,6 +40,11 @@ class SessionState(str, Enum):
     FAILED = "failed"
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
+    # `/chat` 自由对话通道的两个状态（独立于交付流水线，见 core/chat.py）：
+    # CHATTING = 一轮 claude 正在跑；CHAT_AWAITING = 本轮已回发、等用户引用回复续聊。
+    # 二者都属于 is_open（可被引用回复唤醒），但不进入 Session.drive 的流水线分派。
+    CHATTING = "chatting"
+    CHAT_AWAITING = "chat_awaiting"
 
 
 WORKING_STATES: set[SessionState] = {
@@ -63,8 +68,16 @@ RESUMABLE_TERMINAL_STATES: set[SessionState] = {
 TERMINAL_STATES: set[SessionState] = RESUMABLE_TERMINAL_STATES | {SessionState.CANCELLED}
 
 
+# `/chat` 通道的 open 状态（is_open=True → 引用回复走 CONTINUE）。chat 的终态复用
+# 现有 CANCELLED（/cancel）与 FAILED（子进程报错），不新增终态。
+CHAT_STATES: set[SessionState] = {SessionState.CHATTING, SessionState.CHAT_AWAITING}
+
+
 OPEN_STATES: set[SessionState] = (
-    WORKING_STATES | {SessionState.AWAITING_USER_CLARIFICATION} | RESUMABLE_TERMINAL_STATES
+    WORKING_STATES
+    | {SessionState.AWAITING_USER_CLARIFICATION}
+    | RESUMABLE_TERMINAL_STATES
+    | CHAT_STATES
 )
 
 

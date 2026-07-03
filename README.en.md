@@ -108,11 +108,36 @@ git push uses SSH by default (load your key into `ssh-agent` on macOS). MR/PR cr
 | `/resume <slug>` | Explicitly revive a "working" orphan session (left after the controller was killed) |
 | `/plan <slug>` | Show the session's current `plan.md` in full |
 | `/repos` | List configured repos with their `aliases` / `keywords` / `mode` |
+| `/chat <msg>` | Start a multi-turn free-form conversation with the agent (writable, isolated in a dedicated worktree); `@<repo> /chat <msg>` binds a repo, omit `@repo` to use a fallback dir (with a warning). See "Free-form chat" below |
 | `/help` | Help text |
 
 Concurrency is capped by `limits.max_concurrent_sessions` (default 4); excess requests are queued.
 
 You can also override the Reviewer per request: add `[review]` (force on) or `[review:off]` (force off); the marker is stripped from the text sent to the agent.
+
+### Free-form chat (`/chat`)
+
+`/chat` opens a conversation channel that is **separate from the delivery pipeline**: the agent becomes a multi-turn chat window over WeChat — cc-fleet just pipes I/O, forwarding the agent's output to you and your next message back to the same agent session.
+
+```
+@my-repo /chat where is the entry point of this project?
+```
+
+- **Repo-bound + isolated**: `@<repo> /chat` creates a dedicated worktree at `<repo>-worktrees/<slug>` (branch `chat/<slug>`); the agent has full tools, is **writable and can run commands**, but is confined to that worktree by the same PreToolUse guardrails used for development.
+- **Fallback without `@repo`**: a bare `/chat <msg>` runs in `chat.default_cwd` (or the user's home dir if unset), **without** a worktree, and replies with a warning naming the fallback path. Prefer binding a repo.
+- **Multi-turn**: every reply ends with `[session: <slug>]`; **quote that message** and add text to continue the next turn (same quote-reply mechanism as delivery sessions); context continuity is via `--resume`.
+- **Turn-by-turn**: you send one message, the agent finishes that turn, and the full output is auto-split into ~4000-char chunks.
+- **Concurrency**: chat uses its own pool `chat.max_concurrent` (default 4) and does **not** consume `limits.max_concurrent_sessions`, so long chats never starve the plan/dev pipeline.
+- **End it**: `/cancel <chat-slug>`, or quote a chat message and send `/cancel`.
+
+Config lives under the `chat:` block in `config.yaml`:
+
+```yaml
+chat:
+  default_cwd: ~/cc-fleet-chat   # fallback cwd when @repo is omitted; home dir if unset
+  max_concurrent: 4              # dedicated chat concurrency
+  turn_timeout_sec: 3600         # per-turn agent subprocess timeout (seconds)
+```
 
 ## Optional Reviewer
 
