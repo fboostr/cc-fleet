@@ -120,6 +120,17 @@ class Database:
         cur = await self.conn.execute("SELECT 1 FROM sessions WHERE slug = ?", (slug,))
         return await cur.fetchone() is not None
 
+    async def session_exists_with_origin(self, origin_chat_slug: str) -> bool:
+        """是否已有某条 pipeline session 由该 chat（内部 slug）转入（/dev handoff）。
+
+        用于 ``new_pipeline_from_chat`` 拒绝对同一 chat 二次 /dev；存储层还有部分唯一索引
+        ``idx_sessions_origin_chat`` 作为并发原子兜底。
+        """
+        cur = await self.conn.execute(
+            "SELECT 1 FROM sessions WHERE origin_chat_slug = ?", (origin_chat_slug,)
+        )
+        return await cur.fetchone() is not None
+
     # ---------- messages ----------
 
     async def add_message(

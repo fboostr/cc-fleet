@@ -721,3 +721,102 @@ async def test_quote_open_chat_routes_to_continue(cfg: AppConfig):
     assert d.kind == DispatchKind.CONTINUE
     assert d.session_slug == "chat-ab12"
     assert d.cleaned_text == "那 dispatcher 在哪个文件"
+
+
+# ---------- /dev handoff（把 /chat 讨论转开发） ----------
+
+
+async def _chat_kind(_: str) -> str | None:
+    return "chat"
+
+
+async def _pipeline_kind(_: str) -> str | None:
+    return "pipeline"
+
+
+async def _none_kind(_: str) -> str | None:
+    return None
+
+
+_CHAT_QUOTE = "claude 的回答……\n\n[session: chat-ab12 @feed-web sid: abcd1234-aaaa-bbbb]"
+
+
+async def test_dev_quoting_chat_routes_to_handoff(cfg: AppConfig):
+    """引用一条 chat 消息 + /dev 补充 → HANDOFF，slug/补充正确解析。"""
+    msg = IncomingMessage(
+        text="/dev 记得补单测", quote_text=_CHAT_QUOTE, chatid="c", userid="u"
+    )
+    d = await classify(msg, cfg, _never_open, _chat_kind)
+    assert d.kind == DispatchKind.HANDOFF
+    assert d.session_slug == "chat-ab12"
+    assert d.cleaned_text == "记得补单测"
+
+
+async def test_dev_case_insensitive_and_empty_supplement(cfg: AppConfig):
+    """/DEV 大小写不敏感；无补充说明时 cleaned_text 为空串。"""
+    msg = IncomingMessage(text="/DEV", quote_text=_CHAT_QUOTE, chatid="c", userid="u")
+    d = await classify(msg, cfg, _never_open, _chat_kind)
+    assert d.kind == DispatchKind.HANDOFF
+    assert d.session_slug == "chat-ab12"
+    assert d.cleaned_text == ""
+
+
+async def test_dev_without_quote_is_noise(cfg: AppConfig):
+    """/dev 不带引用 → NOISE，提示引用 /chat 消息。"""
+    msg = IncomingMessage(text="/dev 干活", quote_text="", chatid="c", userid="u")
+    d = await classify(msg, cfg, _never_open, _chat_kind)
+    assert d.kind == DispatchKind.NOISE and "/chat" in d.reason
+
+
+async def test_dev_quoting_pipeline_is_noise(cfg: AppConfig):
+    """/dev 引用的是 pipeline 会话（非 chat）→ NOISE。"""
+    msg = IncomingMessage(
+        text="/dev 干活",
+        quote_text="[session: add-login @feed-web]",
+        chatid="c",
+        userid="u",
+    )
+    d = await classify(msg, cfg, _never_open, _pipeline_kind)
+    assert d.kind == DispatchKind.NOISE and "chat" in d.reason
+
+
+async def test_dev_quoting_unknown_slug_is_noise(cfg: AppConfig):
+    """/dev 引用的 slug 在 storage 中不存在 → NOISE。"""
+    msg = IncomingMessage(
+        text="/dev 干活",
+        quote_text="[session: gone-9999 @feed-web]",
+        chatid="c",
+        userid="u",
+    )
+    d = await classify(msg, cfg, _never_open, _none_kind)
+    assert d.kind == DispatchKind.NOISE and "gone-9999" in d.reason
+
+
+async def test_dev_review_directive_parsed_and_stripped(cfg: AppConfig):
+    """/dev 补充里的 [review] 内联指令被解析为 override 并从正文剥离。"""
+    msg = IncomingMessage(
+        text="/dev [review] 记得补单测", quote_text=_CHAT_QUOTE, chatid="c", userid="u"
+    )
+    d = await classify(msg, cfg, _never_open, _chat_kind)
+    assert d.kind == DispatchKind.HANDOFF
+    assert d.review_override is True
+    assert "review" not in d.cleaned_text.lower()
+    assert d.cleaned_text == "记得补单测"
+
+
+async def test_devxxx_not_misdetected(cfg: AppConfig):
+    """`/devxxx` 不是 /dev：不误判为 HANDOFF（走未知指令 NOISE）。"""
+    msg = IncomingMessage(
+        text="/devxxx foo", quote_text=_CHAT_QUOTE, chatid="c", userid="u"
+    )
+    d = await classify(msg, cfg, _never_open, _chat_kind)
+    assert d.kind == DispatchKind.NOISE
+
+
+async def test_dev_skips_kind_check_when_predicate_absent(cfg: AppConfig):
+    """未注入 session_kind_of 时（老调用点）跳过 chat 校验，只要能反解出 slug 即 HANDOFF。"""
+    msg = IncomingMessage(
+        text="/dev 干活", quote_text=_CHAT_QUOTE, chatid="c", userid="u"
+    )
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.HANDOFF and d.session_slug == "chat-ab12"

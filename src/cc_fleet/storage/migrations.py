@@ -94,4 +94,14 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE sessions ADD COLUMN session_kind TEXT NOT NULL DEFAULT 'pipeline';
     """,
+    # handoff（/dev）：pipeline row 记录它由哪条 /chat 对话转入（存 chat 的内部 slug）。
+    # NULL=非 handoff（普通新需求）。见 core/session_manager.new_pipeline_from_chat。
+    """
+    ALTER TABLE sessions ADD COLUMN origin_chat_slug TEXT;
+    """,
+    # 一条 chat 最多转一次开发：部分唯一索引在存储层挡住并发/重复 /dev（NULL 不计入唯一约束）。
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_origin_chat
+        ON sessions(origin_chat_slug) WHERE origin_chat_slug IS NOT NULL;
+    """,
 ]

@@ -52,8 +52,40 @@ async def test_sessions_has_all_altered_columns(tmp_path: Path):
             "code_review_rounds",
             "review_override",
             "session_kind",
+            "origin_chat_slug",
         ):
             assert c in cols, f"sessions 缺列 {c}"
+    finally:
+        await db.close()
+
+
+async def test_origin_chat_slug_unique_index(tmp_path: Path):
+    """部分唯一索引 idx_sessions_origin_chat：同一非空 origin_chat_slug 只能有一行。"""
+    import sqlite3
+
+    db = Database(tmp_path / "state.db")
+    await db.connect()
+    try:
+        base = {
+            "display_slug": None,
+            "repo": "r",
+            "state": "new",
+            "default_branch": "main",
+            "initial_request": "hi",
+            "chatid": "c",
+            "userid": "u",
+        }
+        await db.insert_session({**base, "slug": "req-1", "origin_chat_slug": "chat-x"})
+        assert await db.session_exists_with_origin("chat-x") is True
+        assert await db.session_exists_with_origin("chat-y") is False
+        # 同一 chat 再转一次 → 唯一索引拦截
+        with pytest.raises(sqlite3.IntegrityError):
+            await db.insert_session(
+                {**base, "slug": "req-2", "origin_chat_slug": "chat-x"}
+            )
+        # 多行 origin_chat_slug 为 NULL（普通新需求）不受唯一约束影响
+        await db.insert_session({**base, "slug": "req-3"})
+        await db.insert_session({**base, "slug": "req-4"})
     finally:
         await db.close()
 

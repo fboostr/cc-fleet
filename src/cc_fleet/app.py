@@ -45,7 +45,14 @@ class App:
                 row = await self.db.get_session(s)
             return row is not None and is_open(row["state"])
 
-        decision = await classify(msg, self.config, session_open)
+        async def session_kind_of(s: str) -> str | None:
+            # 仅 /dev（handoff）用：校验被引用的 slug 是不是 chat 会话（返回 session_kind）。
+            row = await self.db.get_session_by_display_slug(s)
+            if row is None:
+                row = await self.db.get_session(s)
+            return row.get("session_kind") if row else None
+
+        decision = await classify(msg, self.config, session_open, session_kind_of)
         chatid = msg.chatid or msg.userid
         if decision.kind == DispatchKind.NEW:
             assert decision.repo is not None
@@ -120,6 +127,41 @@ class App:
                 "dispatch CHAT slug=%s repo=%s",
                 display,
                 decision.repo.name if decision.repo else "-",
+            )
+        elif decision.kind == DispatchKind.HANDOFF:
+            assert decision.session_slug is not None
+            slug, repo_name, ahead, err = await self._manager.new_pipeline_from_chat(
+                chat_slug=decision.session_slug,
+                supplement=decision.cleaned_text,
+                chatid=chatid,
+                userid=msg.userid,
+                review_override=decision.review_override,
+            )
+            if err is not None or slug is None:
+                await self._bot.reply(chatid, err or "无法把该对话转为开发任务。")
+                return
+            # plan 前只有 internal slug（display_slug 要 plan 完成才有）；挂上供用户立即引用回复。
+            session_tag = format_session_tag(slug, repo=repo_name)
+            if decision.review_override is True:
+                review_note = "已为本任务开启 Reviewer 审查。"
+            elif decision.review_override is False:
+                review_note = "已为本任务关闭 Reviewer 审查。"
+            else:
+                review_note = ""
+            if ahead >= self.config.limits.max_concurrent_sessions:
+                ack = (
+                    f"已把对话转为开发任务，加入 @{repo_name} 队列（前面 {ahead} 个）。"
+                    f"开始规划时会再通知你。{review_note}\n\n{session_tag}"
+                )
+            else:
+                ack = (
+                    f"已把对话转为开发任务，开始规划 @{repo_name}。"
+                    f"当 plan 完成或需要确认时会再通知你。{review_note}\n\n{session_tag}"
+                )
+            await self._bot.reply(chatid, ack)
+            logger.info(
+                "dispatch HANDOFF chat=%s slug=%s ahead=%d",
+                decision.session_slug, slug, ahead,
             )
         elif decision.kind == DispatchKind.COMMAND:
             assert decision.command is not None

@@ -165,6 +165,7 @@ git push 默认走 SSH（macOS 请保证 `ssh-agent` 已加载 key）。提 MR/P
 | `/plan <slug> [review\|code]` | 查看指定 session 的 plan 全文：省略选择器看原始 `plan.md`，`review` 看 `plan_review.md`（Reviewer 对 plan 的审查），`code` 看 `code_review.md`（Reviewer 对编码的审查）；也可引用某 session 消息后发 `/plan [review\|code]` 无需带 slug；文件超过 4K 字符时自动拆多条发送 |
 | `/repos` | 列出 `config.yaml` 当前配置的所有仓库及其 `aliases` / `keywords` / `mode` |
 | `/chat <消息>` | 进入与 claude 的多轮自由对话（可写、隔离在专用 worktree）；`@<repo> /chat <消息>` 绑定仓库，省略 `@repo` 则用回退目录并给出警告。详见下方「多轮自由对话」 |
+| `/dev [补充说明]` | **引用**一条 `/chat` 对话消息，把这次讨论转成正式开发任务（复用对话上下文，走完整 plan→dev→MR 流水线）。详见下方「把对话转成开发任务」 |
 | `/help` | 查看帮助 |
 
 队列反馈：同时驱动的 session 数受 `limits.max_concurrent_sessions` 限制（默认 4）；超出时 dispatch 会立即回包 "已加入 @\<repo\> 队列（前面 N 个）"，前一个进终态后再起后台 task。awaiting 状态仍占槽位，避免恢复时再排队。
@@ -191,7 +192,21 @@ git push 默认走 SSH（macOS 请保证 `ssh-agent` 已加载 key）。提 MR/P
 - **多轮续聊**：每条 claude 回复末尾都带 `[session: <slug>]`，**引用该消息**追加内容即可续下一轮（复用与交付 session 相同的引用回复机制）；claude 会话上下文通过 `--resume` 连续。
 - **转发形式**：turn-by-turn —— 你发一条，claude 跑完这一轮，完整输出按 ~4000 字自动分段回发。
 - **并发**：chat 用独立并发池 `chat.max_concurrent`（默认 4），**不占用** `limits.max_concurrent_sessions`，长对话不会饿死 plan/dev 流水线。
-- **结束**：`/cancel <chat-slug>`，或引用 chat 消息发 `/cancel`。
+- **结束**：`/cancel <chat-slug>`，或引用 chat 消息发 `/cancel`；聊清楚需求后也可用 `/dev` 转成正式开发（见下）。
+
+#### 把对话转成开发任务（/dev）
+
+需求需要多轮讨论才能定稿时，先在 `/chat` 里聊清楚，然后**引用**该对话的任意一条机器人消息、发 `/dev [补充说明]`，即可把这次讨论直接转成一个正式交付任务：
+
+```
+/dev 记得顺手补一下单测          # 引用某条 chat 回复后发送
+```
+
+- **上下文零损耗**：新起的开发 session **复用同一个 claude 会话**（`--resume`），整段讨论原样带入规划——无需重述需求。规划首轮会明确「基于已讨论结论产出 plan、不重新发散」。
+- **走完整流水线**：从**规划（plan）**阶段正式开始，产出 `plan.md`、可走 plan 审查，再 dev →（可选 code 审查）→ MR，与普通需求完全一致。
+- **仓库继承自对话**：`@<repo> /chat` 转出的任务在该 repo 的干净 worktree（`<repo>-worktrees/<slug>`、分支 `claude/<slug>`）里开发；上下文靠 `--resume` 承载，不搬运 chat worktree 里的临时改动。**裸 `/chat`（未绑定仓库）无法直接 `/dev`**——请先用 `@<repo> /chat` 重新聊，或直接 `@<repo> 需求` 开发。
+- **原对话归档**：转开发后原 chat 会被归档（不可再续聊），后续请引用**开发任务**的机器人消息跟进。一条对话只能转一次。
+- **前置条件**：对话至少成功回复过一轮（claude 会话已建立）、且当前不在生成回复中，才能 `/dev`。
 
 配置见 `config.yaml` 的 `chat:` 段：
 
@@ -332,9 +347,9 @@ src/cc_fleet/
 │   ├── runner.py                   # 企微 WebSocket 接入（包 aibot SDK）
 │   └── message.py                  # IncomingMessage / OutgoingReply 数据类
 ├── core/
-│   ├── dispatcher.py               # 消息分类（new/continue/command/chat/noise）
+│   ├── dispatcher.py               # 消息分类（new/continue/command/chat/handoff/noise）
 │   ├── session.py                  # 单 session 的状态机
-│   ├── session_manager.py          # 并发驱动（Semaphore + 后台 task；含 chat 独立池）
+│   ├── session_manager.py          # 并发驱动（Semaphore + 后台 task；含 chat 独立池、/dev handoff）
 │   ├── commands.py                 # /list /cancel /plan /help 实现
 │   ├── chat.py                     # /chat 多轮自由对话会话（独立于交付流水线）
 │   ├── state.py                    # SessionState 枚举与语义集合（含 chat 状态）

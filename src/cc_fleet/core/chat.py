@@ -282,6 +282,23 @@ class ChatSession:
         # 而这条回执是 /cancel 路径下唯一的用户反馈。
         await self._notify(f"chat 会话已取消：{reason}", force=True)
 
+    async def mark_handed_off(self, pipeline_slug: str) -> None:
+        """本对话经 /dev 转成开发任务后归档：复用 CANCELLED 终态并发一条提示。
+
+        归档后本 chat 不再 is_open（CANCELLED 是唯一 is_open=False 的终态），此后引用它续聊会
+        被 dispatcher 判成 NEW（全新无关任务），不会与新起的 pipeline 抢同一个 claude 会话。
+        与 ``cancel`` 一样需 force=True 越过 _notify 的 CANCELLED 抑制守卫。
+        """
+        await self._set_state(
+            SessionState.CANCELLED, last_error=f"已转为开发任务 [{pipeline_slug}]"
+        )
+        await self._notify(
+            f"本对话已转为开发任务 [{pipeline_slug}]，我开始规划了；"
+            f"后续请**引用开发任务的机器人消息**跟进。本对话已归档，如需另聊请重新 /chat。"
+            f"{self._tag()}",
+            force=True,
+        )
+
     # ---------- 内部工具 ----------
 
     def _session_dir(self) -> Path:

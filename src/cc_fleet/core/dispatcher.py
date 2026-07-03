@@ -1,7 +1,8 @@
-"""消息分类：把进来的消息归到 command / new / continue / noise 四类。
+"""消息分类：把进来的消息归到 command / new / continue / chat / handoff / noise 六类。
 
 规则按顺序：
 0. text 以 `/` 起头 → 控制面指令（command）。优先于 quote 判定。
+   其中 `/chat` → CHAT（自由对话）；`/dev` → HANDOFF（引用一条 chat 消息把讨论转开发）。
 1. quote_text 中能解析出 [session: <slug> ...] 且 slug 在 storage 中且 ``is_open``
    （含 awaiting 与可恢复终态 FAILED/TIMEOUT/COMPLETED）→ CONTINUE。
 2. text 以已知 `@<alias>` 起头（可能要先剥掉企微自动加的 `@<bot>`） → NEW。
@@ -32,6 +33,7 @@ class DispatchKind(str, Enum):
     CONTINUE = "continue"
     COMMAND = "command"
     CHAT = "chat"
+    HANDOFF = "handoff"
     NOISE = "noise"
 
 
@@ -103,6 +105,9 @@ def _new_decision(repo: RepoConfig, text: str) -> DispatchDecision:
 # `/chat` 指令头（大小写不敏感）：识别裸 `/chat <msg>` 与 `@repo /chat <msg>`。
 _CHAT_COMMAND = "/chat"
 
+# `/dev` 指令头（大小写不敏感）：引用一条 /chat 对话消息，把讨论转成正式开发任务（handoff）。
+_HANDOFF_COMMAND = "/dev"
+
 
 def _extract_chat_command(text: str) -> str | None:
     """若 text 以 `/chat`（后接空格或结尾）开头，返回其后的消息正文（可空串）；否则 None。
@@ -127,11 +132,17 @@ async def classify(
     msg: IncomingMessage,
     config: AppConfig,
     is_open_session: Callable[[str], Awaitable[bool]],
+    session_kind_of: Callable[[str], Awaitable[str | None]] | None = None,
 ) -> DispatchDecision:
     """对一条消息进行分类。
 
     `is_open_session(slug)`：异步谓词，判断 slug 在 storage 中且 ``is_open``
     （含 awaiting 与可恢复终态 FAILED/TIMEOUT/COMPLETED）。
+
+    `session_kind_of(slug)`：异步谓词，返回 slug 对应 session 的 ``session_kind``
+    （'pipeline'/'chat'），不存在返回 None。仅 `/dev`（handoff）用来校验被引用的是
+    chat 会话——它需要在 chat 处于非 open（如已 /cancel）时仍能转、且要在引用指向
+    pipeline 时拒绝，这是 `is_open_session` 表达不了的。None（未注入）时跳过该校验。
     """
     text = (msg.text or "").strip()
     quote = msg.quote_text or ""
@@ -153,6 +164,41 @@ async def classify(
                 kind=DispatchKind.CHAT,
                 repo=None,
                 cleaned_text=rest.strip(),
+            )
+        # /dev：引用一条 /chat 对话消息，把讨论转成正式开发任务（handoff → pipeline）。
+        # 必须能从 quote 反解出 slug，且该 slug 是一条 chat 会话；否则回 NOISE 引导。
+        if head.lower() == _HANDOFF_COMMAND:
+            supplement = rest.strip()
+            hctx = extract_quote_context(quote)
+            if not hctx.slug:
+                return DispatchDecision(
+                    kind=DispatchKind.NOISE,
+                    reason="/dev 需要引用一条 /chat 对话消息，把讨论转成开发任务。"
+                    "请引用该对话的机器人回复再发 /dev。",
+                )
+            if session_kind_of is not None:
+                kind = await session_kind_of(hctx.slug)
+                if kind is None:
+                    return DispatchDecision(
+                        kind=DispatchKind.NOISE,
+                        reason=f"未找到被引用的会话 [{hctx.slug}]。"
+                        "请引用最近的 /chat 对话消息再发 /dev。",
+                    )
+                if kind != "chat":
+                    return DispatchDecision(
+                        kind=DispatchKind.NOISE,
+                        reason="/dev 只能引用 /chat 对话消息把讨论转成开发任务；"
+                        "这条引用不是 chat 会话。若要发新需求请用 `@<repo> 需求`。",
+                    )
+            # 复用 NEW 路径的 [review] 内联指令解析：补充说明里可带 [review]/[review:off]。
+            override, cleaned = (
+                _extract_review_directive(supplement) if supplement else (None, "")
+            )
+            return DispatchDecision(
+                kind=DispatchKind.HANDOFF,
+                session_slug=hctx.slug,
+                cleaned_text=cleaned,
+                review_override=override,
             )
         normalized = _COMMAND_ALIASES.get(head.lower())
         if normalized is not None:
