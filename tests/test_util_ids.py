@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from cc_fleet.util.ids import (
     extract_quote_context,
+    find_session_tag,
     format_session_tag,
 )
 
@@ -72,3 +73,17 @@ def test_extract_quote_context_session_tag_wins_over_repo_only():
 def test_extract_quote_context_empty():
     assert extract_quote_context("").slug is None
     assert extract_quote_context("没有标签的文本").slug is None
+
+
+def test_find_session_tag_returns_raw_substring():
+    text = "plan 已就绪 ✅\n\n[session: add-login @feed-web sid: abcd1234-1111-2222-3333-444455556666]"
+    assert find_session_tag(text) == "[session: add-login @feed-web sid: abcd1234-1111-2222-3333-444455556666]"
+
+
+def test_find_session_tag_repo_only():
+    assert find_session_tag("已收到需求 @feed-web\n\n[repo: feed-web]") == "[repo: feed-web]"
+
+
+def test_find_session_tag_none_when_absent():
+    assert find_session_tag("普通文本，无标签") is None
+    assert find_session_tag("") is None

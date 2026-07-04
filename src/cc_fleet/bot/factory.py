@@ -34,5 +34,6 @@ def create_bot(config: AppConfig, *, on_message: OnMessage) -> BotRunner:
             allowed_user_ids=config.wechat.allowed_user_ids,
             on_message=on_message,
             cursor_path=config.workspace_root / "wechat_cursor.txt",
+            refs_path=config.workspace_root / "wechat_outbound_refs.jsonl",
         )
     raise ValueError(f"不支持的聊天平台：{config.platform}")
