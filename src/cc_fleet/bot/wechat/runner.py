@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from pathlib import Path
@@ -19,6 +20,7 @@ from pathlib import Path
 from .ilink_client import IlinkClient, IlinkMessage
 from ..base import BotRunner, OnMessage
 from ..message import IncomingMessage
+from ...util.ids import find_session_tag
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,16 @@ _MIN_SEND_INTERVAL = 1.0  # 秒
 # 单次长轮询异常后的重试退避上限
 _MAX_BACKOFF_SEC = 30.0
 
+# ── 引用消息「时间戳关联」还原 ────────────────────────────────
+# ilink 新版引用只回传被引用消息的 create_time_ms（不再内联其文本），该时间戳与我们
+# 本地发送该消息的时刻对齐（实测差 <1s）。故发消息时记「发送时刻 → session 标签」，
+# 收到引用时用 create_time_ms 按容差反查还原标签。
+# 反查容差（ms）：兜住本地时钟与 ilink 服务端时钟的轻微偏差。
+_REF_MATCH_TOLERANCE_MS = 5_000
+# 出站标签记录的保留窗口与条数上限（用户可能引用较老的消息）。
+_OUTBOUND_REF_RETENTION_MS = 30 * 24 * 3600 * 1000
+_OUTBOUND_REF_MAX = 5000
+
 
 class WechatBotRunner(BotRunner):
     def __init__(
@@ -40,12 +52,20 @@ class WechatBotRunner(BotRunner):
         allowed_user_ids: list[str] | None,
         on_message: OnMessage,
         cursor_path: Path,
+        refs_path: Path | None = None,
     ) -> None:
         super().__init__(on_message=on_message)
         self._allowed = set(allowed_user_ids or [])
         self._client = IlinkClient(base_url=base_url, bot_token=bot_token)
         self._cursor_path = Path(cursor_path)
         self._cursor = self._load_cursor()
+        # 出站 session 标签记录（发送时刻→标签），用于引用消息按时间戳反查还原。
+        self._refs_path = (
+            Path(refs_path)
+            if refs_path is not None
+            else self._cursor_path.parent / "wechat_outbound_refs.jsonl"
+        )
+        self._outbound_refs: list[tuple[int, str]] = self._load_outbound_refs()
         # from_user_id → (最近一次 context_token, 捕获时的 monotonic 时刻)。
         # 存捕获时刻是为了在发送时打出 token 年龄，便于判断回复失败是否因 token 过期。
         self._context_tokens: dict[str, tuple[str, float]] = {}
@@ -77,6 +97,73 @@ class WechatBotRunner(BotRunner):
         except Exception:  # noqa: BLE001
             logger.warning("持久化 ilink 游标失败", exc_info=True)
 
+    # ---------- 出站标签记录（引用时间戳关联）----------
+
+    def _prune_refs(self, refs: list[tuple[int, str]]) -> list[tuple[int, str]]:
+        """按保留窗口与条数上限裁剪出站标签记录（保序，保留较新的）。"""
+        if not refs:
+            return refs
+        cutoff = int(time.time() * 1000) - _OUTBOUND_REF_RETENTION_MS
+        refs = [r for r in refs if r[0] >= cutoff]
+        if len(refs) > _OUTBOUND_REF_MAX:
+            refs = refs[-_OUTBOUND_REF_MAX:]
+        return refs
+
+    def _load_outbound_refs(self) -> list[tuple[int, str]]:
+        """从 jsonl 加载出站标签记录并裁剪；顺便重写压缩掉过期行。"""
+        refs: list[tuple[int, str]] = []
+        try:
+            with self._refs_path.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        refs.append((int(obj["ms"]), str(obj["tag"])))
+                    except (ValueError, KeyError, TypeError):
+                        continue
+        except FileNotFoundError:
+            return []
+        except Exception:  # noqa: BLE001
+            logger.warning("读取 ilink 出站标签记录失败，从空开始", exc_info=True)
+            return []
+        pruned = self._prune_refs(refs)
+        if len(pruned) != len(refs):  # 启动时压缩：把过期行落盘清掉，避免文件无限增长
+            self._rewrite_outbound_refs(pruned)
+        return pruned
+
+    def _rewrite_outbound_refs(self, refs: list[tuple[int, str]]) -> None:
+        try:
+            self._refs_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._refs_path.open("w", encoding="utf-8") as f:
+                for ms, tag in refs:
+                    f.write(json.dumps({"ms": ms, "tag": tag}, ensure_ascii=False) + "\n")
+        except Exception:  # noqa: BLE001
+            logger.warning("重写 ilink 出站标签记录失败", exc_info=True)
+
+    def _record_outbound_ref(self, send_ms: int, tag: str) -> None:
+        """记录一条「发送时刻 → session 标签」，内存 + 追加落盘。"""
+        self._outbound_refs.append((send_ms, tag))
+        self._outbound_refs = self._prune_refs(self._outbound_refs)
+        try:
+            self._refs_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._refs_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"ms": send_ms, "tag": tag}, ensure_ascii=False) + "\n")
+        except Exception:  # noqa: BLE001
+            logger.warning("持久化 ilink 出站标签记录失败", exc_info=True)
+
+    def _resolve_ref_by_time(self, create_ms: int) -> str:
+        """按被引用消息的 create_time_ms 反查最接近的出站标签（超出容差则空串）。"""
+        best_tag = ""
+        best_delta = _REF_MATCH_TOLERANCE_MS + 1
+        for ms, tag in self._outbound_refs:
+            delta = abs(ms - create_ms)
+            if delta < best_delta:
+                best_delta = delta
+                best_tag = tag
+        return best_tag if best_delta <= _REF_MATCH_TOLERANCE_MS else ""
+
     # ---------- 收消息 ----------
 
     async def _handle(self, m: IlinkMessage) -> None:
@@ -100,11 +187,22 @@ class WechatBotRunner(BotRunner):
             text = m.text.strip()
             if not text:
                 return
+            # 被引用文本还原：优先用直接解析结果（旧版 ilink 会内联被引用文字）；为空且带
+            # ref_create_ms 时（新版只回传时间戳、不含文字），按创建时间反查我们发出的 session 标签。
+            quote_text = m.quote_text
+            if not quote_text and m.ref_create_ms is not None:
+                quote_text = self._resolve_ref_by_time(m.ref_create_ms)
+                if not quote_text:
+                    logger.warning(
+                        "引用消息按时间戳(create_time_ms=%s)未匹配到已记录的会话消息"
+                        "（可能引用了修复前发出的历史消息，或非会话消息）",
+                        m.ref_create_ms,
+                    )
             await self._maybe_send_typing(m.from_user_id)
             msg = IncomingMessage(
                 text=text,
-                quote_text=m.quote_text,  # 被引用消息文本（含 [session: <slug>]，供续聊/指令反解）
-                chatid="",                # 个人微信单聊，无群 chatid
+                quote_text=quote_text,  # 被引用消息的 [session: <slug>] 标签，供续聊/指令反解
+                chatid="",              # 个人微信单聊，无群 chatid
                 userid=m.from_user_id,
             )
             await self._on_message(msg)
@@ -176,6 +274,10 @@ class WechatBotRunner(BotRunner):
                 )
                 self._last_send_time = time.monotonic()
                 logger.info("reply 发送成功 user=%s", chatid)
+                # 记录出站 session 标签 → 发送时刻，供用户引用该消息时按 create_time_ms 反查还原。
+                tag = find_session_tag(text)
+                if tag:
+                    self._record_outbound_ref(int(time.time() * 1000), tag)
             except Exception:  # noqa: BLE001
                 # IlinkError 的 __str__ 已含 ret 与响应体；token_age 一并打出便于判断 TTL
                 logger.exception(

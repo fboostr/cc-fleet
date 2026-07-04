@@ -59,6 +59,7 @@ def _runner(tmp_path: Path, *, on_message=None, allowed=None) -> WechatBotRunner
         allowed_user_ids=allowed,
         on_message=on_message or _noop,
         cursor_path=tmp_path / "cur.txt",
+        refs_path=tmp_path / "refs.jsonl",
     )
 
 
@@ -68,6 +69,31 @@ def _raw(from_user: str, ctx: str, *texts: str) -> dict:
         "to_user_id": "bot@im.bot",
         "context_token": ctx,
         "item_list": [{"type": 1, "text_item": {"text": t}} for t in texts],
+    }
+
+
+def _raw_new_quote(from_user: str, ctx: str, text: str, ref_create_ms: int) -> dict:
+    """新版 ilink 引用报文（照抄真机结构）：ref_msg.message_item 只有 msg_id +
+    create_time_ms，不含被引用文本。用于验证「时间戳关联」还原。"""
+    return {
+        "from_user_id": from_user,
+        "to_user_id": "bot@im.bot",
+        "context_token": ctx,
+        "item_list": [
+            {
+                "type": 1,
+                "text_item": {"text": text},
+                "ref_msg": {
+                    "message_item": {
+                        "type": 0,
+                        "create_time_ms": ref_create_ms,
+                        "is_completed": True,
+                        "msg_id": "1234567890123456789",
+                        "button_item_list": [],
+                    }
+                },
+            }
+        ],
     }
 
 
@@ -126,6 +152,66 @@ def test_parse_message_extracts_quote_from_ref_msg():
 def test_parse_message_no_ref_msg_quote_empty():
     m = _parse_message(_raw("u", "ctx", "hi"))
     assert m.quote_text == ""
+
+
+def test_parse_message_extracts_quote_alt_container_and_leaf():
+    # 健壮性：ref 容器换个 key 名（refer_msg）、被引用文本换个叶子 key（content）也应提取出来，
+    # 避免像历史回归那样「换一层嵌套/字段名就静默取空」。
+    raw = {
+        "from_user_id": "u@im.wechat",
+        "context_token": "ctx",
+        "item_list": [
+            {
+                "type": 1,
+                "text_item": {"text": "/cancel"},
+                "refer_msg": {
+                    "message_item": {"content": "已取消 [session: alt-shape @r sid: z]"}
+                },
+            }
+        ],
+    }
+    m = _parse_message(raw)
+    assert m.text == "/cancel"
+    assert "[session: alt-shape" in m.quote_text
+
+
+def test_parse_message_extracts_quote_deeper_and_dedupes():
+    # 更深/重复嵌套：只要落在 ref 容器内的文本叶子都能收上来，且重复内容去重。
+    raw = {
+        "from_user_id": "u",
+        "item_list": [
+            {
+                "type": 1,
+                "text_item": {"text": "hi"},
+                "quoted": {
+                    "a": {"b": {"text": "[session: deep @r sid: q]"}},
+                    "c": {"text": "[session: deep @r sid: q]"},
+                },
+            }
+        ],
+    }
+    m = _parse_message(raw)
+    assert m.quote_text == "[session: deep @r sid: q]"  # 去重后仅一条
+
+
+def test_parse_message_non_ref_keys_not_treated_as_quote():
+    # 普通文本消息（无 ref/quote/cite 容器）不应误提引用。
+    raw = {"from_user_id": "u", "item_list": [{"type": 1, "text_item": {"text": "just text"}}]}
+    m = _parse_message(raw)
+    assert m.quote_text == ""
+
+
+def test_parse_message_new_ref_extracts_create_ms_no_text():
+    # 新版 ilink 引用：ref 只带 create_time_ms、不含文本 → quote 为空、ref_create_ms 取到。
+    m = _parse_message(_raw_new_quote("u@im.wechat", "ctx", "/plan", 1783178653000))
+    assert m.text == "/plan"
+    assert m.quote_text == ""
+    assert m.ref_create_ms == 1783178653000
+
+
+def test_parse_message_ref_create_ms_none_when_no_ref():
+    m = _parse_message(_raw("u", "ctx", "hi"))
+    assert m.ref_create_ms is None
 
 
 # ── ilink 客户端 ───────────────────────────────────────────
@@ -378,6 +464,42 @@ async def test_handle_passes_quote_text(tmp_path):
     assert "[session: foo-bar" in got[0].quote_text
 
 
+async def test_handle_resolves_quote_by_timestamp(tmp_path):
+    # 新版引用（只带 create_time_ms）：先记录一条「发送时刻→标签」，再收到 create_time_ms
+    # 落在容差内的引用消息 → quote_text 按时间戳还原成该标签，下游即可反解 slug。
+    got = []
+
+    async def on_msg(m):
+        got.append(m)
+
+    runner = _runner(tmp_path, on_message=on_msg)
+    runner._client = FakeClient()
+    now = int(time.time() * 1000)
+    tag = "[session: foo-bar @r sid: abcd1234]"
+    runner._record_outbound_ref(now, tag)
+    # 引用消息的 create_time_ms 与发送时刻差 300ms（容差内）
+    await runner._handle(_parse_message(_raw_new_quote("alice", "ctx", "/plan", now + 300)))
+    assert len(got) == 1
+    assert got[0].text == "/plan"
+    assert got[0].quote_text == tag
+
+
+async def test_handle_ref_by_time_no_match_warns(tmp_path, caplog):
+    # 新版引用但没有匹配的已记录会话消息（历史/非会话消息）→ quote 空 + WARNING，不抛异常。
+    got = []
+
+    async def on_msg(m):
+        got.append(m)
+
+    runner = _runner(tmp_path, on_message=on_msg)
+    runner._client = FakeClient()
+    with caplog.at_level("WARNING"):
+        await runner._handle(_parse_message(_raw_new_quote("alice", "ctx", "/plan", 1783178653000)))
+    assert len(got) == 1
+    assert got[0].quote_text == ""
+    assert any("未匹配到已记录" in r.message for r in caplog.records)
+
+
 async def test_handle_sends_typing(tmp_path):
     runner = _runner(tmp_path)
     fake = FakeClient()
@@ -498,3 +620,47 @@ async def test_reply_respects_min_interval(tmp_path, monkeypatch):
 
     assert fake.sent == [("alice", "ctx", "a"), ("alice", "ctx", "b")]
     assert any(s > 0 for s in slept)
+
+
+# ── runner：出站标签记录 + 引用时间戳反查 ──────────────────────
+
+
+async def test_reply_records_session_tag_only_when_present(tmp_path):
+    runner = _runner(tmp_path)
+    runner._client = FakeClient()
+    runner._context_tokens["alice"] = ("ctx", time.monotonic())
+    # 带 [session:] 标签的回复 → 记录一条（标签为原样子串）
+    await runner.reply("alice", "plan 已就绪 ✅\n\n[session: foo @r sid: abcd1234]")
+    assert len(runner._outbound_refs) == 1
+    assert runner._outbound_refs[0][1] == "[session: foo @r sid: abcd1234]"
+    # 不带标签的回复 → 不记录
+    await runner.reply("alice", "普通提示，无标签")
+    assert len(runner._outbound_refs) == 1
+
+
+def test_resolve_ref_by_time_within_and_outside_tolerance(tmp_path):
+    runner = _runner(tmp_path)
+    now = int(time.time() * 1000)
+    tag = "[session: foo @r sid: x]"
+    runner._record_outbound_ref(now, tag)
+    assert runner._resolve_ref_by_time(now) == tag           # 精确
+    assert runner._resolve_ref_by_time(now + 4000) == tag     # 容差内(4s)
+    assert runner._resolve_ref_by_time(now + 10000) == ""     # 超容差(10s)
+
+
+def test_resolve_ref_by_time_picks_nearest(tmp_path):
+    runner = _runner(tmp_path)
+    now = int(time.time() * 1000)
+    runner._record_outbound_ref(now, "[session: aaa @r sid: 1]")
+    runner._record_outbound_ref(now + 2000, "[session: bbb @r sid: 2]")
+    assert "bbb" in runner._resolve_ref_by_time(now + 1600)
+    assert "aaa" in runner._resolve_ref_by_time(now + 400)
+
+
+def test_outbound_refs_persist_roundtrip(tmp_path):
+    now = int(time.time() * 1000)
+    r1 = _runner(tmp_path)
+    r1._record_outbound_ref(now, "[session: foo @r sid: x]")
+    # 新实例从同一 refs_path 加载后仍能反查
+    r2 = _runner(tmp_path)
+    assert r2._resolve_ref_by_time(now + 500) == "[session: foo @r sid: x]"

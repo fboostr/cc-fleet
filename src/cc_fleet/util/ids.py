@@ -66,6 +66,24 @@ def format_session_tag(
     return "".join(parts)
 
 
+def find_session_tag(text: str) -> str | None:
+    """从（通常是机器人发出的）文本里提取原样的 session/repo 标签子串，无则 None。
+
+    与 ``extract_quote_context`` 的区别：这里返回标签**原文子串**（如
+    ``[session: foo @bar sid: x]``），用于在无法从引用报文取回被引用文字时，
+    按发送时刻记录该标签、供事后按时间戳反查还原（见 ilink 引用时间戳关联）。
+    """
+    if not text:
+        return None
+    m = SESSION_TAG_PATTERN.search(text)
+    if m is not None:
+        return m.group(0)
+    rm = REPO_ONLY_TAG_PATTERN.search(text)
+    if rm is not None:
+        return rm.group(0)
+    return None
+
+
 def extract_quote_context(text: str) -> QuoteContext:
     """从任意文本（通常是用户引用的 quote.text）中提取路由上下文。
 
