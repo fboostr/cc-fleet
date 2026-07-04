@@ -61,6 +61,19 @@ WRITE_TOKENS = re.compile(
 # 流程里剥掉，避免它们触发 WRITE_TOKENS 后误启动路径扫描。
 _FD_DUP = re.compile(r"\d>&\d?")
 
+# 安全伪设备 / 标准流：向其重定向写入是无副作用的丢弃或写标准流，不算越界写入。
+# 仅豁免这些具名伪设备与 /dev/fd/<n>；/dev/sda 等真实块设备不在内，dd of=/dev/sda 仍会被拦。
+# （典型误拦场景：`grep ... 2>/dev/null` 里 `2>` 的 `>` 触发 WRITE_TOKENS，再把 `/dev/null`
+#  当成越界写入目标。）
+SAFE_DEVICE_PATHS = frozenset(
+    {"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty", "/dev/zero", "/dev/full"}
+)
+
+
+def _is_safe_device(token: str) -> bool:
+    """token 是否为安全伪设备 / 标准流（写入无副作用），如 /dev/null、/dev/fd/2。"""
+    return token in SAFE_DEVICE_PATHS or token.startswith("/dev/fd/")
+
 # 识别 heredoc 起始符：<<TAG / <<-TAG / <<'TAG' / <<"TAG" / <<\TAG。
 # 用 (?!<) 排除 here-string (<<<)，后者是单行字面量而非多行 body，不需要剥离。
 _HEREDOC_START = re.compile(
@@ -257,6 +270,11 @@ def check_bash(command: str, allowed_roots: list[Path]) -> str | None:
     sanitized = _strip_fd_dup(sanitized)
     if WRITE_TOKENS.search(sanitized):
         for token in re.findall(r"(?<![\w/])/[\w./~-]+", sanitized):
+            # /dev/null 等安全伪设备是无副作用的丢弃/标准流目标，重定向到它们（如
+            # `2>/dev/null`）不算越界写入。精确匹配整个 token，`/dev/null/../etc/passwd`
+            # 这类穿越因不等于白名单项、也不以 /dev/fd/ 开头而仍会被拦。
+            if _is_safe_device(token):
+                continue
             abs_path = Path(token).expanduser()
             if abs_path.is_absolute() and not _is_within(abs_path, allowed_roots):
                 return f"禁止在工作目录外写入：{token}"

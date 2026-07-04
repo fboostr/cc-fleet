@@ -205,6 +205,61 @@ def test_real_unquoted_redirect_still_blocks(worktree: Path):
     assert reason is not None and "工作目录外" in reason
 
 
+# --- 重定向到 /dev/null 等安全伪设备不应被拦 ---
+# 修复点：`2>/dev/null` 里的 `>` 会命中 WRITE_TOKENS，`/dev/null` 又被绝对路径正则抠出，
+# 旧版据此误判"工作目录外写入"。守卫现在豁免 /dev/null、/dev/std*、/dev/tty、/dev/fd/<n>
+# 等安全伪设备（写入无副作用），但不豁免 /dev/sda 这类真实块设备。
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # 用户实际报错的命令原型
+        'grep -rn "用法" src/ 2>/dev/null; echo "---"; grep -rln "/plan" src/ 2>/dev/null',
+        "echo hi > /dev/null",
+        "some-cmd 2>/dev/null",
+        "some-cmd &>/dev/null",
+        "some-cmd >/dev/null 2>&1",
+        "some-cmd 2>/dev/stderr",
+        "some-cmd >/dev/stdout",
+        "diff <(sort a) /dev/fd/2",
+    ],
+)
+def test_redirect_to_safe_device_allowed(command: str, worktree: Path):
+    payload = {"tool_name": "Bash", "tool_input": {"command": command}}
+    assert pretool_guard.evaluate(payload) is None, f"不应拦截：{command}"
+
+
+def test_dd_to_real_block_device_still_blocked(worktree: Path):
+    # /dev/zero（源）豁免，但 /dev/sda（真实块设备写目标）不豁免 → 必须被拦
+    cmd = "dd if=/dev/zero of=/dev/sda bs=1M"
+    payload = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+    reason = pretool_guard.evaluate(payload)
+    assert reason is not None and "工作目录外" in reason
+
+
+def test_safe_device_does_not_mask_other_outside_write(worktree: Path):
+    # 同一命令内既写 /dev/null（豁免）又写真越界路径 → 越界那个仍要被拦
+    cmd = "echo x > /dev/null; echo y > /tmp/should-not-write"
+    payload = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+    reason = pretool_guard.evaluate(payload)
+    assert reason is not None and "工作目录外" in reason
+
+
+def test_dev_null_path_traversal_still_blocked(worktree: Path):
+    # 伪装成 /dev/null 前缀的路径穿越不应被豁免
+    cmd = "echo x > /dev/null/../../../etc/cron.d/evil"
+    payload = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+    reason = pretool_guard.evaluate(payload)
+    assert reason is not None and "工作目录外" in reason
+
+
+def test_redirect_to_dev_null_allowed_in_remote_mode(remote: RemoteEnv):
+    # 远端模式（注入了额外白名单根）下，本地探查命令的 2>/dev/null 同样应放行
+    cmd = "grep -rn foo src/ 2>/dev/null"
+    payload = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+    assert pretool_guard.evaluate(payload) is None
+
+
 # --- Write / Edit 路径检查 ---
 
 def test_write_inside_worktree_allowed(worktree: Path):
