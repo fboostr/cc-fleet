@@ -36,12 +36,16 @@ flowchart LR
 
 主消息流（`App._on_message`）：
 
-1. `dispatcher.classify(msg, config, is_open_session)` 把消息归类
+1. `dispatcher.classify(msg, config, is_open_session)` 把消息归类。普通消息（无命令/引用/显式
+   @repo）走 chat 还是 dev 由 `config.default_mode` 决定（默认 `chat`，先讨论后转开发）；配置了
+   单个仓库时无 `@repo` 的消息自动归属唯一仓库（免 @），多仓库仍需 `@repo`/keyword 定位。
 2. 按 `DispatchKind` 走分支：
-   - `NEW` → `SessionManager.new_session()` 同步建 db 行 + 起后台 task
+   - `NEW` → `SessionManager.new_session()` 同步建 db 行 + 起后台 task（`default_mode=dev` 的普通
+     消息、`@repo /dev <需求>`、不带引用的 `/dev <需求>` 直达开发都归此类）
    - `CONTINUE` → `SessionManager.continue_session()`（awaiting：唤醒已等的 task；resumable_terminal：起新 task 复活；chat 分流到 `_continue_chat`）
-   - `CHAT` → `SessionManager.new_chat_session()` 起 `/chat` 独立对话通道
-   - `HANDOFF`（`/dev`）→ `SessionManager.new_pipeline_from_chat()` 把被引用的 chat 讨论复用同一 claude 会话转成 pipeline，并归档原 chat
+   - `CHAT` → `SessionManager.new_chat_session()` 起 `/chat` 独立**只读讨论**通道（`default_mode=chat`
+     的普通消息也归此类；在仓库主目录只读运行，不建 worktree）
+   - `HANDOFF`（引用 chat 消息的 `/dev`）→ `SessionManager.new_pipeline_from_chat()` 把被引用的 chat 讨论复用同一 claude 会话转成 pipeline，并归档原 chat
    - `COMMAND` → `commands.dispatch_command()` 同步算结果
    - `NOISE` → 直接 reply 提示
 3. 后台 `_session_loop` acquire semaphore → 反复 `Session.drive()`，遇 awaiting 等 `resume_event`，遇终态退出

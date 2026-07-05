@@ -43,6 +43,8 @@ sequenceDiagram
     F->>U: 开发完成 ✅ + MR 链接
 ```
 
+> 上图是**开发流水线**。默认交互是"先聊后做"：普通消息先进入 `/chat` 只读讨论，聊清楚后引用消息发 `/dev` 才转入上图流程；想跳过讨论直达开发用 `/dev <需求>`。详见「在聊天里使用」。单仓库时发消息无需 `@<repo>`。
+
 ## 状态机一览
 
 ```mermaid
@@ -92,7 +94,7 @@ cc-fleet 选了一条更窄的路：**对话需求 → plan / 澄清 → worktre
 
 ## 核心特性
 
-- **对话路由**：`@<repo-alias>` 显式路由 + keyword 兜底 + 引用回复反向解析 `[session: <slug>]`；多 session 并发不串味
+- **对话路由**：单仓库免 @（直接说话即归属唯一仓库）、`@<repo-alias>` 显式路由 + keyword 兜底 + 引用回复反向解析 `[session: <slug>]`；默认"先 `/chat` 只读讨论、引用消息发 `/dev` 转开发"（可配 `default_mode`），多 session 并发不串味
 - **可插拔 Agent Runner**：架构把「驱动 coding agent 子进程」抽象成可插拔 runner，编排层工具无关；当前实现 **Claude Code**，Codex / opencode 待接入 —— 设计与扩展思路见 [docs/architecture.md](./docs/architecture.md)
 - **隔离开发**：每个 session 一个独立 `git worktree` + 独立分支，主工作树永远干净；session 完整状态机覆盖 plan / 澄清 / dev / 提 MR 全程，失败 / 完成后仍可引用回复唤醒续推
 - **持久化与可视化**：SQLite + per-session `stream.jsonl` 全量原文；自带本地只读 HTTP 面板，可看实时状态、聊天记录、Claude SDK 事件流
@@ -145,8 +147,13 @@ git push 默认走 SSH（macOS 请保证 `ssh-agent` 已加载 key）。提 MR/P
 
 ## 在聊天里使用
 
-- **发新需求**：`@<repo-alias> 这一段是需求描述...`（也可省略 `@` 前缀，靠 `keywords` 兜底）
-- 机器人回复"开始分析"，回执末尾附 `[session: <internal-slug> @<repo>]`，可立即引用该消息发 `/cancel` 取消，或追加文字让 claude 继续在同一 session 里处理；plan 完成后机器人通知会切到可读 display_slug
+**默认"先聊后做"**（`default_mode: chat`，可在配置切成 `dev`）：直接发消息就进入多轮**只读讨论**把需求聊清楚，聊明白后**引用**该对话消息发 `/dev` 转成正式开发；想跳过讨论、一句话直达开发就用 `/dev <需求>`。
+
+- **只配了一个仓库时**：发消息**无需 `@<repo>` 前缀**，直接说话即可自动归属唯一仓库——最贴合聊天习惯。配置了多个仓库才需要用 `@<repo>` 指明（或靠 `keywords` 兜底）。
+- **默认讨论**：`<需求 / 问题>`（单仓库）或 `@<repo> <需求 / 问题>`（多仓库）→ 进入 `/chat` 只读讨论。
+- **直达开发**：`/dev <需求>`（单仓库）或 `@<repo> /dev <需求>`（多仓库）→ 跳过讨论，直接进入 plan→dev→MR 流水线。
+- **讨论转开发**：在讨论里聊清楚后，**引用**该对话的机器人消息发 `/dev [补充说明]`。
+- 机器人回复末尾附 `[session: <internal-slug> @<repo>]`，可立即引用该消息发 `/cancel` 取消，或追加文字继续；plan 完成后机器人通知会切到可读 display_slug
 - **澄清回路**：plan 阶段反问时引用该条消息回复即可继续
 - **完成 / 失败 / 超时**：机器人回执仍带 `[session: <slug>]`，**引用回复**会唤醒原 session 继续推进
   - 已完成 session 默认按"追加 dev"处理（不重做 plan），followup 文本以"追加反馈"形式注入 dev prompt 给 claude
@@ -164,8 +171,8 @@ git push 默认走 SSH（macOS 请保证 `ssh-agent` 已加载 key）。提 MR/P
 | `/resume <slug>` | 显式拉起 working 状态的孤儿 session（主控曾被 kill 留下的）；同样支持引用回复无参 |
 | `/plan <slug> [review\|code]` | 查看指定 session 的 plan 全文：省略选择器看原始 `plan.md`，`review` 看 `plan_review.md`（Reviewer 对 plan 的审查），`code` 看 `code_review.md`（Reviewer 对编码的审查）；也可引用某 session 消息后发 `/plan [review\|code]` 无需带 slug；文件超过 4K 字符时自动拆多条发送 |
 | `/repos` | 列出 `config.yaml` 当前配置的所有仓库及其 `aliases` / `keywords` / `mode` |
-| `/chat <消息>` | 进入与 claude 的多轮自由对话（可写、隔离在专用 worktree）；`@<repo> /chat <消息>` 绑定仓库，省略 `@repo` 则用回退目录并给出警告。详见下方「多轮自由对话」 |
-| `/dev [补充说明]` | **引用**一条 `/chat` 对话消息，把这次讨论转成正式开发任务（复用对话上下文，走完整 plan→dev→MR 流水线）。详见下方「把对话转成开发任务」 |
+| `/chat <消息>` | 进入与 claude 的多轮**只读讨论**（读代码 / 理清需求，不改代码）；`@<repo> /chat` 绑定仓库，单仓库自动绑定唯一仓库，多仓库省略 `@repo` 则用回退目录并给出警告。详见下方「多轮只读讨论」 |
+| `/dev` | 两种用法：**引用**一条 `/chat` 对话消息把讨论转成开发任务（复用对话上下文）；或 `/dev <需求>` 不引用直接开始开发（单仓库自动定位，多仓库用 `@<repo> /dev <需求>`）。走完整 plan→dev→MR 流水线，详见下方「把对话转成开发任务」 |
 | `/help` | 查看帮助 |
 
 队列反馈：同时驱动的 session 数受 `limits.max_concurrent_sessions` 限制（默认 4）；超出时 dispatch 会立即回包 "已加入 @\<repo\> 队列（前面 N 个）"，前一个进终态后再起后台 task。awaiting 状态仍占槽位，避免恢复时再排队。
@@ -179,32 +186,37 @@ git push 默认走 SSH（macOS 请保证 `ssh-agent` 已加载 key）。提 MR/P
 @my-repo [review:off] 修个错别字            # 本次强制关闭 Reviewer（即使仓库默认开）
 ```
 
-### 多轮自由对话（/chat）
+### 多轮只读讨论（/chat）
 
-`/chat` 开一条**独立于交付流水线**的对话通道：把 claude 当成通过微信透出来的多轮聊天窗口 —— cc-fleet 只做 I/O 管道，把 claude 的输出原样转发给你、把你的后续输入原样喂回同一个 claude 会话。
+`/chat` 开一条**独立于交付流水线**的讨论通道：把 claude 当成通过微信透出来的多轮聊天窗口 —— cc-fleet 只做 I/O 管道，把 claude 的输出原样转发给你、把你的后续输入原样喂回同一个 claude 会话。**这是只读讨论**：claude 会读代码、分析需求来把问题聊清楚，但不建 worktree、不改代码；真正动手实现要靠 `/dev` 转开发。
 
 ```
-@my-repo /chat 帮我看看这个项目的入口在哪     # 绑定 my-repo，在其专用 worktree 里开对话
+帮我看看这个项目的入口在哪                    # 单仓库：直接说，自动归属唯一仓库
+@my-repo /chat 帮我看看这个项目的入口在哪     # 多仓库：绑定 my-repo，在其主目录只读讨论
 ```
 
-- **绑定仓库 + 隔离**：`@<repo> /chat` 会为本次对话在 `<repo>-worktrees/<slug>` 建一个专用 worktree（分支 `chat/<slug>`），claude 拥有完整工具、**可写、可跑命令**，但被限制在该 worktree 内（复用与开发流程同一套 PreToolUse 安全护栏）。
-- **省略 `@repo` 的回退**：直接发 `/chat <消息>` 会回退到 `chat.default_cwd`（未配置则用户 home 目录）运行、**不建 worktree**，并回一条警告说明用了哪个回退路径。建议尽量带 `@repo`。
+- **只读运行**：绑定了仓库时直接在**仓库主目录**（`repo.path`）以只读权限运行，claude 能读到当前代码回答问题，但不会写文件、不执行有副作用的命令（复用与开发流程同一套 PreToolUse 安全护栏）。不建 worktree、不占额外磁盘，讨论成本压到最低。
+- **绑定仓库**：单仓库时任何消息（含裸 `/chat`）都自动绑定唯一仓库；多仓库用 `@<repo> /chat`。省略 `@repo`（且非单仓库）时回退到 `chat.default_cwd`（未配置则用户 home），读不到具体仓库代码，并回一条警告——建议带 `@repo`。
 - **多轮续聊**：每条 claude 回复末尾都带 `[session: <slug>]`，**引用该消息**追加内容即可续下一轮（复用与交付 session 相同的引用回复机制）；claude 会话上下文通过 `--resume` 连续。
 - **转发形式**：turn-by-turn —— 你发一条，claude 跑完这一轮，完整输出按 ~4000 字自动分段回发。
 - **并发**：chat 用独立并发池 `chat.max_concurrent`（默认 4），**不占用** `limits.max_concurrent_sessions`，长对话不会饿死 plan/dev 流水线。
-- **结束**：`/cancel <chat-slug>`，或引用 chat 消息发 `/cancel`；聊清楚需求后也可用 `/dev` 转成正式开发（见下）。
+- **结束**：`/cancel <chat-slug>`，或引用 chat 消息发 `/cancel`；聊清楚需求后引用该对话消息发 `/dev` 转成正式开发（见下）。
 
 #### 把对话转成开发任务（/dev）
 
-需求需要多轮讨论才能定稿时，先在 `/chat` 里聊清楚，然后**引用**该对话的任意一条机器人消息、发 `/dev [补充说明]`，即可把这次讨论直接转成一个正式交付任务：
+`/dev` 有两种用法：
 
 ```
-/dev 记得顺手补一下单测          # 引用某条 chat 回复后发送
+/dev 记得顺手补一下单测          # (a) 引用某条 chat 回复后发送 → 把讨论转成开发任务
+/dev 给登录接口加限流            # (b) 不引用、直接发 → 一句话直达开发（单仓库自动定位；
+                              #     多仓库用 `@<repo> /dev <需求>`）
 ```
+
+需求需要多轮讨论才能定稿时，先在 `/chat` 里聊清楚，然后**引用**该对话的任意一条机器人消息、发 `/dev [补充说明]`（用法 a），把讨论直接转成正式交付任务；已经想清楚需求则用法 (b) 跳过讨论直接开发。
 
 - **上下文零损耗**：新起的开发 session **复用同一个 claude 会话**（`--resume`），整段讨论原样带入规划——无需重述需求。规划首轮会明确「基于已讨论结论产出 plan、不重新发散」。
 - **走完整流水线**：从**规划（plan）**阶段正式开始，产出 `plan.md`、可走 plan 审查，再 dev →（可选 code 审查）→ MR，与普通需求完全一致。
-- **仓库继承自对话**：`@<repo> /chat` 转出的任务在该 repo 的干净 worktree（`<repo>-worktrees/<slug>`、分支 `claude/<slug>`）里开发；上下文靠 `--resume` 承载，不搬运 chat worktree 里的临时改动。**裸 `/chat`（未绑定仓库）无法直接 `/dev`**——请先用 `@<repo> /chat` 重新聊，或直接 `@<repo> 需求` 开发。
+- **仓库继承自对话**：绑定了仓库的对话转出的任务在该 repo 的干净 worktree（`<repo>-worktrees/<slug>`、分支 `claude/<slug>`）里开发；chat 阶段是只读的、没有临时改动要搬运，上下文全靠 `--resume` 承载。**裸 `/chat`（多仓库、未绑定仓库）无法直接 `/dev`**——请先用 `@<repo> /chat` 重新聊，或直接用 `/dev <需求>` / `@<repo> /dev <需求>` 开发。
 - **原对话归档**：转开发后原 chat 会被归档（不可再续聊），后续请引用**开发任务**的机器人消息跟进。一条对话只能转一次。
 - **前置条件**：对话至少成功回复过一轮（claude 会话已建立）、且当前不在生成回复中，才能 `/dev`。
 
@@ -212,12 +224,12 @@ git push 默认走 SSH（macOS 请保证 `ssh-agent` 已加载 key）。提 MR/P
 
 ```yaml
 chat:
-  default_cwd: ~/cc-fleet-chat   # 省略 @repo 时的回退工作目录；不配则回退到用户 home
+  default_cwd: ~/cc-fleet-chat   # 多仓库省略 @repo 时的回退工作目录；不配则回退到用户 home
   max_concurrent: 4              # chat 独立并发上限
   turn_timeout_sec: 3600         # 单轮 claude 子进程超时（秒）
 ```
 
-> 注意：`/chat` 里 claude 可写、可执行命令，安全边界与开发流程一致（内部信任环境专用）；回退到 home 目录时写范围较宽，建议配置专用 `chat.default_cwd` 收窄。
+> 注意：`/chat` 是只读讨论，claude 不会改代码；绑定仓库时在仓库主目录只读运行。回退到 home 目录（多仓库省略 `@repo`）时读不到具体仓库代码，建议配置专用 `chat.default_cwd` 或直接带 `@repo`。
 
 ## 管理 CLI
 

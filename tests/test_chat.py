@@ -1,9 +1,9 @@
 """ChatSession 与 /chat 通道测试。
 
-不走真实 claude / git：用 FakeRunner 注入脚本化输出，stub 掉 worktree 创建。覆盖：
-- 首轮 --session-id、次轮 --resume；WRITE 权限
+不走真实 claude / git：用 FakeRunner 注入脚本化输出。覆盖：
+- 首轮 --session-id、次轮 --resume；READ_ONLY 权限（只读讨论）
 - 输出分段回发、仅尾段带 tag；空输出兜底文案；失败 → FAILED（不落 sid）
-- local repo 建 worktree；无 repo 回退 cwd + 警告
+- 有 repo 在仓库主目录只读运行（不建 worktree）；无 repo 回退 cwd + 警告
 - apply_user_message 在 CHATTING 时拒绝；cancel 吸收后续状态写入
 - SessionManager：建 chat row、continue 分流续聊、chat 不占 pipeline 槽、cancel
 """
@@ -78,7 +78,8 @@ def _cfg(tmp_path: Path, *, default_cwd: Path | None = None, chat_max: int = 4) 
 
 @pytest.fixture(autouse=True)
 def stub_worktree(monkeypatch: pytest.MonkeyPatch):
-    """stub git worktree 创建，让 chat 建 worktree 跑通而无需真仓库。"""
+    """stub git worktree 创建。chat 已改为只读、不建 worktree，故此列表应始终为空——
+    保留 stub 以断言"chat 不再触碰 worktree 创建"（若回归会立即被捕获）。"""
     created: list = []
 
     async def fake_fetch(_root: Path, _branch: str) -> None:
@@ -132,9 +133,9 @@ async def test_first_turn_session_id_then_resume(db, tmp_path, reply):
     await chat.create_row(text="hi", chatid="c1", userid="u1")
 
     await chat.run_turn()
-    # 首轮：resume_from=None（用 --session-id），WRITE 权限
+    # 首轮：resume_from=None（用 --session-id），READ_ONLY 权限（只读讨论）
     assert calls[0]["resume_from"] is None
-    assert calls[0]["permission"] is AgentPermission.WRITE
+    assert calls[0]["permission"] is AgentPermission.READ_ONLY
     assert calls[0]["extra_env"]["CC_FLEET_WORKTREE"]
     row = await db.get_session(chat.slug)
     assert row["state"] == SessionState.CHAT_AWAITING.value
@@ -146,16 +147,20 @@ async def test_first_turn_session_id_then_resume(db, tmp_path, reply):
     assert calls[1]["resume_from"] == "sid-1"
 
 
-async def test_worktree_created_for_local_repo(db, tmp_path, reply, stub_worktree):
+async def test_local_repo_runs_readonly_in_repo_dir(db, tmp_path, reply, stub_worktree):
+    """有 repo 时 chat 在仓库主目录只读运行，不建 worktree、无分支。"""
     cfg = _cfg(tmp_path)
+    calls: list = []
     chat = ChatSession(db=db, config=cfg, reply=reply, repo_cfg=cfg.repos[0])
-    chat.runner = _runner("hi")
+    chat.runner = _runner("hi", calls=calls)
     await chat.create_row(text="你好", chatid="c1", userid="u1")
     await chat.run_turn()
     row = await db.get_session(chat.slug)
-    assert row["worktree_path"].endswith(f"repo-a-worktrees/{chat.slug}")
-    assert row["branch"] == f"chat/{chat.slug}"
-    assert stub_worktree and stub_worktree[0][1] == f"chat/{chat.slug}"
+    # cwd 是仓库主目录本身，不是隔离 worktree；branch 为空
+    assert row["worktree_path"] == str(cfg.repos[0].path)
+    assert row["branch"] is None
+    assert calls[0]["permission"] is AgentPermission.READ_ONLY
+    assert stub_worktree == []  # 只读讨论：从不创建 worktree
 
 
 async def test_no_repo_runs_in_fallback_cwd(db, tmp_path, reply, stub_worktree):

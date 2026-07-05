@@ -180,11 +180,14 @@ class HttpConfig(BaseModel):
 class ChatConfig(BaseModel):
     """`/chat` 自由对话通道的配置（独立于 plan→dev→MR 交付流水线）。
 
-    - default_cwd：`/chat` 未带 `@repo` 时的回退工作目录；为空则回退到用户 home。
-      有 `@repo` 时忽略本项，cwd 用新建的 worktree。
+    chat 是只读的需求讨论：绑定了仓库时直接在仓库主目录（``repo.path``）以只读权限跑，
+    不建 worktree、不改代码。
+
+    - default_cwd：`/chat` 未带 `@repo`（且非单仓库自动绑定）时的回退工作目录；为空则
+      回退到用户 home。绑定了仓库时忽略本项，cwd 用仓库主目录。
     - max_concurrent：并发 chat 轮次上限。独立于 ``limits.max_concurrent_sessions``，
       chat 常长时间挂着等用户，用独立池避免饿死交付流水线。
-    - turn_timeout_sec：单轮 claude 子进程超时秒数（chat 可写、可能跑得久）。
+    - turn_timeout_sec：单轮 claude 子进程超时秒数（只读讨论，一般较快，留足冗余）。
     """
 
     default_cwd: Path | None = None
@@ -213,6 +216,14 @@ class AppConfig(BaseModel):
     claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
     repos: list[RepoConfig]
+
+    # 无命令、无引用、无显式 @repo 的普通消息，默认按哪种模式处理（用于降低新手门槛）：
+    # - chat（默认）：进入 /chat 多轮讨论，聊清楚后引用消息发 /dev 转正式开发；更贴合普通用户
+    #   "先聊几轮把需求讲明白"的习惯。
+    # - dev：直接进入 plan→dev→MR 交付流水线（等价旧默认行为），适合"一句话就是明确需求"的老手。
+    # 无论此项为何，`@<repo> /dev <需求>` 与「引用一条 /chat 消息 + /dev」都能直达开发，不受影响。
+    default_mode: Literal["chat", "dev"] = "chat"
+
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     http: HttpConfig = Field(default_factory=HttpConfig)
     chat: ChatConfig = Field(default_factory=ChatConfig)

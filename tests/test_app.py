@@ -22,9 +22,34 @@ from cc_fleet.config.schema import (
 )
 
 
-def _make_config(tmp_path: Path, *, max_concurrent: int) -> AppConfig:
+def _make_config(
+    tmp_path: Path, *, max_concurrent: int, default_mode: str = "dev", multi: bool = False
+) -> AppConfig:
+    """本文件聚焦 NEW（dev）路径的 ack 分支，故 default_mode 默认 "dev"，让 `@repo 需求`
+    直达开发。验证"裸 /chat 无仓库回退"需要 sole_repo 不成立，用 multi=True 造多仓库。"""
     repo = tmp_path / "my-project"
-    repo.mkdir()
+    repo.mkdir(exist_ok=True)
+    repos = [
+        RepoConfig(
+            name="my-project",
+            aliases=["myproj"],
+            path=repo,
+            default_branch="main",
+            keywords=["my-project"],
+        ),
+    ]
+    if multi:
+        repo2 = tmp_path / "other-project"
+        repo2.mkdir(exist_ok=True)
+        repos.append(
+            RepoConfig(
+                name="other-project",
+                aliases=["other"],
+                path=repo2,
+                default_branch="main",
+                keywords=["other-kw"],
+            )
+        )
     return AppConfig(
         workspace_root=tmp_path / "ws",
         log_dir=tmp_path / "logs",
@@ -32,15 +57,8 @@ def _make_config(tmp_path: Path, *, max_concurrent: int) -> AppConfig:
         wecom=WecomConfig(bot_id="x", bot_secret="y"),
         claude=ClaudeConfig(),
         pipeline=PipelineConfig(plan_timeout_sec=10, dev_timeout_sec=10, max_clarify_rounds=2),
-        repos=[
-            RepoConfig(
-                name="my-project",
-                aliases=["myproj"],
-                path=repo,
-                default_branch="main",
-                keywords=["my-project"],
-            ),
-        ],
+        repos=repos,
+        default_mode=default_mode,
         limits=LimitsConfig(max_concurrent_sessions=max_concurrent),
     )
 
@@ -78,8 +96,15 @@ class _FakeManager:
         return "chat-xy", self._chat_note
 
 
-def _build_app(tmp_path: Path, *, max_concurrent: int, ahead: int, chat_note: str | None = None):
-    app = App(_make_config(tmp_path, max_concurrent=max_concurrent))
+def _build_app(
+    tmp_path: Path,
+    *,
+    max_concurrent: int,
+    ahead: int,
+    chat_note: str | None = None,
+    multi: bool = False,
+):
+    app = App(_make_config(tmp_path, max_concurrent=max_concurrent, multi=multi))
     bot = _FakeBot()
     mgr = _FakeManager(ahead=ahead, chat_note=chat_note)
     app._bot = bot
@@ -204,9 +229,11 @@ async def test_chat_command_binds_repo_and_acks_with_tag(tmp_path):
 
 
 async def test_chat_command_no_repo_includes_fallback_note(tmp_path):
-    """裸 `/chat <msg>`（无 @repo）→ ack 包含回退警告；tag 不带 @repo。"""
+    """裸 `/chat <msg>`（多仓库、无 @repo）→ ack 包含回退警告；tag 不带 @repo。
+
+    需多仓库：单仓库时裸 /chat 会自动绑定唯一仓库，不再走无仓库回退。"""
     app, bot, mgr = _build_app(
-        tmp_path, max_concurrent=4, ahead=0, chat_note="⚠️ 未指定 @repo，回退目录 X"
+        tmp_path, max_concurrent=4, ahead=0, chat_note="⚠️ 未指定 @repo，回退目录 X", multi=True
     )
     await app._on_message(IncomingMessage(
         text="/chat 你好", quote_text="", chatid="c1", userid="u1",
