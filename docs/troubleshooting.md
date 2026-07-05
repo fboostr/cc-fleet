@@ -20,7 +20,9 @@ tail -f $log_dir/app.log
 ## session 卡在 `planning`
 
 ```bash
-tail -200 $workspace_root/sessions/<slug>/stream.jsonl | jq -c .
+cc-fleet sessions logs <slug>          # 可读运行日志（推荐：去噪 + 工具输入/返回 + 阶段流转 + 失败判决）
+cc-fleet sessions logs <slug> --raw    # 或回退看原始 stream.jsonl
+tail -200 $workspace_root/sessions/<slug>/stream.jsonl | jq -c .   # 直接看原始底稿
 ```
 
 常见原因：
@@ -144,8 +146,8 @@ du -sh $workspace_root/sessions/*/stream.jsonl | sort -h
 | 文件 | 内容 |
 |---|---|
 | `$log_dir/app.log` | 主控应用日志（连接 / dispatch / drive / 异常） |
-| `$log_dir/sessions/<slug>.log` | 单 session 单独日志（如果代码里用了 session_logger） |
-| `$workspace_root/sessions/<slug>/stream.jsonl` | Coder claude 的 stream-json 全量原文 |
+| `$workspace_root/sessions/<slug>/session.log` | **人类可读运行日志**：去噪渲染工具输入/返回、阶段流转、失败判决（`cc-fleet sessions logs <slug>` 即读此文件） |
+| `$workspace_root/sessions/<slug>/stream.jsonl` | Coder claude 的 stream-json 全量原文（`--raw` / 机读底稿） |
 | `$workspace_root/sessions/<slug>/reviewer_stream.jsonl` | Reviewer claude 的 stream-json 全量原文 |
 | `$workspace_root/sessions/<slug>/plan.md` | 当前 session 的 plan 正文（剥协议尾） |
 | `$workspace_root/sessions/<slug>/plan_review.md` | Reviewer plan 审查意见 |

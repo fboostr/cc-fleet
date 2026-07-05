@@ -97,7 +97,7 @@ cc-fleet 选了一条更窄的路：**对话需求 → plan / 澄清 → worktre
 - **对话路由**：单仓库免 @（直接说话即归属唯一仓库）、`@<repo-alias>` 显式路由 + keyword 兜底 + 引用回复反向解析 `[session: <slug>]`；默认"先 `/chat` 只读讨论、引用消息发 `/dev` 转开发"（可配 `default_mode`），多 session 并发不串味
 - **可插拔 Agent Runner**：架构把「驱动 coding agent 子进程」抽象成可插拔 runner，编排层工具无关；当前实现 **Claude Code**，Codex / opencode 待接入 —— 设计与扩展思路见 [docs/architecture.md](./docs/architecture.md)
 - **隔离开发**：每个 session 一个独立 `git worktree` + 独立分支，主工作树永远干净；session 完整状态机覆盖 plan / 澄清 / dev / 提 MR 全程，失败 / 完成后仍可引用回复唤醒续推
-- **持久化与可视化**：SQLite + per-session `stream.jsonl` 全量原文；自带本地只读 HTTP 面板，可看实时状态、聊天记录、Claude SDK 事件流
+- **持久化与可视化**：SQLite + per-session `stream.jsonl` 全量原文 + 人类可读的 `session.log`（去噪渲染工具输入/返回、阶段流转、失败判决，出问题打开一个文件即可，无需线上复现）；自带本地只读 HTTP 面板，可看实时状态、聊天记录、Claude SDK 事件流
 - **可选独立 Reviewer**（按 repo 开启）：在 plan 与开发完成后各插入审查检查点，由独立于 Coder 的第二个 agent 挑剔审查、Coder 据意见完善 —— 详见 [docs/reviewer.md](./docs/reviewer.md)
 - **MR 质量硬约束**：标题动宾化、commit type 前缀、描述六小节模板（背景 / 用户原始需求 / 改动概要 / 测试与验证 / 文档与注释同步 / 风险与回滚），缺失自动走 git log 兜底
 - **软护栏**（`PreToolUse` hook）：禁止 `git push --force` 及各种变体、禁止工作目录外写、禁止访问 `~/.ssh` / `/etc/passwd` 等敏感路径
@@ -236,7 +236,9 @@ chat:
 ```bash
 cc-fleet --config config.yaml sessions list
 cc-fleet --config config.yaml sessions cancel <slug>
-cc-fleet --config config.yaml sessions logs <slug>   # stream.jsonl 末尾 200 行
+cc-fleet --config config.yaml sessions logs <slug>              # 人类可读运行日志 session.log 全文
+cc-fleet --config config.yaml sessions logs <slug> --tail 100  # 只看末尾 100 行
+cc-fleet --config config.yaml sessions logs <slug> --raw       # 原始 stream.jsonl（机读/深挖）
 ```
 
 ## 本地 HTTP 面板
@@ -311,13 +313,13 @@ repos:
 每个 session 至少 1 次 plan 调用 + 1 次 dev 调用；启用 Reviewer 时每个检查点再 +1 次 plan 级调用。澄清回路每问一轮 +1 次。dev 失败 / 超时被引用回复唤醒时 +1 次 dev。
 
 **Q：数据存哪？能离线吗？**
-session 元数据落 SQLite（`db_path` 配置），每个 session 的 Claude SDK stream-json 原文落 `workspace_root/sessions/<slug>/stream.jsonl`。除企微 WebSocket + Claude Code SDK + Git remote 之外不依赖任何外部服务，可完全在内网跑。
+session 元数据落 SQLite（`db_path` 配置），每个 session 的 Claude SDK stream-json 原文落 `workspace_root/sessions/<slug>/stream.jsonl`，同目录另落一份人类可读的 `session.log`（渲染工具输入/返回、阶段流转、失败判决）。除企微 WebSocket + Claude Code SDK + Git remote 之外不依赖任何外部服务，可完全在内网跑。
 
 **Q：怎么防止 Claude 跑飞 / 做了不该做的事？**
 两层保护：(1) plan 阶段用 `plan` permission mode 强制只读；(2) dev 阶段用 `acceptEdits` mode + `PreToolUse` hook 拦 force push / 工作目录外写 / 敏感路径访问。**绕过风险仍存在**（prompt-injection + shell 混淆），见 [docs/security.md](./docs/security.md)。
 
 **Q：session 卡住怎么办？**
-看 `workspace_root/sessions/<slug>/stream.jsonl` 末尾、看 HTTP 面板的事件流、用 `/cancel <slug>` 取消。完整故障排查见 [docs/troubleshooting.md](./docs/troubleshooting.md)。
+用 `cc-fleet sessions logs <slug>` 看可读运行日志（即 `workspace_root/sessions/<slug>/session.log`）、看 HTTP 面板的事件流、用 `/cancel <slug>` 取消。完整故障排查见 [docs/troubleshooting.md](./docs/troubleshooting.md)。
 
 ## 路线图与已知限制
 
@@ -344,7 +346,7 @@ session 元数据落 SQLite（`db_path` 配置），每个 session 的 Claude SD
 ## 故障排查
 
 - 机器人收不到消息：检查 `.env` 凭据；查看应用日志 `log_dir/app.log`；确认 `wecom.allowed_chatids` 设置
-- session 卡在 `planning`：查看 `workspace_root/sessions/<slug>/stream.jsonl`；检查 claude 是否输出了 `STATUS: ...` 行
+- session 卡在 `planning`：`cc-fleet sessions logs <slug>` 看可读日志（即 `workspace_root/sessions/<slug>/session.log`）；检查 claude 是否输出了 `STATUS: ...` 行
 - MR/PR 提交失败：进 worktree 手动跑一遍 push 命令复现，按平台对症排查
 
 更详细的故障排查清单（按平台 / 按状态分门别类）见 [docs/troubleshooting.md](./docs/troubleshooting.md)。

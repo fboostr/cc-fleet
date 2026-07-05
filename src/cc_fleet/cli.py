@@ -94,13 +94,19 @@ def _cmd_sessions_cancel(args: argparse.Namespace) -> int:
 
 def _cmd_sessions_logs(args: argparse.Namespace) -> int:
     cfg = _load(args)
-    p = (cfg.workspace_root / "sessions" / args.slug / "stream.jsonl").expanduser()
+    sess_dir = (cfg.workspace_root / "sessions" / args.slug).expanduser()
+    # 默认打印人类可读的 session.log（去噪 + 工具输入/返回 + 阶段流转 + 失败判决）；
+    # --raw 回退看原始 stream.jsonl（含全部流式事件，供机读/深挖）。
+    fname = "stream.jsonl" if args.raw else "session.log"
+    p = sess_dir / fname
     if not p.exists():
-        print(f"未找到 stream 日志：{p}", file=sys.stderr)
+        hint = "" if args.raw else "（旧 session 可能尚无 session.log，可加 --raw 看原始 stream.jsonl）"
+        print(f"未找到日志：{p}{hint}", file=sys.stderr)
         return 1
-    # 仅打印末尾 200 行
     lines = Path(p).read_text(encoding="utf-8").splitlines()
-    for line in lines[-200:]:
+    if args.tail and args.tail > 0:
+        lines = lines[-args.tail :]
+    for line in lines:
         print(line)
     return 0
 
@@ -208,8 +214,14 @@ def build_parser() -> argparse.ArgumentParser:
     cancel.add_argument("slug")
     cancel.set_defaults(func=_cmd_sessions_cancel)
 
-    logs = sessions_sub.add_parser("logs", help="查看 session 日志")
+    logs = sessions_sub.add_parser(
+        "logs", help="查看 session 可读运行日志（--raw 看原始 stream.jsonl）"
+    )
     logs.add_argument("slug")
+    logs.add_argument(
+        "--raw", action="store_true", help="打印原始 stream.jsonl 而非可读 session.log"
+    )
+    logs.add_argument("--tail", type=int, default=0, help="只打印末尾 N 行（默认全文）")
     logs.set_defaults(func=_cmd_sessions_logs)
 
     wechat_login = sub.add_parser(
