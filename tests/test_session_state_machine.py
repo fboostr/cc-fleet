@@ -138,6 +138,71 @@ async def test_happy_path_to_completed(db, cfg, repo_cfg, reply, replies):
     assert any("plan 已就绪" in t and "plan.md" in t for _, t in replies)
 
 
+async def test_driven_session_writes_readable_session_log(db, cfg, repo_cfg, reply):
+    """驱动一条 session：session.log 落盘，含阶段流转、工具调用/守卫阻断、以及通知。
+
+    验证「一个文件看全」的两半：claude 事件（工具输入/守卫阻断，来自 stream 事件）
+    + 主控侧信息（阶段流转、plan 就绪通知，stream.jsonl 里没有）。
+    """
+    scripted = ["plan 完成。\n\nSLUG: demo-x\nSTATUS: READY\n", "开发完成，已 push。\n"]
+    calls = {"n": 0}
+
+    async def stub(**kwargs) -> ClaudeRunResult:
+        i = calls["n"]
+        calls["n"] += 1
+        on_event = kwargs.get("on_event")
+        if i == 0 and on_event is not None:  # plan 阶段吐一条工具调用 + 一条守卫阻断
+            await on_event(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Bash",
+                                "input": {"command": "grep -rn x src/ 2>/dev/null"},
+                            }
+                        ]
+                    },
+                }
+            )
+            await on_event(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "t1",
+                                "content": "禁止在工作目录外写入：/dev/null",
+                                "is_error": True,
+                            }
+                        ]
+                    },
+                }
+            )
+        return ClaudeRunResult(
+            exit_code=0,
+            session_id=kwargs.get("resume_from") or kwargs["session_id"],
+            text_output=scripted[min(i, len(scripted) - 1)],
+            stream_log_path=kwargs["stream_log_path"],
+            stderr_tail="",
+            timed_out=False,
+        )
+
+    session = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await session.start(initial_request="做点事", chatid="c1", userid="u1")
+
+    log = (cfg.workspace_root / "sessions" / session.slug / "session.log").read_text(
+        encoding="utf-8"
+    )
+    assert "PLANNING" in log  # 阶段流转（stream.jsonl 里没有）
+    assert "grep -rn x src/ 2>/dev/null" in log  # 工具调用输入
+    assert "禁止在工作目录外写入：/dev/null" in log  # 守卫阻断（tool_result is_error）
+    assert "⛔" in log
+    assert "plan 已就绪" in log  # _notify 通知也缝进日志
+
+
 # ---- clarification 回路 ----
 
 async def test_clarification_then_ready(db, cfg, repo_cfg, reply, replies):

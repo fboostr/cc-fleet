@@ -95,25 +95,52 @@ def test_main_none_return_exits_zero(monkeypatch):
 
 # ---------- sessions logs ----------
 
-def test_cmd_sessions_logs_prints_only_tail(monkeypatch, tmp_path: Path, capsys):
-    ws = tmp_path / "ws"
-    sdir = ws / "sessions" / "myslug"
+def _logs_ns(slug: str, *, raw: bool = False, tail: int = 0) -> SimpleNamespace:
+    return SimpleNamespace(config="c", slug=slug, raw=raw, tail=tail)
+
+
+def _write_session_dir(ws: Path, slug: str, fname: str, body: str) -> None:
+    sdir = ws / "sessions" / slug
     sdir.mkdir(parents=True)
-    (sdir / "stream.jsonl").write_text(
-        "\n".join(f"line{i}" for i in range(250)), encoding="utf-8"
-    )
+    (sdir / fname).write_text(body, encoding="utf-8")
+
+
+def test_cmd_sessions_logs_prints_readable_log_full(monkeypatch, tmp_path: Path, capsys):
+    ws = tmp_path / "ws"
+    _write_session_dir(ws, "myslug", "session.log", "\n".join(f"line{i}" for i in range(250)))
     monkeypatch.setattr(cli, "_load", lambda args: SimpleNamespace(workspace_root=ws))
-    rc = cli._cmd_sessions_logs(SimpleNamespace(config="c", slug="myslug"))
+    rc = cli._cmd_sessions_logs(_logs_ns("myslug"))
     out = capsys.readouterr().out
     assert rc == 0
-    assert "line249" in out  # 末尾在
-    assert "line50" in out  # 末 200 行的边界（line50..line249）
-    assert "line49" not in out  # 第 201 行往前被截掉
+    assert "line0" in out  # 默认打印全文，不再硬截末 200 行
+    assert "line249" in out
+
+
+def test_cmd_sessions_logs_tail_limits(monkeypatch, tmp_path: Path, capsys):
+    ws = tmp_path / "ws"
+    _write_session_dir(ws, "myslug", "session.log", "\n".join(f"line{i}" for i in range(250)))
+    monkeypatch.setattr(cli, "_load", lambda args: SimpleNamespace(workspace_root=ws))
+    rc = cli._cmd_sessions_logs(_logs_ns("myslug", tail=100))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "line249" in out
+    assert "line150" in out
+    assert "line149" not in out  # 只保留末 100 行（line150..line249）
+
+
+def test_cmd_sessions_logs_raw_reads_stream_jsonl(monkeypatch, tmp_path: Path, capsys):
+    ws = tmp_path / "ws"
+    _write_session_dir(ws, "myslug", "stream.jsonl", '{"type":"result"}')
+    monkeypatch.setattr(cli, "_load", lambda args: SimpleNamespace(workspace_root=ws))
+    rc = cli._cmd_sessions_logs(_logs_ns("myslug", raw=True))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert '{"type":"result"}' in out
 
 
 def test_cmd_sessions_logs_missing_file(monkeypatch, tmp_path: Path, capsys):
     monkeypatch.setattr(cli, "_load", lambda args: SimpleNamespace(workspace_root=tmp_path))
-    rc = cli._cmd_sessions_logs(SimpleNamespace(config="c", slug="nope"))
+    rc = cli._cmd_sessions_logs(_logs_ns("nope"))
     assert rc == 1
     assert "未找到" in capsys.readouterr().err
 

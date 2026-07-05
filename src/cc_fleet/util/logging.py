@@ -50,22 +50,3 @@ def setup_logging(log_dir: Path, level: int = logging.INFO) -> None:
     )
     file_handler.setFormatter(fmt)
     root.addHandler(file_handler)
-
-
-def session_logger(log_dir: Path, slug: str) -> logging.Logger:
-    """为单个 session 单独建一个 logger，写到 sessions/<slug>.log，不污染主日志。"""
-    log_dir = log_dir.expanduser()
-    (log_dir / "sessions").mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger(f"session.{slug}")
-    if not logger.handlers:
-        handler = RotatingFileHandler(
-            log_dir / "sessions" / f"{slug}.log",
-            maxBytes=10 * 1024 * 1024,
-            backupCount=3,
-            encoding="utf-8",
-        )
-        handler.setFormatter(_LocalTZFormatter(_LOG_FORMAT))
-        logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
-        logger.propagate = False
-    return logger

@@ -60,7 +60,7 @@ The full state machine and the `apply_followup` recovery table live in [docs/sta
 
 - **Conversational routing**: explicit `@<repo-alias>` + keyword fallback + quoted-reply reverse-resolution of `[session: <slug>]`; concurrent sessions never cross-talk.
 - **Isolated development**: one `git worktree` + branch per session; the main tree stays clean. A full state machine covers plan / clarify / dev / open-MR, and finished or failed sessions can be re-woken by quoting a reply.
-- **Persistence & visibility**: SQLite + per-session `stream.jsonl` (raw Claude SDK stream); a built-in **read-only local HTTP panel** shows live state, chat history, and the event stream.
+- **Persistence & visibility**: SQLite + per-session `stream.jsonl` (raw Claude SDK stream) + a human-readable `session.log` (denoised tool inputs/outputs, phase transitions, and the failure verdict — open one file to see what happened, no re-run needed); a built-in **read-only local HTTP panel** shows live state, chat history, and the event stream.
 - **Optional independent Reviewer** (per repo): inserts a review checkpoint after plan and after dev, run by a *second* agent distinct from the Coder — see [docs/reviewer.md](./docs/reviewer.md) (Chinese).
 - **Hard MR-quality constraints**: imperative title, commit-type prefix, and a six-section description template (background / original request / summary / tests & verification / docs sync / risk & rollback), with a git-log fallback if the agent omits them.
 - **Soft guardrails** (`PreToolUse` hook): block `git push --force` and variants, out-of-tree writes, and access to sensitive paths like `~/.ssh` / `/etc/passwd`.

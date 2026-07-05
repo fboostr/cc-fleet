@@ -78,6 +78,7 @@ from .runners.claude import (
 )
 from .mr_meta import parse_mr_metadata
 from .review import ReviewVerdict, parse_review_output
+from .session_log import SessionLogWriter
 from .slug import parse_plan_output, resolve_slug_conflict, strip_plan_protocol_tail
 from .state import SessionState, is_resumable_terminal
 
@@ -997,6 +998,18 @@ class Session:
     def _session_dir(self) -> Path:
         return (self.config.workspace_root / "sessions" / self.slug).expanduser()
 
+    def _session_log(self) -> SessionLogWriter:
+        """惰性构造 per-session 可读运行日志写入器（sessions/<slug>/session.log）。
+
+        slug 在 create_row 后即固定、_session_dir 随时可用，故惰性构造即可，无需在
+        __init__ 里持有。写入自身 try/except 降级为 warning，绝不拖垮 session。
+        """
+        w = getattr(self, "_slog_writer", None)
+        if w is None:
+            w = SessionLogWriter(self._session_dir() / "session.log")
+            self._slog_writer = w
+        return w
+
     def _is_remote(self) -> bool:
         return self.repo_cfg.mode == "remote"
 
@@ -1249,9 +1262,14 @@ class Session:
         return Path(wt).is_dir()
 
     async def _persist_claude_event(self, evt: dict) -> None:
-        """把 claude SDK stream-json 的每条事件原文落到 events 表，kind 加 claude. 前缀。"""
+        """把 claude SDK stream-json 的每条事件原文落到 events 表，kind 加 claude. 前缀。
+
+        同一 choke point 旁挂人类可读日志：渲染工具调用输入/返回、模型文本、终态，
+        去噪后追加进 sessions/<slug>/session.log（plan/dev/publish 各阶段都经此回调）。
+        """
         etype = evt.get("type") or "unknown"
         await self.db.add_event(self.slug, f"claude.{etype}", evt)
+        self._session_log().write_event(evt)
 
     async def _refresh_row(self) -> None:
         row = await self.db.get_session(self.slug)
@@ -1286,6 +1304,8 @@ class Session:
             return
         await self._update(state=state.value, **extra)
         await self.db.add_event(self.slug, "state", {"to": state.value, **extra})
+        # 可读日志里补一条阶段流转标题——这是 stream.jsonl 结构上没有的主控侧信息。
+        self._session_log().write_phase(state.value.upper())
 
     async def _fail(self, reason: str, phase: str | None = None) -> None:
         # 记录失败时所处阶段，供后续引用回复唤醒决定 resume 回到哪个状态。
@@ -1321,6 +1341,9 @@ class Session:
                 return
         chatid = self.row.get("chatid") or ""
         await self.db.add_message(self.slug, "out", text)
+        # 把发给用户的通知（含 ❌ 失败原因、超时、plan 就绪、澄清等）也缝进可读日志——
+        # 这正是「为什么被主控判失败」这半信息，stream.jsonl 里没有。
+        self._session_log().write_note(text)
         await self.reply(chatid, text)
 
     async def _notify_clarification(self, questions: list[str], plan_path: Path) -> None:
