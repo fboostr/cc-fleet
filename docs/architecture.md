@@ -39,6 +39,9 @@ flowchart LR
 1. `dispatcher.classify(msg, config, is_open_session)` 把消息归类。普通消息（无命令/引用/显式
    @repo）走 chat 还是 dev 由 `config.default_mode` 决定（默认 `chat`，先讨论后转开发）；配置了
    单个仓库时无 `@repo` 的消息自动归属唯一仓库（免 @），多仓库仍需 `@repo`/keyword 定位。
+   其中 chat 模式 + 私聊（无群概念，`chatid` 空）下，无引用的普通消息先试「窗口内免引用
+   自动续聊」：该用户最近一个活跃 chat 距最后一条机器人回复在 `chat.auto_continue_window_sec`
+   内则直接 `CONTINUE` 续到它，否则才按 `default_mode` 开新（谓词 `App.recent_open_chat`）。
 2. 按 `DispatchKind` 走分支：
    - `NEW` → `SessionManager.new_session()` 同步建 db 行 + 起后台 task（`default_mode=dev` 的普通
      消息、`@repo /dev <需求>`、不带引用的 `/dev <需求>` 直达开发都归此类）

@@ -18,6 +18,9 @@
    或 quote 只携带 repo-only tag。引用 CANCELLED 视为"放弃后想发新需求"。
 4. text 中提到了某个 repo 的 keyword → 推断 repo，按 default_mode 归类。
 5. 单仓库兜底：只配了一个仓库时，无从定位的消息一律归属它（免 @），按 default_mode 归类。
+   其中 chat 模式 + 私聊（chatid 空）时先试「窗口内免引用自动续聊」：该用户有活跃 chat
+   且距最后一条机器人回复在 ``chat.auto_continue_window_sec`` 内 → CONTINUE 续到该 chat；
+   否则才按 default_mode 开新（``recent_open_chat`` 谓词，见 classify 参数说明）。
 6. 兜底：NOISE（机器人回一句提示，不开新 session）。仅在配置了多个仓库且无法定位时触达。
 """
 
@@ -176,6 +179,7 @@ async def classify(
     config: AppConfig,
     is_open_session: Callable[[str], Awaitable[bool]],
     session_kind_of: Callable[[str], Awaitable[str | None]] | None = None,
+    recent_open_chat: Callable[[str], Awaitable[str | None]] | None = None,
 ) -> DispatchDecision:
     """对一条消息进行分类。
 
@@ -186,6 +190,10 @@ async def classify(
     （'pipeline'/'chat'），不存在返回 None。仅 `/dev`（handoff）用来校验被引用的是
     chat 会话——它需要在 chat 处于非 open（如已 /cancel）时仍能转、且要在引用指向
     pipeline 时拒绝，这是 `is_open_session` 表达不了的。None（未注入）时跳过该校验。
+
+    `recent_open_chat(userid)`：异步谓词，返回该用户「私聊窗口内可自动续聊」的活跃 chat
+    slug，无则 None（窗口判断在谓词内部，见 ``App.recent_open_chat``）。仅规则 5（单仓库
+    兜底）在 chat 模式 + 私聊下调用，实现"不引用也接上文"。None（未注入）时禁用该特性。
     """
     text = (msg.text or "").strip()
     quote = msg.quote_text or ""
@@ -339,6 +347,22 @@ async def classify(
     #    这唯一仓库（反正只有一个目标）。按 default_mode 决定进对话还是开发。
     sole = _sole_repo(config)
     if sole is not None:
+        # 私聊窗口内免引用自动续聊：chat 模式 + 私聊（无群概念，chatid 空）+ 该用户有活跃
+        # chat 且距最后一条机器人回复在窗口内时，续到该 chat 而非开新（窗口判断在谓词内）。
+        # 显式 @/关键词/可解析引用都在前面各规则优先处理，落到这里必是"无信号"消息才适用；
+        # `/chat` 走规则 0 永远开新，是刻意开新话题的逃生舱。
+        if (
+            config.default_mode == "chat"
+            and not msg.chatid
+            and recent_open_chat is not None
+        ):
+            chat_slug = await recent_open_chat(msg.userid)
+            if chat_slug is not None:
+                return DispatchDecision(
+                    kind=DispatchKind.CONTINUE,
+                    session_slug=chat_slug,
+                    cleaned_text=text,
+                )
         return _default_entry(sole, cursor or text, config)
 
     # 6. 噪声（多仓库且无法定位归属）
