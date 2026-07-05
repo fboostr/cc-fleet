@@ -131,6 +131,37 @@ class Database:
         )
         return await cur.fetchone() is not None
 
+    async def find_recent_open_chat(self, chatid: str) -> dict[str, Any] | None:
+        """取该 chatid 下最近一个「活跃」chat 会话，供私聊窗口内免引用自动续聊判定。
+
+        - 只认活跃态（chatting / chat_awaiting）；已失败 / 取消 / 转开发的 chat 不返回，
+          避免一句无关消息静默复活久远或失败的会话（那些仍需用户显式引用）。字面量
+          'chatting'/'chat_awaiting' 对应 ``SessionState.CHATTING/CHAT_AWAITING``。
+        - ``last_reply_ts``：该会话最后一条 ``direction='out'`` 消息的 ts（= 机器人最后
+          回复时刻）；若尚未回过（刚 chatting 未产出）退回 ``updated_at`` 作锚点。
+        - 私聊建 row 时 chatid 落的是 ``msg.chatid or userid``（私聊即 userid），故这里按
+          chatid 精确匹配即可把该用户私聊会话与其群聊会话（chatid=群 id）隔离。
+
+        返回含 ``slug`` 与 ``last_reply_ts`` 的 dict；无活跃 chat 时 None。窗口是否命中由
+        调用方（``App`` 闭包，持有 config）用 ``auto_continue_window_sec`` 判定。
+        """
+        cur = await self.conn.execute(
+            "SELECT s.slug AS slug,"
+            "       COALESCE(MAX(m.ts), s.updated_at) AS last_reply_ts "
+            "FROM sessions s "
+            "LEFT JOIN messages m"
+            "  ON m.session_slug = s.slug AND m.direction = 'out' "
+            "WHERE s.chatid = ?"
+            "  AND s.session_kind = 'chat'"
+            "  AND s.state IN ('chatting', 'chat_awaiting') "
+            "GROUP BY s.slug "
+            "ORDER BY last_reply_ts DESC "
+            "LIMIT 1",
+            (chatid,),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
     # ---------- messages ----------
 
     async def add_message(

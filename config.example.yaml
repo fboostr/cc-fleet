@@ -124,6 +124,11 @@ chat:
   default_cwd: ~/cc-fleet-chat   # 多仓库省略 @repo 时的回退工作目录；不配则回退到用户 home
   max_concurrent: 4              # chat 独立并发上限（不占用 limits.max_concurrent_sessions）
   turn_timeout_sec: 3600         # 单轮 claude 子进程超时（秒）
+  # 私聊「窗口内免引用自动续聊」时长（秒），默认 1800（30 分钟）、默认开启。仅 default_mode=chat
+  # 且私聊（个人微信 1:1 / 企微单聊）下生效：不带引用的普通消息，若距该用户最近一个活跃 chat
+  # 的最后一条机器人回复 ≤ 本值，自动续到该会话而非开新；超窗 / 无活跃 chat 则照旧开新。
+  # 设 0 关闭（回到"必须引用才续聊"）。想刻意开新话题用 /chat <消息>（永远开新，不受此项影响）。
+  auto_continue_window_sec: 1800
 
 # 本地只读 HTTP 面板（浏览器查看 session 状态、claude 事件流）
 # 默认开启、仅 127.0.0.1、无鉴权；要关掉就把 enabled 设为 false

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 
 from .bot.base import BotRunner
 from .bot.factory import create_bot
@@ -19,6 +20,29 @@ from .util.logging import setup_logging
 from .web.server import WebServer
 
 logger = logging.getLogger(__name__)
+
+
+def _within_reply_window(
+    last_ts: str | None, window_sec: int, now: datetime | None = None
+) -> bool:
+    """距最后一条机器人回复时刻 ``last_ts`` 是否仍在 ``window_sec`` 秒内。
+
+    用于私聊「窗口内免引用自动续聊」判定。``last_ts`` 为空 / 格式异常 / 与当前时间
+    时区不可比（历史脏数据）一律返回 False —— 保守回落"开新会话"，不冒险续到错的会话。
+    ``now`` 供测试注入（默认取本地当前时刻）。
+    """
+    if not last_ts:
+        return False
+    try:
+        last = datetime.fromisoformat(last_ts)
+    except (ValueError, TypeError):
+        return False
+    current = now if now is not None else datetime.now().astimezone()
+    try:
+        return (current - last).total_seconds() <= window_sec
+    except TypeError:
+        # last 无时区而 current 带时区（或反之）→ 不可比，保守不续。
+        return False
 
 
 class App:
@@ -52,7 +76,24 @@ class App:
                 row = await self.db.get_session(s)
             return row.get("session_kind") if row else None
 
-        decision = await classify(msg, self.config, session_open, session_kind_of)
+        async def recent_open_chat(userid: str) -> str | None:
+            # 私聊窗口内免引用自动续聊：查该用户最近一个活跃 chat，若距最后一条机器人回复
+            # ≤ auto_continue_window_sec 则返回其 slug 续到该会话。window<=0 视为关闭。
+            # 仅 dispatcher 规则 5 在 chat 模式 + 私聊（chatid 空）下调用，故这里按 userid
+            # 查即可（私聊建 row 时 chatid 落的就是 userid）。
+            window = self.config.chat.auto_continue_window_sec
+            if window <= 0:
+                return None
+            hit = await self.db.find_recent_open_chat(userid)
+            if hit is None:
+                return None
+            if _within_reply_window(hit.get("last_reply_ts"), window):
+                return hit["slug"]
+            return None
+
+        decision = await classify(
+            msg, self.config, session_open, session_kind_of, recent_open_chat
+        )
         chatid = msg.chatid or msg.userid
         if decision.kind == DispatchKind.NEW:
             assert decision.repo is not None

@@ -959,3 +959,88 @@ async def test_quote_repo_path_respects_chat_mode(tmp_path: Path):
     d = await classify(msg, cfg, _never_open)
     assert d.kind == DispatchKind.CHAT and d.repo.name == "feed-web"
     assert d.cleaned_text == "补充一下"
+
+
+# ---------- 私聊窗口内免引用自动续聊（规则 5） ----------
+
+
+async def _hit_chat(_: str) -> str | None:
+    """模拟"窗口内存在活跃 chat"：返回可续聊的 slug。"""
+    return "chat-live"
+
+
+async def _miss_chat(_: str) -> str | None:
+    """模拟"无活跃 chat / 超窗"：返回 None。"""
+    return None
+
+
+async def test_private_chat_auto_continue_when_recent(tmp_path: Path):
+    """chat 模式 + 私聊（chatid 空）+ 无引用 + 窗口内有活跃 chat → CONTINUE 续到它。"""
+    cfg = make_config(tmp_path, default_mode="chat")
+    msg = IncomingMessage(text="那再补一点", quote_text="", chatid="", userid="u1")
+    d = await classify(msg, cfg, _never_open, None, _hit_chat)
+    assert d.kind == DispatchKind.CONTINUE
+    assert d.session_slug == "chat-live"
+    assert d.cleaned_text == "那再补一点"
+
+
+async def test_private_chat_no_recent_opens_new(tmp_path: Path):
+    """私聊但窗口内无活跃 chat（谓词 None）→ 回落开新 CHAT。"""
+    cfg = make_config(tmp_path, default_mode="chat")
+    msg = IncomingMessage(text="新话题", quote_text="", chatid="", userid="u1")
+    d = await classify(msg, cfg, _never_open, None, _miss_chat)
+    assert d.kind == DispatchKind.CHAT and d.repo.name == "feed-web"
+    assert d.cleaned_text == "新话题"
+
+
+async def test_group_chat_never_auto_continue(tmp_path: Path):
+    """群聊（chatid 非空）即便谓词命中也不自动续聊 → 开新 CHAT。"""
+    cfg = make_config(tmp_path, default_mode="chat")
+    msg = IncomingMessage(text="接着说", quote_text="", chatid="group-1", userid="u1")
+    d = await classify(msg, cfg, _never_open, None, _hit_chat)
+    assert d.kind == DispatchKind.CHAT and d.repo.name == "feed-web"
+
+
+async def test_dev_mode_private_never_auto_continue(tmp_path: Path):
+    """default_mode=dev：私聊也不自动续聊（特性仅 chat 模式）→ NEW。"""
+    cfg = make_config(tmp_path, default_mode="dev")
+    msg = IncomingMessage(text="加个功能", quote_text="", chatid="", userid="u1")
+    d = await classify(msg, cfg, _never_open, None, _hit_chat)
+    assert d.kind == DispatchKind.NEW and d.repo.name == "feed-web"
+
+
+async def test_auto_continue_predicate_absent_opens_new(tmp_path: Path):
+    """未注入 recent_open_chat（特性关闭 / 老调用点）→ 私聊也开新 CHAT，保持旧行为。"""
+    cfg = make_config(tmp_path, default_mode="chat")
+    msg = IncomingMessage(text="继续", quote_text="", chatid="", userid="u1")
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.CHAT and d.repo.name == "feed-web"
+
+
+async def test_explicit_mention_private_skips_auto_continue(tmp_path: Path):
+    """私聊里显式 @repo 是明确意图（规则 2 优先），不被自动续聊劫持 → CHAT 开新。"""
+    cfg = make_config(tmp_path, default_mode="chat")
+    msg = IncomingMessage(text="@feed 换个话题", quote_text="", chatid="", userid="u1")
+    d = await classify(msg, cfg, _never_open, None, _hit_chat)
+    assert d.kind == DispatchKind.CHAT and d.repo.name == "feed-web"
+    assert d.cleaned_text == "换个话题"
+
+
+async def test_quote_open_session_private_prefers_quote(tmp_path: Path):
+    """私聊里带可解析的活跃引用 → 规则 1 CONTINUE 优先，用引用里的 slug 而非自动续聊谓词。"""
+    cfg = make_config(tmp_path, default_mode="chat")
+    msg = IncomingMessage(
+        text="回复", quote_text="[session: quoted-slug]", chatid="", userid="u1"
+    )
+    d = await classify(msg, cfg, _always_open, None, _hit_chat)
+    assert d.kind == DispatchKind.CONTINUE
+    assert d.session_slug == "quoted-slug"
+
+
+async def test_chat_command_private_skips_auto_continue(tmp_path: Path):
+    """私聊里 /chat 永远开新（规则 0 优先），不被自动续聊劫持。"""
+    cfg = make_config(tmp_path, default_mode="chat")
+    msg = IncomingMessage(text="/chat 新对话", quote_text="", chatid="", userid="u1")
+    d = await classify(msg, cfg, _never_open, None, _hit_chat)
+    assert d.kind == DispatchKind.CHAT
+    assert d.cleaned_text == "新对话"

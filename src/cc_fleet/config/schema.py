@@ -188,11 +188,17 @@ class ChatConfig(BaseModel):
     - max_concurrent：并发 chat 轮次上限。独立于 ``limits.max_concurrent_sessions``，
       chat 常长时间挂着等用户，用独立池避免饿死交付流水线。
     - turn_timeout_sec：单轮 claude 子进程超时秒数（只读讨论，一般较快，留足冗余）。
+    - auto_continue_window_sec：私聊「窗口内免引用自动续聊」时长（秒），默认 1800（30 分钟）、
+      默认开启。仅在 ``default_mode='chat'`` 且**私聊**（无群概念）下生效：不带引用的普通消息，
+      若该用户存在一个活跃 chat 会话、且距其**最后一条机器人回复** ≤ 本值，则自动续到该会话
+      而非开新会话；超窗 / 无活跃 chat 则照旧开新。设 ``0`` 关闭（回到"必须引用才续聊"的旧行为）。
+      刻意开新话题用 ``/chat <消息>``（永远开新，不受本项影响）。
     """
 
     default_cwd: Path | None = None
     max_concurrent: int = 4
     turn_timeout_sec: int = 3600
+    auto_continue_window_sec: int = 1800
 
     @field_validator("default_cwd", mode="before")
     @classmethod
