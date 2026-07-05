@@ -17,24 +17,47 @@ from cc_fleet.config.schema import (
 from cc_fleet.core.dispatcher import DispatchKind, classify
 
 
-def make_config(tmp_path: Path) -> AppConfig:
+def make_config(
+    tmp_path: Path, *, default_mode: str = "dev", multi: bool = False
+) -> AppConfig:
+    """构造测试配置。
+
+    - default_mode 默认 "dev"：让大量"验证 repo 路由"的用例保持断言 NEW（路由逻辑与
+      chat/dev 模式正交）；default_mode="chat" 的用例单独覆盖对话默认路径。
+    - multi=False（默认）单仓库：会触发"单仓库免@"兜底；需要验证"多仓库无法定位 → NOISE"
+      的用例传 multi=True 拿到两个仓库。
+    """
     repo_root = tmp_path / "repo"
-    repo_root.mkdir()
+    repo_root.mkdir(exist_ok=True)
+    repos = [
+        RepoConfig(
+            name="feed-web",
+            aliases=["feed", "web"],
+            path=repo_root,
+            default_branch="main",
+            keywords=["前端", "列表页"],
+        )
+    ]
+    if multi:
+        repo2 = tmp_path / "repo2"
+        repo2.mkdir(exist_ok=True)
+        repos.append(
+            RepoConfig(
+                name="api-svc",
+                aliases=["api"],
+                path=repo2,
+                default_branch="main",
+                keywords=["后端"],
+            )
+        )
     return AppConfig(
         workspace_root=tmp_path / "ws",
         log_dir=tmp_path / "logs",
         db_path=tmp_path / "state.db",
         wecom=WecomConfig(bot_id="x", bot_secret="y"),
         claude=ClaudeConfig(),
-        repos=[
-            RepoConfig(
-                name="feed-web",
-                aliases=["feed", "web"],
-                path=repo_root,
-                default_branch="main",
-                keywords=["前端", "列表页"],
-            )
-        ],
+        repos=repos,
+        default_mode=default_mode,
         limits=LimitsConfig(),
     )
 
@@ -42,6 +65,12 @@ def make_config(tmp_path: Path) -> AppConfig:
 @pytest.fixture
 def cfg(tmp_path: Path) -> AppConfig:
     return make_config(tmp_path)
+
+
+@pytest.fixture
+def cfg_multi(tmp_path: Path) -> AppConfig:
+    """多仓库（dev 模式）：验证"无法定位归属 → NOISE"分支。"""
+    return make_config(tmp_path, multi=True)
 
 
 async def _never_open(_: str) -> bool:
@@ -66,9 +95,10 @@ async def test_mention_with_full_name(cfg: AppConfig):
     assert d.kind == DispatchKind.NEW and d.repo.name == "feed-web"
 
 
-async def test_unknown_mention_is_noise(cfg: AppConfig):
+async def test_unknown_mention_is_noise(cfg_multi: AppConfig):
+    """多仓库时 @不存在的仓库 → NOISE（单仓库会走"免@兜底"归属唯一仓库，见另一用例）。"""
     msg = IncomingMessage(text="@unknown 干啥", quote_text="", chatid="c", userid="u")
-    d = await classify(msg, cfg, _never_open)
+    d = await classify(msg, cfg_multi, _never_open)
     assert d.kind == DispatchKind.NOISE and "unknown" in d.reason
 
 
@@ -78,9 +108,10 @@ async def test_keyword_fallback(cfg: AppConfig):
     assert d.kind == DispatchKind.NEW and d.repo.name == "feed-web"
 
 
-async def test_no_repo_match_is_noise(cfg: AppConfig):
+async def test_no_repo_match_is_noise(cfg_multi: AppConfig):
+    """多仓库时无 @、无关键词、无引用 → NOISE 提示 @<repo>（单仓库场景见"免@兜底"用例）。"""
     msg = IncomingMessage(text="今天天气真好", quote_text="", chatid="c", userid="u")
-    d = await classify(msg, cfg, _never_open)
+    d = await classify(msg, cfg_multi, _never_open)
     assert d.kind == DispatchKind.NOISE and "@" in d.reason
 
 
@@ -110,13 +141,13 @@ async def test_quote_inactive_session_falls_through(cfg: AppConfig):
     assert d.kind == DispatchKind.NEW and d.repo.name == "feed-web"
 
 
-async def test_quote_terminal_session_no_repo_no_keyword_is_noise(cfg: AppConfig):
-    """quote 引用了已结束 session、tag 里也没 repo、text 也没显式 @ 也没关键词
-    → 兜底 NOISE，提示用户用 @<repo> 指明仓库。"""
+async def test_quote_terminal_session_no_repo_no_keyword_is_noise(cfg_multi: AppConfig):
+    """多仓库时 quote 引用了已结束 session、tag 里也没 repo、text 也没显式 @ 也没关键词
+    → 兜底 NOISE，提示用户用 @<repo> 指明仓库（单仓库场景会归属唯一仓库）。"""
     msg = IncomingMessage(
         text="再发一次", quote_text="[session: dead]", chatid="c", userid="u"
     )
-    d = await classify(msg, cfg, _never_open)
+    d = await classify(msg, cfg_multi, _never_open)
     assert d.kind == DispatchKind.NOISE
     assert "@" in d.reason
 
@@ -284,10 +315,11 @@ async def test_group_chat_bot_mention_only_keyword_fallback(cfg: AppConfig):
     assert d.kind == DispatchKind.NEW and d.repo.name == "feed-web"
 
 
-async def test_group_chat_bot_mention_no_keyword_is_noise(cfg: AppConfig):
-    """群聊里只 at 了机器人、内容也没关键词 → 提示找不到 @ChatBot。"""
+async def test_group_chat_bot_mention_no_keyword_is_noise(cfg_multi: AppConfig):
+    """多仓库群聊里只 at 了机器人、内容也没关键词 → 提示找不到 @ChatBot
+    （单仓库群聊会归属唯一仓库，见"免@兜底"用例）。"""
     msg = IncomingMessage(text="@ChatBot 你好", quote_text="", chatid="c", userid="u")
-    d = await classify(msg, cfg, _never_open)
+    d = await classify(msg, cfg_multi, _never_open)
     assert d.kind == DispatchKind.NOISE and "ChatBot" in d.reason
 
 
@@ -655,9 +687,19 @@ async def test_plan_selector_only_no_quote_passes_through(cfg: AppConfig):
 # ---------- /chat 通道 ----------
 
 
-async def test_chat_command_no_repo_routes_to_chat(cfg: AppConfig):
+async def test_chat_command_single_repo_binds_sole(cfg: AppConfig):
+    """单仓库时裸 /chat 自动绑定唯一仓库（免 @），对话直接基于该仓库代码。"""
     msg = IncomingMessage(text="/chat 你好呀", quote_text="", chatid="c", userid="u")
     d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.CHAT
+    assert d.repo and d.repo.name == "feed-web"
+    assert d.cleaned_text == "你好呀"
+
+
+async def test_chat_command_multi_repo_no_bind(cfg_multi: AppConfig):
+    """多仓库时裸 /chat 不绑定仓库（repo=None，走回退目录 + 警告）。"""
+    msg = IncomingMessage(text="/chat 你好呀", quote_text="", chatid="c", userid="u")
+    d = await classify(msg, cfg_multi, _never_open)
     assert d.kind == DispatchKind.CHAT
     assert d.repo is None
     assert d.cleaned_text == "你好呀"
@@ -761,11 +803,38 @@ async def test_dev_case_insensitive_and_empty_supplement(cfg: AppConfig):
     assert d.cleaned_text == ""
 
 
-async def test_dev_without_quote_is_noise(cfg: AppConfig):
-    """/dev 不带引用 → NOISE，提示引用 /chat 消息。"""
+async def test_dev_without_quote_single_repo_direct_dev(cfg: AppConfig):
+    """/dev <需求> 不带引用、单仓库 → 直达开发（NEW），自动定位唯一仓库。"""
     msg = IncomingMessage(text="/dev 干活", quote_text="", chatid="c", userid="u")
     d = await classify(msg, cfg, _never_open, _chat_kind)
-    assert d.kind == DispatchKind.NOISE and "/chat" in d.reason
+    assert d.kind == DispatchKind.NEW
+    assert d.repo and d.repo.name == "feed-web"
+    assert d.cleaned_text == "干活"
+
+
+async def test_dev_without_quote_multi_repo_is_noise(cfg_multi: AppConfig):
+    """/dev <需求> 不带引用、多仓库无法定位 → NOISE，引导用 @<repo> /dev。"""
+    msg = IncomingMessage(text="/dev 干活", quote_text="", chatid="c", userid="u")
+    d = await classify(msg, cfg_multi, _never_open, _chat_kind)
+    assert d.kind == DispatchKind.NOISE and "@<repo>" in d.reason
+
+
+async def test_dev_empty_no_quote_is_noise(cfg: AppConfig):
+    """裸 /dev 无引用、无正文 → NOISE，给出两种用法引导。"""
+    msg = IncomingMessage(text="/dev", quote_text="", chatid="c", userid="u")
+    d = await classify(msg, cfg, _never_open, _chat_kind)
+    assert d.kind == DispatchKind.NOISE and "/chat" in d.reason and "/dev" in d.reason
+
+
+async def test_dev_direct_parses_review_directive(cfg: AppConfig):
+    """/dev <需求> 直达开发时，正文里的 [review] 被解析为 override 并剥离。"""
+    msg = IncomingMessage(
+        text="/dev [review] 加个限流", quote_text="", chatid="c", userid="u"
+    )
+    d = await classify(msg, cfg, _never_open, _chat_kind)
+    assert d.kind == DispatchKind.NEW
+    assert d.review_override is True
+    assert d.cleaned_text == "加个限流"
 
 
 async def test_dev_quoting_pipeline_is_noise(cfg: AppConfig):
@@ -820,3 +889,73 @@ async def test_dev_skips_kind_check_when_predicate_absent(cfg: AppConfig):
     )
     d = await classify(msg, cfg, _never_open)
     assert d.kind == DispatchKind.HANDOFF and d.session_slug == "chat-ab12"
+
+
+# ---------- 单仓库免@ + 默认模式（chat / dev） ----------
+
+
+async def test_single_repo_no_mention_dev_mode_routes_new(tmp_path: Path):
+    """单仓库 + default_mode=dev：无 @ 普通消息直达开发（NEW），免 @。"""
+    cfg = make_config(tmp_path, default_mode="dev")
+    msg = IncomingMessage(text="帮我加个导出功能", quote_text="", chatid="c", userid="u")
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.NEW and d.repo.name == "feed-web"
+    assert d.cleaned_text == "帮我加个导出功能"
+
+
+async def test_single_repo_no_mention_chat_mode_routes_chat(tmp_path: Path):
+    """单仓库 + default_mode=chat（产品默认）：无 @ 普通消息进对话，免 @。"""
+    cfg = make_config(tmp_path, default_mode="chat")
+    msg = IncomingMessage(text="帮我加个导出功能", quote_text="", chatid="c", userid="u")
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.CHAT and d.repo.name == "feed-web"
+    assert d.cleaned_text == "帮我加个导出功能"
+
+
+async def test_at_repo_chat_mode_routes_chat(tmp_path: Path):
+    """default_mode=chat：@repo 普通需求也进对话（不再一句话直接开发）。"""
+    cfg = make_config(tmp_path, default_mode="chat")
+    msg = IncomingMessage(text="@feed 加个导出", quote_text="", chatid="c", userid="u")
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.CHAT and d.repo.name == "feed-web"
+    assert d.cleaned_text == "加个导出"
+
+
+async def test_at_repo_dev_direct_bypasses_chat_mode(tmp_path: Path):
+    """@repo /dev <需求>：即便 default_mode=chat 也直达开发（老手快捷入口）。"""
+    cfg = make_config(tmp_path, default_mode="chat")
+    msg = IncomingMessage(text="@feed /dev 加个导出", quote_text="", chatid="c", userid="u")
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.NEW and d.repo.name == "feed-web"
+    assert d.cleaned_text == "加个导出"
+
+
+async def test_single_repo_unknown_mention_routes_to_sole(tmp_path: Path):
+    """单仓库时即便 @错了仓库名，也归属唯一仓库（只有一个目标），不报 NOISE。"""
+    cfg = make_config(tmp_path, default_mode="dev")
+    msg = IncomingMessage(text="@typo 加个功能", quote_text="", chatid="c", userid="u")
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.NEW and d.repo.name == "feed-web"
+    assert d.cleaned_text == "加个功能"
+
+
+async def test_keyword_path_respects_chat_mode(tmp_path: Path):
+    """关键词兜底也遵循 default_mode：chat 模式下命中关键词 → CHAT。"""
+    cfg = make_config(tmp_path, default_mode="chat", multi=True)
+    msg = IncomingMessage(text="改一下列表页标题", quote_text="", chatid="c", userid="u")
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.CHAT and d.repo.name == "feed-web"
+
+
+async def test_quote_repo_path_respects_chat_mode(tmp_path: Path):
+    """quote 隐式 repo 路径也遵循 default_mode：chat 模式 → CHAT。"""
+    cfg = make_config(tmp_path, default_mode="chat", multi=True)
+    msg = IncomingMessage(
+        text="补充一下",
+        quote_text="[session: dead @feed-web sid: abcd1234-aaaa-bbbb-cccc-ddddeeeeffff]",
+        chatid="c",
+        userid="u",
+    )
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.CHAT and d.repo.name == "feed-web"
+    assert d.cleaned_text == "补充一下"

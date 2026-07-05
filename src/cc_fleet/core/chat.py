@@ -4,9 +4,13 @@
 轻量路径，把 Claude 当成通过微信透出来的多轮对话窗口。cc-fleet 只做 I/O 管道——每收到
 一条用户输入就用 ``--resume`` 起一次性 claude 子进程跑完这一轮，把完整输出分段回发。
 
+chat 定位为**只读的需求讨论**：以 ``READ_ONLY`` 权限直接在仓库主目录里跑，不建 worktree、
+不改代码——聊清楚需求后，用户引用消息发 ``/dev`` 才转成正式开发（handoff → pipeline，
+那时才建 worktree、进入可写的 plan→dev 流水线）。这样普通用户"先聊几轮"的成本被压到最低，
+也避免闲聊阶段误改仓库。
+
 复用现有基础设施，不重复造轮子：
 
-- 建 worktree：``repo.fetch_default_branch`` + ``create_worktree``（与 Session._do_new 同约定）。
 - 护栏：``runner.guardrail.prepare`` 写 settings.json + ``CC_FLEET_WORKTREE`` 边界。
 - 分段：``util.text.split_for_chat``。
 - session tag：``util.ids.format_session_tag``（用户引用回复即续聊，见 dispatcher 规则 1）。
@@ -29,7 +33,6 @@ from ..config.schema import AgentTool, AppConfig, RepoConfig
 from ..storage.db import Database
 from ..util.ids import format_session_tag, new_internal_slug, new_uuid
 from ..util.text import DEFAULT_CHAT_CHUNK_LIMIT, split_for_chat
-from . import repo as repo_module
 from .runner_factory import get_runner
 from .runners.base import AgentPermission
 from .runners.claude import format_run_failure
@@ -71,15 +74,13 @@ class ChatSession:
         reply: ReplyFunc,
         repo_cfg: RepoConfig | None,
         fallback_cwd: Path | None = None,
-        fetch_lock: Any = None,
     ) -> None:
         self.db = db
         self.config = config
         self.reply = reply
         self._repo_cfg = repo_cfg
-        # 无 @repo 时的回退工作目录（SessionManager 解析好传入）；有 repo 时忽略。
+        # 无 @repo 时的回退工作目录（SessionManager 解析好传入）；有 repo 时用 repo.path。
         self._fallback_cwd = fallback_cwd
-        self._fetch_lock = fetch_lock
         self.runner = get_runner(
             repo_cfg.agent if repo_cfg is not None else AgentTool.CLAUDE, config
         )
@@ -139,58 +140,25 @@ class ChatSession:
     # ---------- 环境准备 ----------
 
     async def ensure_setup_once(self) -> None:
-        """幂等准备工作目录：首次建 worktree（local repo）或解析回退 cwd。
+        """幂等解析只读运行目录：有 @repo 时用仓库主目录，无 repo 时用回退目录。
 
-        已有 ``worktree_path``（首轮已建 / 进程重启后 row 仍在）直接返回，天然抗重启。
-        local repo：复用 ``fetch_default_branch`` + ``create_worktree``（fetch_lock 下串行，
-        规避 .git 竞争），分支 ``chat/<slug>``。无 repo 或 remote repo：不建 worktree，
-        直接在回退目录 / repo 壳子目录运行。建 worktree 失败 → 转 FAILED 并抛出，让 loop 退出。
+        chat 是只读讨论，**不建 worktree、不改代码**，直接在仓库主目录（``repo.path``，
+        local 与 remote 同）里以 ``READ_ONLY`` 权限跑，让 claude 能读到当前代码回答问题。
+        转开发（/dev handoff）时才由 pipeline 侧建 worktree、进入可写流水线。
+        已有 ``worktree_path``（首轮已解析 / 进程重启后 row 仍在）直接返回，天然抗重启。
         """
         await self._refresh_row()
         if self.row.get("worktree_path"):
             return
 
-        if self._repo_cfg is not None and self._repo_cfg.mode == "local":
-            worktree_root = self._repo_cfg.path.with_name(
-                self._repo_cfg.path.name + "-worktrees"
-            )
-            worktree_path = worktree_root / self.slug
-            branch = f"chat/{self.slug}"
-            base = f"origin/{self._repo_cfg.default_branch}"
-            already = worktree_path.exists() and (worktree_path / ".git").exists()
-            if not already:
-                try:
-                    if self._fetch_lock is not None:
-                        async with self._fetch_lock:
-                            await repo_module.fetch_default_branch(
-                                self._repo_cfg.path, self._repo_cfg.default_branch
-                            )
-                            await repo_module.create_worktree(
-                                self._repo_cfg.path, worktree_path, branch, base
-                            )
-                    else:
-                        await repo_module.fetch_default_branch(
-                            self._repo_cfg.path, self._repo_cfg.default_branch
-                        )
-                        await repo_module.create_worktree(
-                            self._repo_cfg.path, worktree_path, branch, base
-                        )
-                except repo_module.GitError as e:
-                    await self._set_state(
-                        SessionState.FAILED, last_error=f"创建 chat worktree 失败：{e}"
-                    )
-                    await self._notify(f"❌ 创建 chat worktree 失败：{e}{self._tag()}")
-                    raise
-            await self._update(worktree_path=str(worktree_path), branch=branch)
+        # 有 repo → 仓库主目录（只读，不隔离）；无 repo → 回退目录 / home。
+        if self._repo_cfg is not None:
+            cwd = self._repo_cfg.path
         else:
-            # 无 repo（回退到 default_cwd / home）或 remote repo（用其壳子目录）。
-            if self._repo_cfg is not None:
-                cwd = self._repo_cfg.path
-            else:
-                cwd = self._fallback_cwd or Path.home()
-            cwd = cwd.expanduser()
-            cwd.mkdir(parents=True, exist_ok=True)
-            await self._update(worktree_path=str(cwd), branch=None)
+            cwd = self._fallback_cwd or Path.home()
+        cwd = cwd.expanduser()
+        cwd.mkdir(parents=True, exist_ok=True)
+        await self._update(worktree_path=str(cwd), branch=None)
 
     # ---------- 一轮对话 ----------
 
@@ -222,7 +190,8 @@ class ChatSession:
         result = await self.runner.run(
             prompt=prompt,
             cwd=cwd,
-            permission=AgentPermission.WRITE,
+            # 只读讨论：READ_ONLY 映射到 claude 的 --permission-mode plan，可读文件/搜索但不改代码。
+            permission=AgentPermission.READ_ONLY,
             protocol_text=_chat_protocol_text(),
             session_id=session_id,
             resume_from=resume_from,

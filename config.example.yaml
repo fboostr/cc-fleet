@@ -44,7 +44,16 @@ pipeline:
   review_timeout_sec: 1800    # Reviewer 单次审查（plan/code）超时；仅启用 reviewer 的 repo 用得到
   max_clarify_rounds: 5       # plan ↔ awaiting_user 最多来回轮数
 
-# 工作仓库清单（初次接入建议先只配 1 个）
+# ── 默认交互模式（降低新手门槛）───────────────────────────
+# 无命令、无引用、无 @repo 的普通消息默认怎么处理：
+#   - chat（默认）：先进入 /chat 多轮只读讨论把需求聊清楚，再引用该对话消息发 /dev 转开发；
+#                   更贴合普通用户"先聊几轮再动手"的习惯
+#   - dev：一句话直接进入 plan→dev→MR 交付流水线（老手快捷；等价旧默认行为）
+# 无论此项为何，`@<repo> /dev <需求>` 与「引用一条 /chat 消息 + /dev」都能直达开发。
+default_mode: chat
+
+# 工作仓库清单（初次接入建议先只配 1 个：只配 1 个仓库时，发消息无需 @<repo> 前缀，
+# 直接说话即可自动归属该仓库——最贴合聊天习惯，也最省心）
 # 提 MR/PR 按代码托管平台分流，均无需额外安装 glab / gh 等 CLI：
 #   - GitLab：`git push -o merge_request.create ...`（origin 指向 GitLab 即可）
 #   - GitHub：先普通 push 再走 REST API 建 PR（需在 .env 配 GITHUB_TOKEN / GH_TOKEN）
@@ -106,12 +115,13 @@ repos:
 limits:
   max_concurrent_sessions: 4
 
-# ── /chat 自由对话通道（可选，独立于交付流水线）─────────────
-# `@<repo> /chat <消息>` 开一条与 claude 的多轮对话：在该 repo 的专用 worktree 里可写运行，
-# 引用机器人回复即续聊。省略 @repo 时回退到 default_cwd（不配则用户 home 目录）并给出警告。
-# 整段可省略，全部字段都有默认值。
+# ── /chat 只读讨论通道（独立于交付流水线）───────────────────
+# `/chat <消息>`（或 `@<repo> /chat`）开一条与 claude 的多轮**只读讨论**：直接在仓库主目录
+# 只读运行（读代码 / 理清需求，不建 worktree、不改代码），引用机器人回复即续聊；聊清楚后
+# 引用该对话消息发 /dev 才转成正式开发。单仓库时自动绑定唯一仓库；多仓库省略 @repo 时回退到
+# default_cwd（不配则用户 home）并给出警告。整段可省略，全部字段都有默认值。
 chat:
-  default_cwd: ~/cc-fleet-chat   # 省略 @repo 时的回退工作目录；不配则回退到用户 home
+  default_cwd: ~/cc-fleet-chat   # 多仓库省略 @repo 时的回退工作目录；不配则回退到用户 home
   max_concurrent: 4              # chat 独立并发上限（不占用 limits.max_concurrent_sessions）
   turn_timeout_sec: 3600         # 单轮 claude 子进程超时（秒）
 

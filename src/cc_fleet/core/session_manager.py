@@ -283,17 +283,15 @@ class SessionManager:
             fallback_cwd = (cfg_cwd or Path.home()).expanduser()
             src = "chat.default_cwd 配置" if cfg_cwd else "用户 home 目录"
             note = (
-                f"⚠️ 未指定 @repo，本次 chat 在回退目录 `{fallback_cwd}`（{src}）中运行，"
-                "不创建隔离 worktree。建议改用 `@<repo> /chat …` 绑定仓库以获得隔离。"
+                f"⚠️ 未指定 @repo，本次 chat 在回退目录 `{fallback_cwd}`（{src}）中只读运行，"
+                "读不到具体仓库代码。建议用 `@<repo> /chat …` 绑定仓库，讨论才能基于该仓库代码。"
             )
-        fetch_lock = self._repo_lock(repo_cfg.name) if repo_cfg is not None else None
         chat = ChatSession(
             db=self.db,
             config=self.config,
             reply=self.reply,
             repo_cfg=repo_cfg,
             fallback_cwd=fallback_cwd,
-            fetch_lock=fetch_lock,
         )
         display = await chat.create_row(text=text, chatid=chatid, userid=userid)
         ctx = _ChatCtx(chat)
@@ -334,14 +332,12 @@ class SessionManager:
         fallback_cwd = None
         if repo_cfg is None:
             fallback_cwd = (self.config.chat.default_cwd or Path.home()).expanduser()
-        fetch_lock = self._repo_lock(repo_cfg.name) if repo_cfg is not None else None
         chat = ChatSession(
             db=self.db,
             config=self.config,
             reply=self.reply,
             repo_cfg=repo_cfg,
             fallback_cwd=fallback_cwd,
-            fetch_lock=fetch_lock,
         )
         await chat.resume(internal)
         # 无条件注入用户消息 + 转 CHATTING（孤儿可能停在任意 open 态）。
@@ -383,7 +379,7 @@ class SessionManager:
                 async with self._chat_slot:
                     if ctx.cancel_requested:
                         break
-                    await ctx.chat.run_turn()  # 首轮内部会 ensure_setup（建 worktree）
+                    await ctx.chat.run_turn()  # 首轮内部会 ensure_setup（解析只读运行目录）
                 state = SessionState(ctx.chat.row["state"])
                 if state != SessionState.CHAT_AWAITING:
                     break  # FAILED / CANCELLED → 退出
