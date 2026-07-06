@@ -944,7 +944,9 @@ async def test_resume_new_with_existing_worktree_is_idempotent(
     且保留已分配的 claude_session_id。回归保护:无条件 new_uuid 会丢 SDK 会话。"""
     _patch_claude_smart(monkeypatch)
 
-    wt = tmp_path / "ws" / "sessions" / "req-resume-new" / "worktree"
+    # worktree 路径必须与 _do_new 的推导一致（<repo.path>-worktrees/<slug>），
+    # 否则 already_exists 判 False，会误走 fetch+create 且 row 指向不存在的目录。
+    wt = cfg.repos[0].path.with_name(cfg.repos[0].path.name + "-worktrees") / "req-resume-new"
     wt.mkdir(parents=True)
     (wt / ".git").write_text("gitdir: /irrelevant\n")
 
