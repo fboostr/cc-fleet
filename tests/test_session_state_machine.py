@@ -114,6 +114,26 @@ def make_claude_stub(scripted: list[str]) -> Callable:
     return stub
 
 
+def make_recording_stub(scripted: list[str]) -> tuple[Callable, list[dict]]:
+    """同 make_claude_stub，但把每次调用的 kwargs 记进 calls，便于断言注入的 prompt。"""
+    calls: list[dict] = []
+
+    async def stub(**kwargs) -> ClaudeRunResult:
+        i = len(calls)
+        calls.append(kwargs)
+        text = scripted[min(i, len(scripted) - 1)]
+        return ClaudeRunResult(
+            exit_code=0,
+            session_id=kwargs.get("resume_from") or kwargs["session_id"],
+            text_output=text,
+            stream_log_path=kwargs["stream_log_path"],
+            stderr_tail="",
+            timed_out=False,
+        )
+
+    return stub, calls
+
+
 # ---- happy path ----
 
 async def test_happy_path_to_completed(db, cfg, repo_cfg, reply, replies):
@@ -220,6 +240,7 @@ async def test_clarification_then_ready(db, cfg, repo_cfg, reply, replies):
     row = await db.get_session(session.slug)
     assert row["state"] == SessionState.AWAITING_USER_CLARIFICATION.value
     assert row["clarify_rounds"] == 1
+    assert row["clarify_phase"] == "planning"
     assert any("OAuth" in t for _, t in replies)
     # 澄清回执同时含问题清单与 plan.md 路径
     assert any("OAuth" in t and "plan 全文" in t and "plan.md" in t for _, t in replies)
@@ -265,6 +286,101 @@ async def test_clarification_max_rounds_exceeded(db, cfg, repo_cfg, reply, repli
     row = await db.get_session(s.slug)
     assert row["state"] == SessionState.FAILED.value
     assert "澄清轮数" in (row["last_error"] or "")
+
+
+# ---- dev 阶段澄清回路（NEED_CLARIFICATION → awaiting → resume developing）----
+
+async def test_dev_clarification_then_ready(db, cfg, repo_cfg, reply, replies):
+    stub, calls = make_recording_stub([
+        "plan ok\n\nSLUG: add-x\nSTATUS: READY\n",
+        # dev 首轮：需要用户拍板，不 commit
+        "我需要你决定。\n\nSTATUS: NEED_CLARIFICATION\nQUESTIONS:\n1. A 还是 B？\n",
+        # 用户答复后 dev 二轮：完成
+        "已按你的选择完成开发并 commit。\n",
+    ])
+    s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s.start(initial_request="做个 x", chatid="c1", userid="u1")
+
+    row = await db.get_session(s.slug)
+    assert row["state"] == SessionState.AWAITING_USER_CLARIFICATION.value
+    assert row["clarify_rounds"] == 1
+    assert row["clarify_phase"] == "developing"
+    # dev 澄清回执含问题清单，但不含 plan 阶段专有的「plan 全文」行
+    assert any("1. A 还是 B？" in t for _, t in replies)
+    assert not any("A 还是 B" in t and "plan 全文" in t for _, t in replies)
+
+    # 用户引用回复 → resume 回 developing，答复注入 dev prompt
+    s2 = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s2.resume(s.slug)
+    await s2.handle_user_clarification("选 A", quote_text="[session: add-x]")
+
+    row = await db.get_session(s.slug)
+    assert row["state"] == SessionState.COMPLETED.value
+    # 第 3 次 claude 调用（dev 二轮）的 prompt 注入了用户答复 + 澄清回路措辞
+    assert "选 A" in calls[2]["prompt"]
+    assert "待确认问题" in calls[2]["prompt"]
+
+
+async def test_dev_clarification_priority_over_commit(db, cfg, repo_cfg, reply, replies):
+    """dev 输出既（默认 has_commits_ahead=True）有 commit 又 NEED_CLARIFICATION → 澄清优先，挂 awaiting。"""
+    stub = make_claude_stub([
+        "plan ok\n\nSLUG: add-y\nSTATUS: READY\n",
+        "我改了几行但拿不准方向。\n\nSTATUS: NEED_CLARIFICATION\nQUESTIONS:\n1. A 还是 B？\n",
+    ])
+    s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s.start(initial_request="做个 y", chatid="c1", userid="u1")
+
+    row = await db.get_session(s.slug)
+    assert row["state"] == SessionState.AWAITING_USER_CLARIFICATION.value
+    assert row["clarify_phase"] == "developing"
+
+
+async def test_dev_clarification_max_rounds_exceeded(db, cfg, repo_cfg, reply, replies):
+    # max_clarify_rounds=2：plan READY 进 dev；dev 连续 NEED_CLARIFICATION，第 3 次 dev 触发超限 → FAILED
+    stub = make_claude_stub([
+        "plan ok\n\nSLUG: add-z\nSTATUS: READY\n",
+        "STATUS: NEED_CLARIFICATION\nQUESTIONS:\n1. A\n",
+        "STATUS: NEED_CLARIFICATION\nQUESTIONS:\n1. B\n",
+        "STATUS: NEED_CLARIFICATION\nQUESTIONS:\n1. C\n",
+    ])
+    s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s.start(initial_request="模糊 dev", chatid="c1", userid="u1")
+    await s.resume(s.slug)
+    await s.handle_user_clarification("答 1")
+    await s.resume(s.slug)
+    await s.handle_user_clarification("答 2")
+
+    row = await db.get_session(s.slug)
+    assert row["state"] == SessionState.FAILED.value
+    assert "澄清轮数" in (row["last_error"] or "")
+    assert row["failed_phase"] == SessionState.DEVELOPING.value
+
+
+async def test_dev_clarification_remote(db, cfg, tmp_path, reply, replies):
+    repo_cfg = _make_remote_repo_cfg(tmp_path)
+    stub = make_claude_stub([
+        "plan ready\n\nSLUG: add-remote-x\nSTATUS: READY\n",
+        # remote dev 首轮：需要用户决策
+        "远端拿不准。\n\nSTATUS: NEED_CLARIFICATION\nQUESTIONS:\n1. A 还是 B？\n",
+        # 答复后 dev 二轮：完成开发（有 commit）
+        "已在远端完成开发并 commit。\n",
+        # publish 阶段：push + MR
+        "完成报告：push 完成。\n\nMR_URL: https://gitlab.example/g/r/-/merge_requests/77\n",
+    ])
+    s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s.start(initial_request="远端做个 x", chatid="c1", userid="u1")
+
+    row = await db.get_session(s.slug)
+    assert row["state"] == SessionState.AWAITING_USER_CLARIFICATION.value
+    assert row["clarify_phase"] == "developing"
+
+    s2 = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s2.resume(s.slug)
+    await s2.handle_user_clarification("选 A", quote_text="[session: add-remote-x]")
+
+    row = await db.get_session(s.slug)
+    assert row["state"] == SessionState.COMPLETED.value
+    assert row["mr_url"].endswith("/merge_requests/77")
 
 
 # ---- plan 阶段没按协议输出 ----

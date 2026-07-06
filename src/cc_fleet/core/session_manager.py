@@ -173,9 +173,15 @@ class SessionManager:
             ok = await ctx.session.apply_clarification(text, quote_text=quote_text)
             if not ok:
                 return False
+            # apply_clarification 返回后 row.state 已是 resume 目标（dev 澄清→DEVELOPING、plan 澄清→PLANNING）
+            phase_word = (
+                "开发"
+                if SessionState(ctx.session.row["state"]) == SessionState.DEVELOPING
+                else "plan"
+            )
             await self._notify_continue_ack(
                 row=ctx.session.row,
-                text=f"已收到补充信息，claude 继续推进 plan [{display}]。",
+                text=f"已收到补充信息，claude 继续推进{phase_word} [{display}]。",
             )
             ctx.resume_event.set()
             return True

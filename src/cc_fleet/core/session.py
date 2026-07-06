@@ -158,6 +158,10 @@ class Session:
         # 仅内存，一次性消费；主控崩溃恢复后重置为 False（最多多花一次审查成本，行为安全）。
         self._skip_next_plan_review: bool = False
         self._skip_next_code_review: bool = False
+        # dev 阶段澄清回路：apply_clarification 唤醒 dev-awaiting（clarify_phase=developing）时置 True，
+        # 供 _do_developing 顶部把注入 prompt 的措辞从「追加反馈」调成「回答上一轮的待确认问题」。
+        # 仅内存、一次性消费：同一 Session 对象在 awaiting park 期间存活，跨进程重启本就无法唤醒 awaiting。
+        self._resuming_dev_clarification: bool = False
 
     # ---------- 公开入口 ----------
 
@@ -233,10 +237,14 @@ class Session:
         await self._refresh_row()
 
     async def apply_clarification(self, text: str, quote_text: str | None = None) -> bool:
-        """同步部分：入 in 消息、设 pending、状态转 PLANNING。返回 True 表示已就绪可 drive。
+        """同步部分：入 in 消息、设 pending、按 clarify_phase 转回工作态。返回 True 表示已就绪可 drive。
 
         SessionManager 在 dispatch 路径里调本方法（拿 db 行的最新 state，
         防止 awaiting 假设过期），然后通过 resume_event 唤醒后台 task 继续 drive。
+
+        resume 目标按进入 awaiting 时写下的 ``clarify_phase`` 决定：'developing' → DEVELOPING
+        （dev 阶段澄清，复用 dev 的 pending_user_message 注入），其余（'planning' / 老 row 的
+        NULL）→ PLANNING，向后兼容。
         """
         await self._refresh_row()
         if self.row.get("state") != SessionState.AWAITING_USER_CLARIFICATION.value:
@@ -244,7 +252,11 @@ class Session:
             return False
         await self.db.add_message(self.slug, "in", text, quote_text=quote_text)
         self.pending_user_message = text
-        await self._set_state(SessionState.PLANNING)
+        if self.row.get("clarify_phase") == SessionState.DEVELOPING.value:
+            self._resuming_dev_clarification = True
+            await self._set_state(SessionState.DEVELOPING)
+        else:
+            await self._set_state(SessionState.PLANNING)
         return True
 
     async def handle_user_clarification(self, text: str, quote_text: str | None = None) -> None:
@@ -463,7 +475,10 @@ class Session:
                 )
                 return
             await self._update(clarify_rounds=self.row["clarify_rounds"] + 1)
-            await self._set_state(SessionState.AWAITING_USER_CLARIFICATION)
+            await self._set_state(
+                SessionState.AWAITING_USER_CLARIFICATION,
+                clarify_phase=SessionState.PLANNING.value,
+            )
             await self._notify_clarification(protocol.questions, plan_path)
 
     async def _do_developing(self) -> None:
@@ -474,6 +489,9 @@ class Session:
 
         followup = self.pending_user_message
         self.pending_user_message = None
+        # dev 澄清回路标志一次性消费（无论下面走哪个分支都复位，避免泄漏到后续 dev 轮）
+        resuming_dev_clarification = self._resuming_dev_clarification
+        self._resuming_dev_clarification = False
         if self._pending_revision_feedback is not None:
             # 从 CODE_REVIEWING 回来：把 Reviewer 代码审查意见作为修订指令注入。
             # approved 由配对标志 _pending_revision_was_approved 决定 prompt 语气；同时消费并清零。
@@ -483,6 +501,13 @@ class Session:
             )
             self._pending_revision_feedback = None
             self._pending_revision_was_approved = False
+        elif followup and resuming_dev_clarification:
+            # dev 澄清回路：上一轮 dev 输出 NEED_CLARIFICATION 挂起等用户，这里注入用户答复继续开发
+            prompt = (
+                f"针对你上一轮提出的待确认问题，用户答复如下：\n{followup}\n\n"
+                "请据此继续开发；其它规则见已注入的 system prompt。\n"
+                "若仍需用户决策，按 dev 协议输出 STATUS: NEED_CLARIFICATION + QUESTIONS。"
+            )
         elif followup:
             # 引用回复唤醒（failed/timeout/completed → DEVELOPING）时把用户消息注入 prompt
             prompt = (
@@ -516,6 +541,25 @@ class Session:
             return
         if result.exit_code not in (0, None) or result.result_is_error:
             await self._fail(format_run_failure(result, "dev"))
+            return
+
+        # commit 闸门之前先看 claude 是否请求用户决策（dev 澄清协议，与 plan 阶段同 STATUS/QUESTIONS
+        # 语法、复用 parse_plan_output）。命中则挂 awaiting 等用户回复，而非因「无新 commit」误判失败。
+        # 放在 local/remote 分叉之前 → 两模式共用；正常 dev 输出无 STATUS 行时 status=None，零干扰；
+        # 即便 claude 既 commit 又提问也以澄清优先（残留 commit 保留在 worktree，答复后 resume 续跑）。
+        clarify = parse_plan_output(result.text_output)
+        if clarify.status == "NEED_CLARIFICATION":
+            if self.row["clarify_rounds"] >= self.config.pipeline.max_clarify_rounds:
+                await self._fail(
+                    f"澄清轮数已超过上限 {self.config.pipeline.max_clarify_rounds}"
+                )
+                return
+            await self._update(clarify_rounds=self.row["clarify_rounds"] + 1)
+            await self._set_state(
+                SessionState.AWAITING_USER_CLARIFICATION,
+                clarify_phase=SessionState.DEVELOPING.value,
+            )
+            await self._notify_clarification(clarify.questions)
             return
 
         # dev 阶段两种模式都只到 commit 为止（remote defer-push 后也不再在 dev 内 push/建 MR），
@@ -1346,14 +1390,18 @@ class Session:
         self._session_log().write_note(text)
         await self.reply(chatid, text)
 
-    async def _notify_clarification(self, questions: list[str], plan_path: Path) -> None:
+    async def _notify_clarification(
+        self, questions: list[str], plan_path: Path | None = None
+    ) -> None:
         bullets = (
             "\n".join(f"{i}. {q}" for i, q in enumerate(questions, 1))
             or "1. （未给出具体问题，请重新描述需求）"
         )
+        # plan 阶段附 plan 全文路径；dev 阶段（plan_path=None）无此语义，省略该行。
+        plan_line = f"plan 全文：{plan_path}\n\n" if plan_path is not None else ""
         text = (
             f"需要进一步确认：\n{bullets}\n\n"
-            f"plan 全文：{plan_path}\n\n"
+            f"{plan_line}"
             f"请**引用本消息**回复以补充信息。{self._tag()}"
         )
         await self._notify(text)

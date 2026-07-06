@@ -104,4 +104,10 @@ MIGRATIONS: list[str] = [
     CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_origin_chat
         ON sessions(origin_chat_slug) WHERE origin_chat_slug IS NOT NULL;
     """,
+    # 澄清来源阶段：进入 awaiting_user_clarification 时写 'planning' / 'developing'，供
+    # apply_clarification 决定唤醒后 resume 回哪个工作态（plan 澄清回 PLANNING、dev 澄清回
+    # DEVELOPING）。老 row / 未写该列（NULL）一律按 'planning' 处理，行为与改动前完全一致。
+    """
+    ALTER TABLE sessions ADD COLUMN clarify_phase TEXT;
+    """,
 ]

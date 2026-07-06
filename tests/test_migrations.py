@@ -53,6 +53,7 @@ async def test_sessions_has_all_altered_columns(tmp_path: Path):
             "review_override",
             "session_kind",
             "origin_chat_slug",
+            "clarify_phase",
         ):
             assert c in cols, f"sessions 缺列 {c}"
     finally:

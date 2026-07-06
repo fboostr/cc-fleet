@@ -188,6 +188,42 @@ def _patch_claude_clarification(
     monkeypatch.setattr(session_mod, "get_runner", lambda *a, **k: FakeRunner(stub))
 
 
+def _patch_claude_dev_clarification(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    slug: str = "add-login",
+    question: str = "A 还是 B？",
+) -> None:
+    """plan 直接 READY；dev 首轮 NEED_CLARIFICATION、之后 READY 完成。
+
+    以 claude_session_id 维度标记 dev 首轮，多 session 并发不串台。
+    """
+    from cc_fleet.core import session as session_mod
+
+    seen_dev: set[str] = set()
+
+    async def stub(**kwargs) -> ClaudeRunResult:
+        mode = perm_mode(kwargs)
+        sid = kwargs.get("resume_from") or kwargs["session_id"]
+        if mode == "plan":
+            text = f"SLUG: {slug}\nSTATUS: READY"
+        elif sid not in seen_dev:
+            seen_dev.add(sid)
+            text = f"STATUS: NEED_CLARIFICATION\nQUESTIONS:\n1. {question}"
+        else:
+            text = "完成 ✅"
+        return ClaudeRunResult(
+            exit_code=0,
+            session_id=sid,
+            text_output=text,
+            stream_log_path=kwargs["stream_log_path"],
+            stderr_tail="",
+            timed_out=False,
+        )
+
+    monkeypatch.setattr(session_mod, "get_runner", lambda *a, **k: FakeRunner(stub))
+
+
 # ---------- happy path：两个 session 并发跑到 COMPLETED ----------
 
 async def test_two_sessions_run_in_parallel(db, cfg, reply, monkeypatch):
@@ -355,6 +391,49 @@ async def test_continue_session_awaiting_acks_user(db, cfg, reply, replies, monk
         "已收到补充信息" in t and "add-login" in t and "[session: add-login" in t
         for t in ack_texts
     ), f"未在 ack 中找到澄清文案：{ack_texts}"
+
+    await _wait_idle(mgr)
+    await mgr.shutdown()
+
+
+# ---------- continue_session：dev 阶段 awaiting 唤醒回 developing ----------
+
+async def test_continue_session_resumes_dev_awaiting(db, cfg, reply, replies, monkeypatch):
+    """dev 阶段 NEED_CLARIFICATION → awaiting → continue_session 唤醒回 developing → COMPLETED，
+    且全程复用同一 ctx（不重新排队）。"""
+    _patch_claude_dev_clarification(monkeypatch, slug="add-login")
+    mgr = SessionManager(db, cfg, reply)
+    slug, _ = await mgr.new_session(
+        repo_cfg=cfg.repos[0], text="加登录", chatid="c1", userid="u1"
+    )
+    await _wait_state(db, slug, SessionState.AWAITING_USER_CLARIFICATION)
+    row = await db.get_session(slug)
+    assert row["clarify_phase"] == "developing"
+    assert slug in mgr._sessions  # awaiting 占着 ctx，未重新排队
+
+    ok = await mgr.continue_session(slug="add-login", text="选 A", quote_text=None)
+    assert ok is True
+
+    await _wait_idle(mgr)
+    await mgr.shutdown()
+    row = await db.get_session(slug)
+    assert row["state"] == SessionState.COMPLETED.value
+
+
+async def test_continue_session_dev_awaiting_ack_says_kaifa(db, cfg, reply, replies, monkeypatch):
+    """dev 澄清唤醒的 ack 文案应说「继续推进开发」而非「plan」。"""
+    _patch_claude_dev_clarification(monkeypatch, slug="add-login")
+    mgr = SessionManager(db, cfg, reply)
+    slug, _ = await mgr.new_session(
+        repo_cfg=cfg.repos[0], text="加登录", chatid="c1", userid="u1"
+    )
+    await _wait_state(db, slug, SessionState.AWAITING_USER_CLARIFICATION)
+
+    before = len(replies)
+    ok = await mgr.continue_session(slug="add-login", text="选 A", quote_text=None)
+    assert ok is True
+    ack_texts = [t for c, t in replies[before:] if c == "c1"]
+    assert any("已收到补充信息" in t and "继续推进开发" in t for t in ack_texts), ack_texts
 
     await _wait_idle(mgr)
     await mgr.shutdown()
