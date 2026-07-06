@@ -648,8 +648,10 @@ async def test_list_renders_last_active_time_to_seconds(db: Database):
     import re
 
     await _insert(db, slug="tmp-active", state=SessionState.DEVELOPING, display="active-feat")
-    # 用一个明确的 UTC 时刻覆盖 updated_at，预期输出落到本地时区的对应字符串
-    fixed = datetime(2026, 5, 19, 10, 30, 45, tzinfo=timezone.utc)
+    # 用一个明确的 UTC 时刻覆盖 updated_at，预期输出落到本地时区的对应字符串。
+    # 必须锚定「现在」的相对时间（落在最近 7 天活跃窗口内），否则会被 render_list
+    # 的 _is_recent 过滤剔除；写死绝对日期会随时间流逝变成时间炸弹。
+    fixed = datetime.now(timezone.utc) - timedelta(days=1)
     await _set_updated_at(db, "tmp-active", fixed)
 
     text = await render_list(db, _MAX_ROUNDS)
