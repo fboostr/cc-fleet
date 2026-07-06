@@ -16,9 +16,25 @@ cc-fleet turns your team chat (WeChat Work and personal WeChat) into an **intake
 
 ## What it is NOT
 
-cc-fleet is **not just another "bridge Claude Code into IM" tool.** If all you want is to drive Claude Code remotely from chat, [cc-connect](https://github.com/chenhg5/cc-connect) / [cc-im](https://github.com/congqiu/cc-im) / [cc2im](https://github.com/roxorlt/cc2im) / GitHub Copilot CLI's `/fleet` are lighter choices — they hand you a remote terminal.
+cc-fleet is **not just another "bridge Claude Code into IM" tool.** [cc-connect](https://github.com/chenhg5/cc-connect) / [cc-im](https://github.com/congqiu/cc-im) / [cc2im](https://github.com/roxorlt/cc2im) / GitHub Copilot CLI's `/fleet` are all **generic remote-control bridges**: they turn IM into a remote terminal — you type, the agent runs, and the ceiling is your commands plus the agent itself. They compete on **breadth**: more platforms, more agents, voice / media / cron.
 
-cc-fleet takes a narrower path: **request → plan / clarify → isolated worktree → automatic MR**. It automates the *whole delivery chain* and puts hard quality constraints on every MR it opens. You give it a *requirement*; it gives you a *reviewable MR*.
+cc-fleet is not a bridge — it's an **opinionated delivery pipeline**: **request → plan / clarify → isolated worktree → automatic MR with hard quality constraints → resumable state machine**. It competes on **depth**: it hard-codes "one requirement to one review-ready MR" into a state machine and puts constraints at every step. This isn't "which is better" — they're different species.
+
+Here's what actually sets them apart — none of those bridges do any of it:
+
+| Capability | cc-im | cc-connect | cc2im | **cc-fleet** |
+|---|:-:|:-:|:-:|:-:|
+| Proactive plan / ask-back clarification | ❌ | ❌ | ❌ | ✅ built into the state machine |
+| Hard `git worktree` isolation | ❌ | ❌ (Unix-user via `run_as_user`) | ❌ | ✅ one tree + branch per session |
+| Auto-open MR/PR | ❌ | ❌ | ❌ | ✅ GitLab / GitHub |
+| Hard MR quality constraints (verb-object title / 6-section template) | ❌ | ❌ | ❌ | ✅ |
+| Delivery state machine + wake-on-reply after failure | ❌ | session resume only | `--continue` only | ✅ end-to-end |
+| Independent Reviewer agent | ❌ | ❌ | ❌ | ✅ optional |
+| Remote dev box (local shell dir + ssh) | ❌ | ❌ | ❌ | ✅ |
+
+> Compiled from each project's own README; may drift as they evolve — check the upstream READMEs.
+
+The flip side: cc-fleet trades **breadth for depth**, and the trade-offs are real. **Chat platforms are WeChat Work + personal WeChat only** (cc-connect covers 13, cc-im covers 3); **it only drives Claude Code** (the runner is pluggable, Codex / opencode pending; cc-connect speaks ACP and drives 10+); and there's no voice / media / cron / multi-provider switching that the bridges ship. **If you want broad-coverage remote control, cc-connect and friends are the better pick; if you want to "send one requirement and get back a reviewable MR," that's cc-fleet.**
 
 ## 30-second overview
 
