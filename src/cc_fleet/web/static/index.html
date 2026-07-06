@@ -48,11 +48,19 @@
     .b-completed { background: #1c3a28; color: var(--ok); }
     .b-failed, .b-timeout { background: #3a1c1c; color: var(--err); }
     .b-cancelled { background: #2a3240; color: var(--fg-dim); }
+    .b-chatting { background: #17303a; color: #4fd0e0; }
+    .b-chat_awaiting { background: #3a2f1c; color: var(--warn); }
     .empty { padding: 20px 12px; color: var(--fg-dim); text-align: center; }
-    .msg { padding: 8px 12px; border-bottom: 1px solid var(--border); white-space: pre-wrap; word-break: break-word; }
+    .msg { padding: 8px 12px; border-bottom: 1px solid var(--border); word-break: break-word; }
+    /* 用户消息(.in)保持纯文本并保留原始换行；机器人消息(.out)走 markdown（.md 自带排版），
+       故 pre-wrap 只加在 .in .body，避免 markdown 块级元素间的换行被 pre-wrap 显示成空白。 */
+    .msg.in .body { white-space: pre-wrap; }
     .msg .dir { font-size: 11px; color: var(--fg-dim); margin-bottom: 4px; }
     .msg.in .dir::before { content: "↘ 用户 "; color: var(--accent); }
     .msg.out .dir::before { content: "↗ 机器人 "; color: var(--ok); }
+    /* markdown 气泡首/尾元素去掉外边距，避免与 .msg 的 padding 叠加出双倍留白 */
+    .msg.out .md > :first-child { margin-top: 0; }
+    .msg.out .md > :last-child { margin-bottom: 0; }
     /* === Terminal Events View === */
     .terminal {
       padding: 0;
@@ -335,6 +343,7 @@
             <label class="filter"><input type="checkbox" id="filter-awaiting" checked /> 等待回复</label>
             <label class="filter" title="已结案但仍可被引用回复唤醒：completed / failed / timeout"><input type="checkbox" id="filter-resumable" checked /> 已结案（可继续）</label>
             <label class="filter" title="用户取消，不可恢复"><input type="checkbox" id="filter-closed" /> 已关闭</label>
+            <label class="filter" title="/chat 只读对话（默认隐藏，勾选显示）"><input type="checkbox" id="filter-chat" /> 对话</label>
           </div>
         </div>
         <div class="tz" id="tz-hint"></div>
@@ -394,24 +403,26 @@ const POLL_MS = 3000;
 // 旧版 v1 的 terminal 字段把 completed/failed/timeout/cancelled 混作一组、默认隐藏。
 // state.py 把 RESUMABLE_TERMINAL（completed/failed/timeout）从"已结案"里独立出来后，
 // 这里把 group 拆为 resumable + closed 两组：resumable 默认勾选，closed 默认隐藏。
-// LS_KEY 升 v2；浏览器残留的 v1 直接忽略走默认值，无迁移逻辑。
-const LS_KEY = 'cc-fleet.filters.v2';
+// LS_KEY 升 v3（v2→v3 增加 chat 组，/chat 对话默认隐藏）；浏览器残留的旧值直接忽略走默认值，无迁移逻辑。
+const LS_KEY = 'cc-fleet.filters.v3';
 
 // 状态分组与 src/cc_fleet/core/state.py 一一对齐：
 //   working           ↔ WORKING_STATES
 //   awaiting          ↔ {AWAITING_USER_CLARIFICATION}
 //   resumable         ↔ RESUMABLE_TERMINAL_STATES（已结案但引用回复仍可唤醒）
 //   closed            ↔ {CANCELLED}（用户取消，不可恢复）
+//   chat              ↔ CHAT_STATES（/chat 只读对话，默认隐藏）
 const STATE_GROUPS = {
   working: new Set(['new', 'planning', 'developing', 'mr_submitting']),
   awaiting: new Set(['awaiting_user_clarification']),
   resumable: new Set(['completed', 'failed', 'timeout']),
   closed: new Set(['cancelled']),
+  chat: new Set(['chatting', 'chat_awaiting']),
 };
 
 const DEFAULT_FILTERS = {
   rangeDays: 7,         // 0 表示不限
-  groups: { working: true, awaiting: true, resumable: true, closed: false },
+  groups: { working: true, awaiting: true, resumable: true, closed: false, chat: false },
   claudeOnly: true,
 };
 
@@ -428,6 +439,7 @@ function loadFilters() {
         awaiting: !!g.awaiting,
         resumable: !!g.resumable,
         closed: !!g.closed,
+        chat: !!g.chat,
       },
       claudeOnly: parsed.claudeOnly !== false,
     };
@@ -534,7 +546,7 @@ function applySessionFilters(list) {
   }
   // 状态分组：勾选了的组的并集；全勾或全不勾视为不筛。
   const groups = state.groups;
-  const keys = ['working', 'awaiting', 'resumable', 'closed'];
+  const keys = ['working', 'awaiting', 'resumable', 'closed', 'chat'];
   const allOn = keys.every((k) => groups[k]);
   const allOff = keys.every((k) => !groups[k]);
   if (!allOn && !allOff) {
@@ -587,6 +599,43 @@ function renderSessions(list) {
   });
 }
 
+// 按用户可见 display_slug 或内部 slug 命中 state.sessions 里的行。
+function findSessionRow(slug) {
+  return state.sessions.find(
+    (s) => (s.display_slug || s.slug) === slug || s.slug === slug
+  ) || null;
+}
+
+// 渲染 Messages 栏头部：当前 slug + chat↔dev 交叉链接。数据现成（sessions 行含
+// session_kind / origin_chat_slug），纯前端用 state.sessions 解析，不需额外接口。
+function renderMessagesMeta(slug) {
+  const row = findSessionRow(slug);
+  let link = '';
+  if (row && row.session_kind === 'chat') {
+    // 该 chat 若已 /dev 转开发：反查 origin_chat_slug 指向本 chat 内部 slug 的 pipeline 行。
+    const dev = state.sessions.find((s) => s.origin_chat_slug === row.slug);
+    if (dev) {
+      const d = dev.display_slug || dev.slug;
+      link = ` · 已转为开发任务 <a href="#" data-jump="${escapeHtml(d)}">${escapeHtml(d)}</a>`;
+    }
+  } else if (row && row.origin_chat_slug) {
+    // 该 pipeline 由某个 chat 转入：链回来源 chat。
+    const chat = state.sessions.find((s) => s.slug === row.origin_chat_slug);
+    if (chat) {
+      const c = chat.display_slug || chat.slug;
+      link = ` · 源自对话 <a href="#" data-jump="${escapeHtml(c)}">${escapeHtml(c)}</a>`;
+    }
+  }
+  messagesMeta.innerHTML = escapeHtml(slug) + link;
+  const a = messagesMeta.querySelector('a[data-jump]');
+  if (a) {
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      selectSession(a.dataset.jump);
+    });
+  }
+}
+
 function selectSession(slug) {
   state.selected = slug;
   // 切 session 时清空展开记忆与原文/全文缓存，避免不同 session 之间 event id 串味。
@@ -600,9 +649,11 @@ function selectSession(slug) {
   sessionsBody.querySelectorAll('.session-item').forEach((el) => {
     el.classList.toggle('active', el.dataset.slug === slug);
   });
-  messagesMeta.textContent = slug;
+  renderMessagesMeta(slug);
   eventsMeta.textContent = slug;
-  $('#btn-plan').disabled = false;
+  // chat 会话没有 plan.md / 审查文件，Plan 按钮对其禁用（否则点了只弹 404）。
+  const row = findSessionRow(slug);
+  $('#btn-plan').disabled = !!(row && row.session_kind === 'chat');
   loadDetail();
 }
 
@@ -625,14 +676,43 @@ async function loadDetail() {
   }
 }
 
+// 把连续同 direction 的消息合并成一个气泡：一轮 AI 回复被 _forward_output 按 ~4000 字
+// 切成多条独立 out 行（split_for_chat 在 \n\n / \n 边界切并 rstrip、跳过下段开头空白），
+// 逐条渲染 markdown 会在段边界把代码块/表格切断。合并后用 '\n\n' 拼回——对齐 split_for_chat
+// 主流的段落边界切分，尽量还原原文。ts 取组内首条（起始时刻），任一条带引用即标记。
+function mergeMessages(list) {
+  const groups = [];
+  for (const m of list) {
+    const prev = groups[groups.length - 1];
+    if (prev && prev.direction === m.direction) {
+      prev.parts.push(m.text || '');
+      prev.quoted = prev.quoted || !!m.quote_text;
+    } else {
+      groups.push({
+        direction: m.direction,
+        ts: m.ts,
+        quoted: !!m.quote_text,
+        parts: [m.text || ''],
+      });
+    }
+  }
+  return groups.map((g) => ({ ...g, text: g.parts.join('\n\n') }));
+}
+
 function renderMessages(list) {
   if (list.length === 0) { messagesBody.innerHTML = '<div class="empty">暂无消息</div>'; return; }
-  messagesBody.innerHTML = list.map((m) => `
-    <div class="msg ${m.direction}">
-      <div class="dir">${fmtTs(m.ts)}${m.quote_text ? '（含引用）' : ''}</div>
-      <div>${escapeHtml(m.text || '')}</div>
-    </div>
-  `).join('');
+  // out（机器人）走 markdown，in（用户）保持纯文本；两者的换行由 CSS（.msg.in .body 的
+  // pre-wrap / .md 自带排版）分别处理。
+  messagesBody.innerHTML = mergeMessages(list).map((g) => {
+    const bodyHtml = g.direction === 'out'
+      ? `<div class="body md">${renderMarkdown(g.text)}</div>`
+      : `<div class="body">${escapeHtml(g.text)}</div>`;
+    return `
+    <div class="msg ${g.direction}">
+      <div class="dir">${fmtTs(g.ts)}${g.quoted ? '（含引用）' : ''}</div>
+      ${bodyHtml}
+    </div>`;
+  }).join('');
   messagesBody.scrollTop = messagesBody.scrollHeight;
 }
 
@@ -1143,6 +1223,7 @@ const groupBindings = [
   ['#filter-awaiting', 'awaiting'],
   ['#filter-resumable', 'resumable'],
   ['#filter-closed', 'closed'],
+  ['#filter-chat', 'chat'],
 ];
 for (const [sel, key] of groupBindings) {
   const el = $(sel);
