@@ -249,7 +249,8 @@ cc-fleet --config config.yaml sessions logs <slug> --raw       # 原始 stream.j
 - 默认 `enabled: true`、`bind: 127.0.0.1`、无鉴权 —— **仅本机进程使用**，不要暴露公网
 - 改 `config.yaml` 中 `http.enabled / bind / port` 可禁用或改端口
 - 前端为单文件 `web/static/index.html`，原生 JS，定时 3s 轮询
-- Messages 列「Plan」按钮弹窗顶部 tab 可在 `Plan / Plan 审查 / Code 审查` 之间切换；启用 Reviewer 时三份意见都能直接对照看，未启用或该阶段未产出的 tab 显示"暂无"
+- Messages 列「Plan」按钮弹窗顶部 tab 可在 `Plan / Plan 审查 / Code 审查` 之间切换；启用 Reviewer 时三份意见都能直接对照看，未启用或该阶段未产出的 tab 显示"暂无"（chat 对话会话无 plan/审查，按钮置灰）
+- Messages 列机器人消息按 markdown 渲染（连续分段自动合并）；`/chat` 只读对话会话默认隐藏，勾选筛选器「对话」显示，并与其转出的开发任务互相链接
 
 完整 API 表、SQLite schema、前端筛选语义见 [docs/architecture.md](./docs/architecture.md)。
 

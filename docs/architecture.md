@@ -179,8 +179,13 @@ P1 已把「子进程驱动 + 护栏」工具无关化，但有三处 claude 耦
 | 等待回复 | `awaiting_user_clarification` | ✅ |
 | 已结案（可继续） | `completed / failed / timeout` | ✅ |
 | 已关闭 | `cancelled` | ❌ |
+| 对话 | `chatting / chat_awaiting`（`/chat` 只读对话） | ❌ |
 
-前端 Messages 列头部有「Plan」按钮，点开弹出 modal，顶部 tab 在 `Plan / Plan 审查 / Code 审查` 之间切换，分别拉 `/plan`、`/plan-review`、`/code-review` 渲染 markdown；缺文件 tab 显示"暂无（未启用 Reviewer / 该阶段未产出）"（Esc 或点击遮罩关闭）。渲染器是内嵌的迷你实现（约 130 行 JS），覆盖标题/列表/代码块/行内 code/粗体/斜体/链接/引用/分隔线，保持面板"单文件、纯静态、可离线"特性。
+`/chat` 只读对话会话（`session_kind='chat'`）默认隐藏（低门槛对话量大，避免刷没交付任务），勾选「对话」筛选器才显示。
+
+前端 Messages 列头部有「Plan」按钮，点开弹出 modal，顶部 tab 在 `Plan / Plan 审查 / Code 审查` 之间切换，分别拉 `/plan`、`/plan-review`、`/code-review` 渲染 markdown；缺文件 tab 显示"暂无（未启用 Reviewer / 该阶段未产出）"（Esc 或点击遮罩关闭）。渲染器是内嵌的迷你实现（约 130 行 JS），覆盖标题/列表/代码块/行内 code/粗体/斜体/链接/引用/分隔线，保持面板"单文件、纯静态、可离线"特性。chat 会话无 plan/审查文件，「Plan」按钮对其置灰。
+
+Messages 列的消息渲染：机器人消息（`direction=out`）走 markdown（复用上面的迷你渲染器），用户消息（`in`）保持纯文本；连续同向消息合并成一个气泡——一轮 AI 回复被 `_forward_output` 按 ~4000 字分段成多条 `out` 时，合并后按 `\n\n` 拼回再渲染，避免代码块/表格在段边界被切断。列头部还用 `session_kind` / `origin_chat_slug` 解析出 chat ↔ 转出开发任务的双向跳转链接。
 
 ## 共用连接
 
