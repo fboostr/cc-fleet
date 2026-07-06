@@ -2,7 +2,7 @@
 
 不走真实 claude / git：用 FakeRunner 注入脚本化输出。覆盖：
 - 首轮 --session-id、次轮 --resume；READ_ONLY 权限（只读讨论）
-- 输出分段回发、仅尾段带 tag；空输出兜底文案；失败 → FAILED（不落 sid）
+- 输出分段回发、每段带 tag；空输出兜底文案；失败 → FAILED（不落 sid）
 - 有 repo 在仓库主目录只读运行（不建 worktree）；无 repo 回退 cwd + 警告
 - apply_user_message 在 CHATTING 时拒绝；cancel 吸收后续状态写入
 - SessionManager：建 chat row、continue 分流续聊、chat 不占 pipeline 槽、cancel
@@ -177,7 +177,7 @@ async def test_no_repo_runs_in_fallback_cwd(db, tmp_path, reply, stub_worktree):
     assert stub_worktree == []  # 无 repo 不建 worktree
 
 
-async def test_forward_splits_and_tags_last_only(db, tmp_path, replies, reply):
+async def test_forward_splits_and_tags_every_chunk(db, tmp_path, replies, reply):
     cfg = _cfg(tmp_path)
     long_text = "\n\n".join("A" + "x" * 3000 for _ in range(3))  # > 4000，分段
     chat = ChatSession(db=db, config=cfg, reply=reply, repo_cfg=cfg.repos[0])
@@ -187,10 +187,9 @@ async def test_forward_splits_and_tags_last_only(db, tmp_path, replies, reply):
     await chat.run_turn()
     outs = [t for (_c, t) in replies]
     assert len(outs) >= 2
-    tagged = [t for t in outs if "[session:" in t]
-    assert len(tagged) == 1  # 只有最后一段带 tag
-    assert "[session:" in outs[-1]
-    assert extract_quote_context(outs[-1]).slug == display
+    # 每一段都带 tag：引用任意段（含首段/中间段）都能反解出同一个 session 续聊
+    assert all("[session:" in t for t in outs)
+    assert all(extract_quote_context(t).slug == display for t in outs)
 
 
 async def test_empty_output_notice(db, tmp_path, replies, reply):

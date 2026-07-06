@@ -44,3 +44,22 @@ def split_for_chat(text: str, limit: int = DEFAULT_CHAT_CHUNK_LIMIT) -> list[str
             pos += 1
     # 极端情况下可能产生空 chunk（如开头就一堆空白），剔除
     return [c for c in chunks if c]
+
+
+def split_for_chat_with_tag(
+    text: str,
+    tag: str,
+    limit: int = DEFAULT_CHAT_CHUNK_LIMIT,
+    extra_reserve: int = 0,
+) -> list[str]:
+    """切分 ``text`` 并给**每一段**追加 ``tag``，供分段回发时每段都可被引用反解。
+
+    切分阈值会预留 ``len(tag) + extra_reserve`` 的空间，保证拼接 tag（以及调用方可能
+    再前置的分页头，用 ``extra_reserve`` 预留）后单段仍不超过 ``limit``——避免只在最后
+    一段带 tag 时"引用前段反解不出 session"，同时不因加 tag 顶破企微单条上限。
+
+    ``tag`` 通常自带前置分隔符（如 ``"\\n\\n[session: ...]"``）；空 ``text`` 会退化为
+    单元素 ``[tag]``，调用方应自行避免对空文本调用（改发兜底文案）。
+    """
+    budget = max(1, limit - len(tag) - extra_reserve)
+    return [chunk + tag for chunk in split_for_chat(text, budget)]

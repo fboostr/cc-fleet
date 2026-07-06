@@ -28,6 +28,7 @@ from cc_fleet.core.commands import (
 from cc_fleet.core.session_manager import SessionManager
 from cc_fleet.core.state import SessionState
 from cc_fleet.storage.db import Database
+from cc_fleet.util.ids import extract_quote_context
 
 
 _MAX_ROUNDS = 5
@@ -494,9 +495,10 @@ async def test_plan_short_single_message(db: Database, cfg: AppConfig):
     _write_plan(cfg.workspace_root, "tmp-short", "# 标题\n\n这是一个短 plan。")
     out = await render_plan(db, cfg.workspace_root, "short-plan")
     assert len(out) == 1
-    # 单条消息不带分页头
+    # 单条消息不带分页头，但仍带 session tag（短 plan 也可引用续聊）
     assert out[0].startswith("# 标题")
     assert "短 plan" in out[0]
+    assert extract_quote_context(out[0]).slug == "short-plan"
 
 
 async def test_plan_lookup_by_internal_slug(db: Database, cfg: AppConfig):
@@ -510,7 +512,7 @@ async def test_plan_lookup_by_internal_slug(db: Database, cfg: AppConfig):
 
 
 async def test_plan_long_is_split(db: Database, cfg: AppConfig):
-    """plan 文件超过 4K 字符时按段落切多条；每条带分页头，每条长度合理。"""
+    """plan 文件超过 4K 字符时按段落切多条；每条带分页头 + session tag，且不溢出上限。"""
     await _insert(db, slug="tmp-long", state=SessionState.PLANNING, display="long-plan")
     # 构造一个超过 _PLAN_CHUNK_LIMIT 的文件，由若干个段落组成
     paragraph = "段落内容 " * 80  # ~640 字符（含空格）
@@ -521,12 +523,14 @@ async def test_plan_long_is_split(db: Database, cfg: AppConfig):
 
     out = await render_plan(db, cfg.workspace_root, "long-plan")
     assert len(out) >= 2, "超长 plan 应该被拆成多条"
-    # 每条都带分页头
     for i, piece in enumerate(out, start=1):
+        # 每条都带分页头
         assert piece.startswith(f"**plan [long-plan] ({i}/{len(out)})**")
-    # 分页头之外的实际内容长度不应超出 limit 太多（容差给分页头）
+        # 每条都带 session tag：引用任意一条（含首/中段）都能反解出 slug 续聊
+        assert extract_quote_context(piece).slug == "long-plan"
+    # 预留了 tag + 分页头长度后，每条（头 + 正文 + tag）都不应溢出单条上限
     for piece in out:
-        assert len(piece) <= _PLAN_CHUNK_LIMIT + 100
+        assert len(piece) <= _PLAN_CHUNK_LIMIT
 
 
 async def test_dispatch_plan_routes_through_dispatch_command(
