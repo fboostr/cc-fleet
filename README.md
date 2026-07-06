@@ -81,9 +81,25 @@ stateDiagram-v2
 
 ## 它不是什么
 
-cc-fleet **不是又一个"把 Claude Code 接到 IM"的桥**。如果你只想在聊天里远程操作 Claude Code，[cc-im](https://github.com/congqiu/cc-im) / [cc-connect](https://github.com/chenhg5/cc-connect) / [cc2im](https://github.com/roxorlt/cc2im) / GitHub Copilot CLI 的 `/fleet` 子命令都是更轻的选择。
+cc-fleet **不是又一个"把 Claude Code 接到 IM"的桥**。[cc-im](https://github.com/congqiu/cc-im) / [cc-connect](https://github.com/chenhg5/cc-connect) / [cc2im](https://github.com/roxorlt/cc2im) / GitHub Copilot CLI 的 `/fleet` 子命令，本质都是**通用遥控桥**：把 IM 变成一个远程终端，你敲什么它做什么，能力边界 = 你的指令 + agent 本身。它们比拼的是**广度**——平台多、agent 多、多媒体 / 语音 / cron 齐全。
 
-cc-fleet 选了一条更窄的路：**对话需求 → plan / 澄清 → worktree 隔离 → 自动 MR** —— 把整条交付链路自动化掉，并对每一份 MR 的质量做硬约束。
+cc-fleet 不是桥，是一条**有观点的交付流水线**：**对话需求 → plan / 澄清 → worktree 隔离 → 自动 MR + 质量硬约束 → 可恢复状态机**。它比拼的是**深度**——把"一句需求到一份合格 MR"整条链路固化成状态机，每个环节都加约束。这不是"谁更好"，是两个物种。
+
+真正拉开差距的几件事，那几个桥一个都没做：
+
+| 能力 | cc-im | cc-connect | cc2im | **cc-fleet** |
+|---|:-:|:-:|:-:|:-:|
+| 主动 plan / 反问澄清 | ❌ | ❌ | ❌ | ✅ 状态机内置 |
+| git worktree 硬隔离 | ❌ | ❌（靠 `run_as_user` Unix 用户级） | ❌ | ✅ 每 session 一棵 + 独立分支 |
+| 自动提 MR/PR | ❌ | ❌ | ❌ | ✅ GitLab / GitHub |
+| MR 质量硬约束（标题动宾化 / 六节描述模板） | ❌ | ❌ | ❌ | ✅ |
+| 交付状态机 + 失败可唤醒续推 | ❌ | 仅 session resume | 仅 `--continue` | ✅ 全程 |
+| 独立 Reviewer agent | ❌ | ❌ | ❌ | ✅ 可选 |
+| remote dev box（本地壳子 + ssh） | ❌ | ❌ | ❌ | ✅ |
+
+> 上表按各竞品自述整理，可能随其迭代变化，以各项目 README 为准。
+
+反过来说，cc-fleet 用**广度换了深度**，短板也很实在：**聊天平台只有企微 + 个人微信**（cc-connect 覆盖 13 家、cc-im 覆盖 3 家）；**agent 只跑 Claude Code**（架构可插拔，Codex / opencode 待接入；cc-connect 走 ACP 支持 10+）；也没有语音 / 多媒体 / cron / 多 provider 切换这些"桥"类富功能。**如果你要的是广覆盖的远程遥控，cc-connect 等是更合适的选择；如果你要的是"发一句需求、收一份能评审的 MR"，那才是 cc-fleet。**
 
 ## 适用范围与现状
 
@@ -306,7 +322,7 @@ repos:
 ## FAQ
 
 **Q：为什么不直接用 cc-im / cc-connect / cc2im？**
-那些项目把 Claude Code 接到 IM、让你远程敲指令，更轻。cc-fleet 走得更远：从需求 → plan → worktree → MR 全链路自动化，并对 MR 质量做硬约束。如果你只需要"在 IM 里跑命令"，cc-im 之类是更合适的选择。
+它们是**通用遥控桥**——把 IM 变成远程终端遥控本地 agent，比拼的是广度（cc-connect 覆盖 13 家聊天平台、经 ACP 支持 10+ agent，还带语音 / cron 等富功能）。cc-fleet 是一条**交付流水线**，比拼深度：从需求 → plan / 澄清 → worktree 隔离 → 自动 MR + 质量硬约束 → 可恢复状态机，把整条链路固化下来。**要广覆盖的远程遥控，选它们；要"发一句需求、收一份能评审的 MR"，选 cc-fleet。** 逐条差异见 [它不是什么](#它不是什么)。
 
 **Q：一定要企微吗？能接 Slack / Lark / Discord？**
 已适配企业微信智能机器人（WebSocket 长连接）与个人微信（ilink ClawBot，HTTP 长轮询，腾讯官方个人号 Bot 协议，`cc-fleet wechat-login` 扫码取 token；单聊 1:1、纯文本、不能发文件给用户）。其它聊天平台接入欢迎 PR：抽象层就在 `bot/` 包，业务侧只依赖 `IncomingMessage` 与 `reply(chatid, text)`，新增平台实现一个 `BotRunner` 子类 + 在 `bot/factory.py` 加分支即可。
