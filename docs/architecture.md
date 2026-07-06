@@ -74,7 +74,7 @@ flowchart TB
 ```
 
 - **`runners/base.py`**：归一接口 —— `AgentRunner`（`run(permission, protocol_text, guardrail, …)`）、`AgentPermission`（READ_ONLY / WRITE，取代 claude 专属的 plan / acceptEdits 字面量）、`AgentRunResult`、`GuardrailProvider` / `GuardrailHandle`。
-- **`runners/engine.py`**：**工具无关**子进程引擎 `run_subprocess`（`start_new_session` 进程组回收、chunk 读 stream 避开 readline 64 KiB 上限、超时 SIGTERM→SIGKILL）+ `StreamInterpreter` 协议（「一条事件如何抽文本 / session_id / 终态错误」逐工具实现）。
+- **`runners/engine.py`**：**工具无关**子进程引擎 `run_subprocess`（`start_new_session` 进程组回收、chunk 读 stream 避开 readline 64 KiB 上限）+ `StreamInterpreter` 协议（「一条事件如何抽文本 / session_id / 终态错误 / **工具生命周期**」逐工具实现）。回收不再按墙钟总时长一刀切，而是每 1s 轮询的**三档空闲监控**（`_overrun`：无工具在飞 `idle_sec` / 有工具在飞 `tool_sec` / 绝对上限 `hard_cap_sec`，见 `TimeoutPolicy`），任一触发或收到 `kill_event`（`/kill` 强杀）即 SIGTERM→SIGKILL 杀进程组。「工具在飞」由 `interpreter.tool_activity` 配对 `tool_use`/`tool_result` 判定，从而不误杀大型编译 / 测试。
 - **`runners/claude.py`**：Claude 实现 —— `ClaudeRunner` / `ClaudeInterpreter` / `ClaudeGuardrailProvider`。
 - **`runner_factory.get_runner(tool, config)`**：按 `RepoConfig.agent` 选 runner。
 - **配置层对称**：每个工具一个配置块（`ClaudeConfig`，未来 `CodexConfig` / `OpencodeConfig`，都至少含 `binary`）；工具无关的阶段超时 / 澄清轮次在 `PipelineConfig`。

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from cc_fleet.core.runners import claude as claude_mod
-from cc_fleet.core.runners.base import AgentPermission, GuardrailHandle
+from cc_fleet.core.runners.base import AgentPermission, GuardrailHandle, TimeoutPolicy
 from cc_fleet.core.runners.claude import (
     ClaudeGuardrailProvider,
     ClaudeInterpreter,
@@ -71,9 +71,10 @@ async def test_run_maps_read_only_protocol_and_guardrail(monkeypatch, tmp_path: 
     captured: dict = {}
 
     async def fake_run_subprocess(
-        *, argv, cwd, stdin_text, env, timeout_sec, stream_log_path, interpreter, on_event=None
+        *, argv, cwd, stdin_text, env, timeout, stream_log_path, interpreter,
+        on_event=None, kill_event=None,
     ):
-        captured.update(argv=argv, env=env, stdin=stdin_text)
+        captured.update(argv=argv, env=env, stdin=stdin_text, timeout=timeout)
         return _engine_result(init_session_id="init-sid")
 
     monkeypatch.setattr(claude_mod, "run_subprocess", fake_run_subprocess)
@@ -88,12 +89,14 @@ async def test_run_maps_read_only_protocol_and_guardrail(monkeypatch, tmp_path: 
         session_id="sid",
         resume_from=None,
         guardrail=gr,
-        timeout_sec=10,
+        timeout=TimeoutPolicy(10, 10, 10),
         stream_log_path=tmp_path / "log",
         extra_env={"EX": "2"},
         on_event=None,
     )
     argv = captured["argv"]
+    # ClaudeRunner 应把 TimeoutPolicy 原样透传给引擎（不再折成标量）。
+    assert captured["timeout"] == TimeoutPolicy(10, 10, 10)
     assert argv[argv.index("--permission-mode") + 1] == "plan"
     assert argv[argv.index("--settings") + 1] == str(tmp_path / "s.json")
     assert argv[argv.index("--append-system-prompt") + 1] == "PROTO"
@@ -125,7 +128,7 @@ async def test_run_maps_write_resume_and_empty_protocol(monkeypatch, tmp_path: P
         session_id="sid",
         resume_from="rsid",
         guardrail=gr,
-        timeout_sec=5,
+        timeout=TimeoutPolicy(5, 5, 5),
         stream_log_path=tmp_path / "l",
         extra_env=None,
         on_event=None,

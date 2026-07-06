@@ -670,6 +670,32 @@ class SessionManager:
         await session.cancel()
         return True
 
+    async def hard_cancel(self, slug: str) -> bool:
+        """聊天端 /kill：**强杀**——先按下 kill_event 让 engine 监控循环立即杀掉正在跑的
+        活进程组（run 返回 ``killed=True``），再复用 ``cancel()`` 落 CANCELLED + 回执。
+
+        与 ``cancel()``（软取消，不打断活进程、等 claude 自己收尾）并存互补。无内存 ctx
+        （孤儿行 / 已无活进程可杀）时退化为等价软取消：没有活进程，强杀无从谈起。
+        参数 slug 同 ``cancel``：先 display 再 internal。"""
+        row = await self.db.get_session_by_display_slug(slug)
+        if row is None:
+            row = await self.db.get_session(slug)
+        if row is None or not is_open(row["state"]):
+            return False
+        internal = row["slug"]
+        # 先按下强杀信号：engine 监控循环下一轮（≤1s）响应，杀活进程组。
+        if row.get("session_kind") == "chat":
+            chat_ctx = self._chats.get(internal)
+            if chat_ctx is not None:
+                chat_ctx.chat.hard_kill()
+        else:
+            ctx = self._sessions.get(internal)
+            if ctx is not None:
+                ctx.session.hard_kill()
+        # 落 CANCELLED + 唤醒后台 task + 回执：复用软取消路径（幂等；已 set 的
+        # kill_event 不受影响，被杀的 run 返回后调用点会因 CANCELLED 守卫静默收尾）。
+        return await self.cancel(slug)
+
     async def shutdown(self) -> None:
         """主进程退出：取消所有 task，等 drain（含 chat）。"""
         ctxs = list(self._sessions.values()) + list(self._chats.values())

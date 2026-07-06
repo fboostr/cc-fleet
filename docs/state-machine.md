@@ -35,7 +35,7 @@ stateDiagram-v2
     completed --> developing: 引用回复追加
     failed --> planning: 引用回复（按 failed_phase）
     timeout --> planning: 引用回复（按 failed_phase）
-    new --> cancelled: /cancel
+    new --> cancelled: /cancel 或 /kill
     planning --> cancelled
     developing --> cancelled
     awaiting_user_clarification --> cancelled

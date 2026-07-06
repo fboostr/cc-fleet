@@ -240,7 +240,8 @@ def render_help() -> str:
         "**可用指令**\n\n"
         f"- `/list`：列出最近 {_RECENT_DAYS} 天活跃过的工作中 / 等待回复 session\n"
         f"- `/list all`：列出最近 {_RECENT_DAYS} 天活跃过的所有状态 session（含已取消 / 已完成 / 失败 / 超时）\n"
-        "- `/cancel <slug>`：取消指定 session（也可引用某 session 消息发 `/cancel`，无需带参数）\n"
+        "- `/cancel <slug>`：**软取消**指定 session——不打断正在跑的 claude，让它体面收尾（也可引用某 session 消息发 `/cancel`，无需带参数）\n"
+        "- `/kill <slug>`：**强杀**指定 session——立即杀掉正在跑的活进程再取消，用于 claude 卡死 / 跑飞不想再等（也可引用某 session 消息发 `/kill`）\n"
         "- `/resume <slug>`：显式拉起 working 状态的孤儿 session（主控曾被中断时留下的）；awaiting / 终态请用引用回复\n"
         "- `/plan <slug> [review|code]`：查看指定 session 的 plan 全文；`review`=plan 审查、`code`=code 审查、省略=原始 plan（也可引用某 session 消息发 `/plan [review|code]`，无需带 slug）\n"
         "- `/repos`：列出当前配置的所有仓库及其 alias / keywords\n"
@@ -418,6 +419,15 @@ async def dispatch_command(
             return ["用法：`/cancel <slug>`，或引用某 session 的消息发 `/cancel`（无需带参数）。"]
         ok = await manager.cancel(arg)
         return [f"已取消 [{arg}]。" if ok else f"未找到未结案的 session [{arg}]。"]
+    if command == "kill":
+        if not arg:
+            return ["用法：`/kill <slug>`，或引用某 session 的消息发 `/kill`（无需带参数）。"]
+        ok = await manager.hard_cancel(arg)
+        return [
+            f"已强杀 [{arg}]（立即杀掉活进程并取消）。"
+            if ok
+            else f"未找到未结案的 session [{arg}]。"
+        ]
     if command == "resume":
         if not arg:
             return [

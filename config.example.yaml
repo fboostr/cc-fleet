@@ -38,10 +38,29 @@ claude:
   binary: claude              # Claude Code CLI 可执行名 / 路径
 
 # 交付流水线阶段参数（工具无关：plan / dev / review 是状态机阶段，对所有 agent 通用，不随工具重复）
+#
+# 超时不再是「进程墙钟总时长」一刀切，而是每阶段一个三档**空闲**策略（避免长编译/测试被误杀）：
+#   - idle_sec：**无工具在飞**时的回合间空闲上限（真·卡死 / 等输入，收得紧）。
+#   - tool_sec：**有工具在飞**（tool_use 已发、tool_result 未回）时的静默上限，覆盖大型
+#     C++ 编译 / 数十分钟测试等合法长工具（放得松）。
+#   - hard_cap_sec：从进程启动起算的绝对总时长兜底，防「一直吐事件的死循环」。
+# 约束 idle_sec ≤ tool_sec ≤ hard_cap_sec。跑飞不想等可用 /kill 立即强杀（见 README）。
+#
+# 兼容：旧的 plan_timeout_sec / dev_timeout_sec / review_timeout_sec 标量仍可用——会被等价迁移成
+# idle=tool=hard_cap=旧值（旧墙钟行为逐字节不变）并发一条 deprecation；想吃到空闲分档请改用下面新结构。
 pipeline:
-  plan_timeout_sec: 1800      # plan 阶段单次调用最长 30 分钟
-  dev_timeout_sec: 3600       # dev 阶段单次调用最长 60 分钟
-  review_timeout_sec: 1800    # Reviewer 单次审查（plan/code）超时；仅启用 reviewer 的 repo 用得到
+  plan:                       # plan 只读分析，鲜有长工具，收紧
+    idle_sec: 300             #   回合间空闲 5 分钟
+    tool_sec: 900             #   工具执行 15 分钟
+    hard_cap_sec: 3600        #   绝对上限 1 小时
+  dev:                        # dev 要跑编译 / 测试，放宽
+    idle_sec: 600             #   回合间空闲 10 分钟
+    tool_sec: 3600            #   工具执行 60 分钟（大型编译/测试）
+    hard_cap_sec: 28800       #   绝对上限 8 小时
+  review:                     # Reviewer 只读审查（plan/code 共用），同 plan 收紧
+    idle_sec: 300
+    tool_sec: 900
+    hard_cap_sec: 3600
   max_clarify_rounds: 5       # plan ↔ awaiting_user 最多来回轮数
 
 # ── 默认交互模式（降低新手门槛）───────────────────────────
@@ -88,6 +107,13 @@ repos:
     # reviewer:
     #   enabled: true
     #   max_rounds: 1           # 「审查→修订」轮次上限，默认 1；0 等价于关闭
+    # 可选：按仓库覆盖全局 pipeline 的阶段超时（只覆盖填了的阶段，其余回退全局）。
+    # 重型仓库（大型 C++ 编译 / 测试）可单独把 dev.tool_sec 调大：
+    # timeouts:
+    #   dev:
+    #     idle_sec: 900
+    #     tool_sec: 7200        # 工具执行放宽到 2 小时
+    #     hard_cap_sec: 36000
 
   # GitHub 仓库示例（origin 指向 github.com）
   # - name: my-gh-repo
@@ -123,7 +149,11 @@ limits:
 chat:
   default_cwd: ~/cc-fleet-chat   # 多仓库省略 @repo 时的回退工作目录；不配则回退到用户 home
   max_concurrent: 4              # chat 独立并发上限（不占用 limits.max_concurrent_sessions）
-  turn_timeout_sec: 3600         # 单轮 claude 子进程超时（秒）
+  turn:                          # 单轮 claude 子进程的空闲超时（三档同 pipeline；只读讨论收紧）
+    idle_sec: 300
+    tool_sec: 600
+    hard_cap_sec: 3600
+  # 旧写法 turn_timeout_sec: 3600 仍兼容（等价迁移成三档相等），想吃空闲分档请改用上面 turn。
   # 私聊「窗口内免引用自动续聊」时长（秒），默认 1800（30 分钟）、默认开启。仅 default_mode=chat
   # 且私聊（个人微信 1:1 / 企微单聊）下生效：不带引用的普通消息，若距该用户最近一个活跃 chat
   # 的最后一条机器人回复 ≤ 本值，自动续到该会话而非开新；超窗 / 无活跃 chat 则照旧开新。

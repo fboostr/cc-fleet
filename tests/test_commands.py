@@ -114,6 +114,30 @@ async def _set_created_and_updated_at(db: Database, slug: str, dt: datetime) -> 
     await db.conn.commit()
 
 
+# ---------- /kill 强杀命令 ----------
+
+
+async def test_kill_command_hard_cancels_session(db: Database, manager: SessionManager):
+    """/kill <slug> → 走 hard_cancel：open 的孤儿 session 被落 CANCELLED，回执点明"强杀"。"""
+    await _insert(db, slug="req-k", state=SessionState.DEVELOPING, display="kill-feat")
+    out = await dispatch_command(db, manager, "kill", "kill-feat")
+    assert len(out) == 1 and "强杀" in out[0]
+    row = await db.get_session("req-k")
+    assert row["state"] == SessionState.CANCELLED.value
+    await manager.shutdown()
+
+
+async def test_kill_command_requires_arg(db: Database, manager: SessionManager):
+    out = await dispatch_command(db, manager, "kill", None)
+    assert len(out) == 1 and "/kill" in out[0]
+
+
+async def test_kill_command_unknown_slug(db: Database, manager: SessionManager):
+    out = await dispatch_command(db, manager, "kill", "nope")
+    assert "未找到" in out[0]
+    await manager.shutdown()
+
+
 # ---------- /list 默认视图 ----------
 
 

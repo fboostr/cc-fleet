@@ -769,6 +769,52 @@ async def test_cancel_unknown_slug_returns_false(db, cfg, reply):
     await mgr.shutdown()
 
 
+async def test_hard_cancel_sets_kill_event_and_cancels(db, cfg, reply, monkeypatch):
+    """/kill：hard_cancel 对内存中的 session set kill_event（供 engine 立即杀活进程）
+    并复用 cancel() 落 CANCELLED。用卡在 awaiting 的 session 观察 kill_event 被按下。"""
+    from cc_fleet.core import session as session_mod
+
+    async def stub(**kwargs) -> ClaudeRunResult:
+        return ClaudeRunResult(
+            exit_code=0,
+            session_id=kwargs.get("resume_from") or kwargs["session_id"],
+            text_output="SLUG: kill-x\nSTATUS: NEED_CLARIFICATION\nQUESTIONS:\n- A",
+            stream_log_path=kwargs["stream_log_path"],
+            stderr_tail="",
+            timed_out=False,
+        )
+
+    monkeypatch.setattr(session_mod, "get_runner", lambda *a, **k: FakeRunner(stub))
+    mgr = SessionManager(db, cfg, reply)
+    slug, _ = await mgr.new_session(
+        repo_cfg=cfg.repos[0], text="x", chatid="c1", userid="u1"
+    )
+    for _ in range(100):
+        row = await db.get_session(slug)
+        if row["state"] == SessionState.AWAITING_USER_CLARIFICATION.value:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        await mgr.shutdown()
+        pytest.fail("session 未进入 awaiting")
+
+    ctx = mgr._sessions[slug]  # 内存 ctx（hard_cancel 应 set 其 session 的 kill_event）
+    ok = await mgr.hard_cancel("kill-x")  # 用 display_slug 强杀
+    assert ok is True
+    assert ctx.session._kill_event.is_set()
+    await mgr.shutdown()
+
+    row = await db.get_session(slug)
+    assert row["state"] == SessionState.CANCELLED.value
+
+
+async def test_hard_cancel_unknown_slug_returns_false(db, cfg, reply):
+    mgr = SessionManager(db, cfg, reply)
+    ok = await mgr.hard_cancel("no-such-slug")
+    assert ok is False
+    await mgr.shutdown()
+
+
 # ---------- shutdown drain ----------
 
 # ---------- continue_session：失败/超时/已完成 session 的复活流 ----------
