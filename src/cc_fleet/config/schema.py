@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 from enum import Enum
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+logger = logging.getLogger(__name__)
 
 
 class PlatformType(str, Enum):
@@ -55,20 +58,124 @@ class ClaudeConfig(BaseModel):
     binary: str = "claude"
 
 
+class StageTimeout(BaseModel):
+    """单个阶段的空闲超时策略（一一对应 runner 层的 ``TimeoutPolicy``）。
+
+    不再用「进程总时长」一刀切，而是按「是否有工具在飞」分三档（详见
+    ``core/runners/base.py`` 的 ``TimeoutPolicy``）：
+
+    - ``idle_sec``：无工具在飞时的「回合间空闲」上限（真·卡死 / 等输入信号，收得紧）。
+    - ``tool_sec``：有工具在飞（``tool_use`` 已发、``tool_result`` 未回）时的静默上限，
+      覆盖大型 C++ 编译 / 数十分钟测试等合法长工具（放得松）。
+    - ``hard_cap_sec``：从进程启动起算的绝对总时长兜底，防「一直吐事件的病态死循环」。
+
+    约束 ``idle_sec ≤ tool_sec ≤ hard_cap_sec``，否则分档失去意义（如 idle > hard_cap
+    时空闲档永不触发）。
+    """
+
+    idle_sec: int = Field(default=300, gt=0)
+    tool_sec: int = Field(default=900, gt=0)
+    hard_cap_sec: int = Field(default=3600, gt=0)
+
+    @model_validator(mode="after")
+    def _check_order(self) -> "StageTimeout":
+        if not (self.idle_sec <= self.tool_sec <= self.hard_cap_sec):
+            raise ValueError(
+                "超时三档需满足 idle_sec ≤ tool_sec ≤ hard_cap_sec，当前 "
+                f"{self.idle_sec}/{self.tool_sec}/{self.hard_cap_sec}"
+            )
+        return self
+
+    def to_policy(self) -> "TimeoutPolicy":
+        """转成 runner 层的 ``TimeoutPolicy``（方法内延迟 import，避免 config→runners 的模块级依赖环）。"""
+        from ..core.runners.base import TimeoutPolicy
+
+        return TimeoutPolicy(
+            idle_sec=self.idle_sec, tool_sec=self.tool_sec, hard_cap_sec=self.hard_cap_sec
+        )
+
+
+def _default_stage(idle: int, tool: int, hard_cap: int):
+    """给 ``Field(default_factory=...)`` 用的工厂：产出一个指定三档默认值的 ``StageTimeout``。"""
+    return lambda: StageTimeout(idle_sec=idle, tool_sec=tool, hard_cap_sec=hard_cap)
+
+
+# 结构化改造前的单标量超时字段 → 新结构里对应的阶段键。旧配置里出现这些标量时**不报错**，
+# 而是等价迁移（方案 C）：旧标量语义是「墙钟总上限」，映射为 idle=tool=hard_cap=旧值——
+# 旧一刀切行为逐字节不变，只换内部表达。不擅自放宽 idle/tool（那会改变旧超时行为）；想要
+# 空闲分档得显式改用新结构。pipeline 与 chat.turn 共用。
+_LEGACY_TIMEOUT_STAGE = {
+    "plan_timeout_sec": "plan",
+    "dev_timeout_sec": "dev",
+    "review_timeout_sec": "review",
+    "turn_timeout_sec": "turn",
+}
+
+
+def _migrate_legacy_timeouts(data, where: str, allowed: set[str]):
+    """把旧标量超时字段等价迁移成新的 ``StageTimeout`` dict（方案 C：三档全相等，行为不变）。
+
+    ``allowed`` 限定本段接受哪些旧键（pipeline 收 plan/dev/review_timeout_sec，chat 收
+    turn_timeout_sec）。返回处理后的**新** data（复制，不原地改调用方 dict）；``data`` 非
+    dict 时原样返回。同一阶段旧字段与新字段并存视为冲突、报错；命中旧字段时发一条中性
+    deprecation（每 key 一次），提示想要空闲分档需改用新结构。
+    """
+    if not isinstance(data, dict):
+        return data
+    data = dict(data)
+    for old_key in allowed:
+        if old_key not in data:
+            continue
+        stage = _LEGACY_TIMEOUT_STAGE[old_key]
+        val = data.pop(old_key)
+        if isinstance(val, bool) or not isinstance(val, int) or val <= 0:
+            raise ValueError(f"{where} 段的 {old_key} 需为正整数秒数，当前 {val!r}")
+        if stage in data:
+            raise ValueError(
+                f"{where} 段同时给了旧字段 {old_key} 与新字段 {stage}，请二选一"
+                "（新结构见 config.example.yaml）"
+            )
+        logger.warning(
+            "检测到 %s 段旧格式 %s，已按等价墙钟迁移（行为不变）；"
+            "若想让长编译 / 测试吃到空闲分档，请改用新结构 %s: {idle_sec/tool_sec/hard_cap_sec}。",
+            where,
+            old_key,
+            stage,
+        )
+        data[stage] = {"idle_sec": val, "tool_sec": val, "hard_cap_sec": val}
+    return data
+
+
 class PipelineConfig(BaseModel):
     """交付流水线的阶段参数（工具无关）。
 
     plan / dev / review 是状态机的阶段，这些超时与澄清轮次上限对所有 coding agent 通用，
     故独立于具体工具的配置块（``ClaudeConfig`` 等），不随工具重复——这也是「编排层工具
     无关、工具耦合只在 runner 层」在配置层的体现。
+
+    每阶段一个 ``StageTimeout``，默认按阶段分档：dev 放宽（长编译 / 测试），plan / review
+    收紧（只读分析 / 探索，鲜有长工具）。可被 ``RepoConfig.timeouts`` 按仓库覆盖。
     """
 
-    plan_timeout_sec: int = 1800
-    dev_timeout_sec: int = 3600
-    # Reviewer 单次审查（plan / code review 共用）的超时秒数。审查是只读分析，
-    # 时长与 plan 阶段相当，故默认与 plan_timeout_sec 一致。
-    review_timeout_sec: int = 1800
+    plan: StageTimeout = Field(default_factory=_default_stage(300, 900, 3600))
+    dev: StageTimeout = Field(default_factory=_default_stage(600, 3600, 28800))
+    review: StageTimeout = Field(default_factory=_default_stage(300, 900, 3600))
     max_clarify_rounds: int = 5
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy(cls, data):
+        return _migrate_legacy_timeouts(
+            data, "pipeline", {"plan_timeout_sec", "dev_timeout_sec", "review_timeout_sec"}
+        )
+
+
+class PipelineTimeoutOverride(BaseModel):
+    """``RepoConfig`` 级的超时覆盖：每阶段可选整块替换全局 ``pipeline`` 默认，未填的阶段回退全局。"""
+
+    plan: StageTimeout | None = None
+    dev: StageTimeout | None = None
+    review: StageTimeout | None = None
 
 
 class ReviewerConfig(BaseModel):
@@ -116,6 +223,10 @@ class RepoConfig(BaseModel):
     remote_ssh_alias: str | None = None
     remote_repo_path: str | None = None
     remote_worktree_root: str | None = None
+
+    # 可选：按仓库覆盖全局 pipeline 的阶段超时（重型仓库如大型 C++ 编译 / 测试可单独调大
+    # dev.tool_sec）。只覆盖填了的阶段，其余回退全局 ``pipeline``；解析见 ``AppConfig.stage_timeout``。
+    timeouts: PipelineTimeoutOverride | None = None
 
     # 驱动本 repo 的 AI coding 工具（Coder）。默认 claude，旧配置零感知、向后兼容。
     agent: AgentTool = AgentTool.CLAUDE
@@ -187,7 +298,8 @@ class ChatConfig(BaseModel):
       回退到用户 home。绑定了仓库时忽略本项，cwd 用仓库主目录。
     - max_concurrent：并发 chat 轮次上限。独立于 ``limits.max_concurrent_sessions``，
       chat 常长时间挂着等用户，用独立池避免饿死交付流水线。
-    - turn_timeout_sec：单轮 claude 子进程超时秒数（只读讨论，一般较快，留足冗余）。
+    - turn：单轮 claude 子进程的空闲超时策略（``StageTimeout``，三档语义同 pipeline 各阶段）。
+      chat 是只读讨论、鲜有长工具，默认收紧。
     - auto_continue_window_sec：私聊「窗口内免引用自动续聊」时长（秒），默认 1800（30 分钟）、
       默认开启。仅在 ``default_mode='chat'`` 且**私聊**（无群概念）下生效：不带引用的普通消息，
       若该用户存在一个活跃 chat 会话、且距其**最后一条机器人回复** ≤ 本值，则自动续到该会话
@@ -197,8 +309,13 @@ class ChatConfig(BaseModel):
 
     default_cwd: Path | None = None
     max_concurrent: int = 4
-    turn_timeout_sec: int = 3600
+    turn: StageTimeout = Field(default_factory=_default_stage(300, 600, 3600))
     auto_continue_window_sec: int = 1800
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy(cls, data):
+        return _migrate_legacy_timeouts(data, "chat", {"turn_timeout_sec"})
 
     @field_validator("default_cwd", mode="before")
     @classmethod
@@ -283,6 +400,17 @@ class AppConfig(BaseModel):
             if key_lower in (a.lower() for a in repo.aliases):
                 return repo
         return None
+
+    def stage_timeout(
+        self, repo: RepoConfig, stage: Literal["plan", "dev", "review"]
+    ) -> StageTimeout:
+        """解析某仓库某阶段的有效超时：repo 级 ``timeouts`` 覆盖优先，否则回退全局 ``pipeline``。"""
+        override = repo.timeouts
+        if override is not None:
+            st = getattr(override, stage)
+            if st is not None:
+                return st
+        return getattr(self.pipeline, stage)
 
     def validate_runtime(self) -> list[str]:
         """启动期对每个 repo 做静态校验，把"配置漏改"在拉起进程前就拦住。

@@ -8,7 +8,13 @@ from pathlib import Path
 import pytest
 
 from cc_fleet.config.loader import load_config
-from cc_fleet.config.schema import HttpConfig, PlatformType
+from cc_fleet.config.schema import (
+    ChatConfig,
+    HttpConfig,
+    PipelineConfig,
+    PlatformType,
+    StageTimeout,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -87,7 +93,10 @@ def test_chat_section_parsed(tmp_path, monkeypatch):
         chat:
           default_cwd: {tmp_path}/chatdir
           max_concurrent: 2
-          turn_timeout_sec: 120
+          turn:
+            idle_sec: 60
+            tool_sec: 90
+            hard_cap_sec: 120
         repos:
           - name: demo
             path: {tmp_path}
@@ -97,7 +106,11 @@ def test_chat_section_parsed(tmp_path, monkeypatch):
     p.write_text(body, encoding="utf-8")
     cfg = load_config(p)
     assert cfg.chat.max_concurrent == 2
-    assert cfg.chat.turn_timeout_sec == 120
+    assert (cfg.chat.turn.idle_sec, cfg.chat.turn.tool_sec, cfg.chat.turn.hard_cap_sec) == (
+        60,
+        90,
+        120,
+    )
     assert str(cfg.chat.default_cwd) == f"{tmp_path}/chatdir"
 
 
@@ -107,7 +120,81 @@ def test_chat_section_defaults_when_absent(tmp_path, monkeypatch):
     cfg = load_config(_write(tmp_path, "wecom"))
     assert cfg.chat.default_cwd is None
     assert cfg.chat.max_concurrent == 4
-    assert cfg.chat.turn_timeout_sec == 3600
+    assert cfg.chat.turn.hard_cap_sec == 3600
+
+
+# ── 超时结构化：三档约束 / 旧标量等价迁移（方案 C）/ 按仓库覆盖 ──────────
+def test_stage_timeout_rejects_out_of_order():
+    # idle ≤ tool ≤ hard_cap 被违反时报错（否则分档失去意义）
+    with pytest.raises(ValueError, match="idle_sec ≤ tool_sec ≤ hard_cap_sec"):
+        StageTimeout(idle_sec=100, tool_sec=10, hard_cap_sec=5)
+
+
+def test_pipeline_legacy_scalar_migrated_equivalently(caplog):
+    """方案 C：旧标量 ``dev_timeout_sec`` 等价迁移成 idle=tool=hard_cap（旧墙钟行为不变），
+    并发一条中性 deprecation；其它未提及阶段仍用新默认。"""
+    with caplog.at_level("WARNING"):
+        pc = PipelineConfig(dev_timeout_sec=300)
+    assert (pc.dev.idle_sec, pc.dev.tool_sec, pc.dev.hard_cap_sec) == (300, 300, 300)
+    # plan 未给旧字段 → 新分档默认
+    assert (pc.plan.idle_sec, pc.plan.hard_cap_sec) == (300, 3600)
+    assert any("dev_timeout_sec" in r.getMessage() for r in caplog.records)
+
+
+def test_chat_legacy_turn_timeout_migrated():
+    cc = ChatConfig(turn_timeout_sec=120)
+    assert (cc.turn.idle_sec, cc.turn.tool_sec, cc.turn.hard_cap_sec) == (120, 120, 120)
+
+
+def test_legacy_and_new_same_stage_conflict_errors():
+    # 同阶段旧字段 + 新字段并存 → 显式报错（不猜用户意图）
+    with pytest.raises(ValueError, match="dev"):
+        PipelineConfig(
+            dev_timeout_sec=300, dev={"idle_sec": 1, "tool_sec": 2, "hard_cap_sec": 3}
+        )
+
+
+def test_repo_timeouts_override_resolution(tmp_path, monkeypatch):
+    """AppConfig.stage_timeout：repo 级 timeouts 覆盖优先，未覆盖的阶段回退全局 pipeline。"""
+    monkeypatch.setenv("WECOM_BOT_ID", "id-1")
+    monkeypatch.setenv("WECOM_BOT_SECRET", "sec-1")
+    body = textwrap.dedent(
+        f"""
+        workspace_root: {tmp_path}/ws
+        log_dir: {tmp_path}/logs
+        db_path: {tmp_path}/state.db
+        platform: wecom
+        wecom:
+          bot_id: ${{env:WECOM_BOT_ID}}
+          bot_secret: ${{env:WECOM_BOT_SECRET}}
+        pipeline:
+          dev:
+            idle_sec: 600
+            tool_sec: 3600
+            hard_cap_sec: 28800
+        repos:
+          - name: heavy
+            path: {tmp_path}
+            timeouts:
+              dev:
+                idle_sec: 900
+                tool_sec: 7200
+                hard_cap_sec: 36000
+          - name: light
+            path: {tmp_path}
+        """
+    )
+    p = tmp_path / "config.yaml"
+    p.write_text(body, encoding="utf-8")
+    cfg = load_config(p)
+    heavy = cfg.repo_by_name_or_alias("heavy")
+    light = cfg.repo_by_name_or_alias("light")
+    # heavy 覆盖了 dev → 用覆盖值
+    assert cfg.stage_timeout(heavy, "dev").tool_sec == 7200
+    # heavy 未覆盖 plan → 回退全局默认（hard_cap 3600）
+    assert cfg.stage_timeout(heavy, "plan").hard_cap_sec == 3600
+    # light 无任何覆盖 → 全局 dev（tool 3600）
+    assert cfg.stage_timeout(light, "dev").tool_sec == 3600
 
 
 # ── HttpConfig.bind 格式校验 ──────────────────────────────────────────

@@ -70,7 +70,14 @@ from ..util.ids import format_session_tag, new_internal_slug, new_uuid
 from . import mr as mr_module
 from . import repo as repo_module
 from .runner_factory import get_runner
-from .runners.base import AgentPermission, AgentRunner, CallableRunner, ClaudeRunResult
+from .runners.base import (
+    AgentPermission,
+    AgentRunner,
+    CallableRunner,
+    ClaudeRunResult,
+    TimeoutPolicy,
+    timeout_phrase,
+)
 from .runners.claude import (
     LENGTH_ERROR_HINT,
     classify_length_error,
@@ -133,6 +140,10 @@ class Session:
 
         self.slug: str = ""             # 内部主键
         self.row: dict[str, Any] = {}   # db 行的内存缓存
+
+        # /kill 手动强杀用：set 后 engine 监控循环立即杀进程组、run 返回 killed=True，
+        # drive loop 据此落 CANCELLED。整个 session 生命周期共用同一个 event（多轮 run 复用）。
+        self._kill_event: asyncio.Event = asyncio.Event()
 
         self.pending_user_message: str | None = None
         # apply_followup 拒绝时给调用方拿去回包用户的中文提示；成功路径置 None
@@ -310,6 +321,15 @@ class Session:
         # 通知；而这条回执在 CLI 取消路径（cli.py→mgr.cancel）下是唯一的用户回执。
         await self._notify(f"session 已取消：{reason}", force=True)
 
+    def hard_kill(self) -> None:
+        """``/kill`` 手动强杀：set ``kill_event``，engine 监控循环下一轮（≤1s）杀活进程组、
+        ``run`` 返回 ``killed=True``，调用点据此直接收尾。落 CANCELLED + 回执由
+        ``SessionManager.hard_cancel`` 复用 ``cancel()`` 完成（与软取消同路径）。
+
+        与 ``cancel()``（软取消，不杀活进程、等 claude 自己跑完）互补：``/kill`` 面向
+        「claude 卡死 / 跑飞、不想再等」的场景。同步方法：只按信号，不落库。"""
+        self._kill_event.set()
+
     # ---------- 状态机主循环 ----------
 
     async def drive(self) -> None:
@@ -423,15 +443,21 @@ class Session:
             session_id=self.row["claude_session_id"],
             resume_from=resume_from,
             guardrail=guardrail,
-            timeout_sec=self.config.pipeline.plan_timeout_sec,
+            timeout=self.config.stage_timeout(self.repo_cfg, "plan").to_policy(),
             stream_log_path=stream_log,
             extra_env=self._claude_extra_env(worktree),
             on_event=self._persist_claude_event,
+            kill_event=self._kill_event,
         )
 
+        if result.killed:
+            # /kill 强杀：hard_cancel 已落 CANCELLED（_set_state 守卫会吸收后续写入），
+            # 直接收尾，勿覆盖成 TIMEOUT。
+            return
         if result.timed_out:
-            await self._timeout("plan 阶段超时")
-            await self._notify(f"plan 超时{self._tag()}")
+            reason = f"plan 阶段{timeout_phrase(result.timeout_kind)}超时"
+            await self._timeout(reason)
+            await self._notify(f"{reason}{self._tag()}")
             return
         if result.exit_code not in (0, None) or result.result_is_error:
             await self._fail(format_run_failure(result, "plan"))
@@ -529,15 +555,19 @@ class Session:
             session_id=self.row["claude_session_id"],
             resume_from=self.row["claude_session_id"],
             guardrail=guardrail,
-            timeout_sec=self.config.pipeline.dev_timeout_sec,
+            timeout=self.config.stage_timeout(self.repo_cfg, "dev").to_policy(),
             stream_log_path=stream_log,
             extra_env=self._claude_extra_env(worktree),
             on_event=self._persist_claude_event,
+            kill_event=self._kill_event,
         )
 
+        if result.killed:
+            return  # /kill 强杀：hard_cancel 已落 CANCELLED，直接收尾
         if result.timed_out:
-            await self._timeout("dev 阶段超时")
-            await self._notify(f"开发超时{self._tag()}")
+            reason = f"dev 阶段{timeout_phrase(result.timeout_kind)}超时"
+            await self._timeout(reason)
+            await self._notify(f"开发{timeout_phrase(result.timeout_kind)}超时{self._tag()}")
             return
         if result.exit_code not in (0, None) or result.result_is_error:
             await self._fail(format_run_failure(result, "dev"))
@@ -659,15 +689,19 @@ class Session:
             session_id=self.row["claude_session_id"],
             resume_from=self.row["claude_session_id"],
             guardrail=guardrail,
-            timeout_sec=self.config.pipeline.dev_timeout_sec,
+            timeout=self.config.stage_timeout(self.repo_cfg, "dev").to_policy(),
             stream_log_path=stream_log,
             extra_env=self._claude_extra_env(worktree),
             on_event=self._persist_claude_event,
+            kill_event=self._kill_event,
         )
 
+        if result.killed:
+            return  # /kill 强杀：hard_cancel 已落 CANCELLED，直接收尾
         if result.timed_out:
-            await self._timeout("发布阶段超时")
-            await self._notify(f"发布超时{self._tag()}")
+            reason = f"发布阶段{timeout_phrase(result.timeout_kind)}超时"
+            await self._timeout(reason)
+            await self._notify(f"发布{timeout_phrase(result.timeout_kind)}超时{self._tag()}")
             return
         if result.exit_code not in (0, None) or result.result_is_error:
             await self._fail(format_run_failure(result, "publish"))
@@ -761,7 +795,7 @@ class Session:
         verdict = await self._run_reviewer(
             prompt=prompt,
             protocol_file="plan_review_protocol.md",
-            timeout_sec=self.config.pipeline.review_timeout_sec,
+            timeout=self.config.stage_timeout(self.repo_cfg, "review").to_policy(),
         )
 
         if verdict is None:  # 失败即跳过：当作没有 Reviewer
@@ -838,7 +872,7 @@ class Session:
         verdict = await self._run_reviewer(
             prompt=prompt,
             protocol_file=protocol_file,
-            timeout_sec=self.config.pipeline.review_timeout_sec,
+            timeout=self.config.stage_timeout(self.repo_cfg, "review").to_policy(),
         )
 
         if verdict is None:  # 失败即跳过
@@ -878,7 +912,7 @@ class Session:
         await self._set_state(SessionState.DEVELOPING)
 
     async def _run_reviewer(
-        self, *, prompt: str, protocol_file: str, timeout_sec: int
+        self, *, prompt: str, protocol_file: str, timeout: TimeoutPolicy
     ) -> ReviewVerdict | None:
         """跑一次独立 Reviewer（plan 只读模式，独立会话）。
 
@@ -907,18 +941,21 @@ class Session:
                 session_id=call_sid,
                 resume_from=resume_from,
                 guardrail=guardrail,
-                timeout_sec=timeout_sec,
+                timeout=timeout,
                 stream_log_path=stream_log,
                 extra_env=self._claude_extra_env(worktree),
                 on_event=self._persist_reviewer_event,
+                kill_event=self._kill_event,
             )
         except Exception as e:  # noqa: BLE001 - Reviewer 失败一律降级跳过，绝不拖垮 session
             logger.warning("session %s Reviewer 调用异常，跳过审查：%s", self.slug, e)
             self._last_review_skip_reason = classify_length_error(e)
             return None
 
-        if result.timed_out:
-            logger.warning("session %s Reviewer 审查超时，跳过", self.slug)
+        if result.timed_out or result.killed:
+            # 超时或被 /kill 强杀：Reviewer 失败即跳过（当作没有 Reviewer）。killed 时
+            # session 已被 hard_cancel 落 CANCELLED，返回 None 后调用点的 _set_state 也被守卫吸收。
+            logger.warning("session %s Reviewer 审查中断（超时/强杀），跳过", self.slug)
             return None
         if result.exit_code not in (0, None) or result.result_is_error:
             logger.warning(

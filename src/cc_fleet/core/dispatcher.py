@@ -52,6 +52,7 @@ _COMMAND_ALIASES: dict[str, str] = {
     "/list": "list",
     "/help": "help",
     "/cancel": "cancel",
+    "/kill": "kill",
     "/resume": "resume",
     "/plan": "plan",
     "/repos": "repos",
@@ -267,9 +268,9 @@ async def classify(
         normalized = _COMMAND_ALIASES.get(head.lower())
         if normalized is not None:
             arg = rest.strip() or None
-            # /cancel / /plan / /resume 无参时回退到 quote 里的 slug,方便用户"引用某
+            # /cancel / /kill / /plan / /resume 无参时回退到 quote 里的 slug,方便用户"引用某
             # session 消息发 /xxx"。
-            if normalized in ("cancel", "plan", "resume") and arg is None:
+            if normalized in ("cancel", "kill", "plan", "resume") and arg is None:
                 quote_ctx = extract_quote_context(quote)
                 if quote_ctx.slug:
                     arg = quote_ctx.slug

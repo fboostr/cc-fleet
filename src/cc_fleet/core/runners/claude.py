@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import logging
 import os
@@ -19,6 +20,7 @@ from .base import (
     EventCallback,
     GuardrailHandle,
     PermissionMode,
+    TimeoutPolicy,
 )
 from .engine import run_subprocess
 
@@ -135,6 +137,31 @@ class ClaudeInterpreter:
     def terminal_error(self, events: list[dict]) -> tuple[bool, str | None]:
         return _terminal_result_error(events)
 
+    def tool_activity(self, evt: dict) -> list[tuple[str, str]]:
+        """claude 的工具生命周期：``assistant`` 消息里的 ``tool_use`` block（发起，按 ``id``）、
+        ``user`` 消息里的 ``tool_result`` block（结果已回，按 ``tool_use_id`` 配对）。
+
+        一条事件可含多个 block（并行工具调用 / 批量结果），逐个抽出，供引擎判「工具在飞」。
+        """
+        etype = evt.get("type")
+        content = (evt.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            return []
+        out: list[tuple[str, str]] = []
+        if etype == "assistant":
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tid = block.get("id")
+                    if isinstance(tid, str):
+                        out.append(("start", tid))
+        elif etype == "user":
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    tid = block.get("tool_use_id")
+                    if isinstance(tid, str):
+                        out.append(("end", tid))
+        return out
+
 
 def build_claude_args(
     *,
@@ -178,11 +205,12 @@ async def _drive_claude(
     prompt: str,
     cwd: Path,
     env: dict[str, str],
-    timeout_sec: int,
+    timeout: TimeoutPolicy,
     stream_log_path: Path,
     on_event: EventCallback | None,
     resume_from: str | None,
     session_id: str,
+    kill_event: asyncio.Event | None = None,
 ) -> ClaudeRunResult:
     """共享：起 claude 子进程（经共享引擎）+ 解析 + 组装 ``ClaudeRunResult``。
 
@@ -195,10 +223,11 @@ async def _drive_claude(
         cwd=cwd,
         stdin_text=prompt,
         env=env,
-        timeout_sec=timeout_sec,
+        timeout=timeout,
         stream_log_path=stream_log_path,
         interpreter=ClaudeInterpreter(),
         on_event=on_event,
+        kill_event=kill_event,
     )
     effective_sid = res.init_session_id or resume_from or session_id
     return ClaudeRunResult(
@@ -211,6 +240,8 @@ async def _drive_claude(
         events=res.events,
         result_is_error=res.result_is_error,
         error_message=res.error_message,
+        timeout_kind=res.timeout_kind,
+        killed=res.killed,
     )
 
 
@@ -234,6 +265,9 @@ async def run_claude(
     prompt 经 **stdin** 喂入（不走 argv 的 ``-p`` 位置参数），以规避 OS 命令行参数上限：
     plan 暴涨时单个 ``-p`` 参数会顶爆 ARG_MAX（Linux 单参硬上限 128 KiB）让子进程根本
     起不来。stdin 是流、无此限制，上限抬到模型上下文窗口（撞线时是干净的模型层报错）。
+
+    ``timeout_sec`` 保持标量签名以兼容老调用方——内部转成三档相等的 ``TimeoutPolicy``，
+    等价旧「总时长上界」墙钟语义（``hard_cap`` 兜住）。走空闲分档的新路径请用 ``ClaudeRunner``。
     """
     args = build_claude_args(
         binary=binary,
@@ -251,7 +285,9 @@ async def run_claude(
         prompt=prompt,
         cwd=cwd,
         env=env,
-        timeout_sec=timeout_sec,
+        timeout=TimeoutPolicy(
+            idle_sec=timeout_sec, tool_sec=timeout_sec, hard_cap_sec=timeout_sec
+        ),
         stream_log_path=stream_log_path,
         on_event=on_event,
         resume_from=resume_from,
@@ -293,10 +329,11 @@ class ClaudeRunner:
         session_id: str,
         resume_from: str | None,
         guardrail: GuardrailHandle,
-        timeout_sec: int,
+        timeout: TimeoutPolicy,
         stream_log_path: Path,
         extra_env: dict[str, str] | None,
         on_event: EventCallback | None,
+        kill_event: asyncio.Event | None = None,
     ) -> ClaudeRunResult:
         mode: PermissionMode = (
             "plan" if permission is AgentPermission.READ_ONLY else "acceptEdits"
@@ -324,9 +361,10 @@ class ClaudeRunner:
             prompt=prompt,
             cwd=cwd,
             env=env,
-            timeout_sec=timeout_sec,
+            timeout=timeout,
             stream_log_path=stream_log_path,
             on_event=on_event,
             resume_from=resume_from,
             session_id=session_id,
+            kill_event=kill_event,
         )

@@ -1,4 +1,4 @@
-"""RepoConfig.reviewer / PipelineConfig.review_timeout_sec 的默认值与解析。"""
+"""RepoConfig.reviewer / PipelineConfig.review 超时的默认值与解析。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,9 @@ def test_reviewer_defaults_disabled(tmp_path: Path):
 
 
 def test_review_timeout_default():
-    assert PipelineConfig().review_timeout_sec == 1800
+    # review 阶段是只读分析，默认收紧（与 plan 同档）。
+    review = PipelineConfig().review
+    assert (review.idle_sec, review.tool_sec, review.hard_cap_sec) == (300, 900, 3600)
 
 
 def test_reviewer_parses_from_nested_dict(tmp_path: Path):

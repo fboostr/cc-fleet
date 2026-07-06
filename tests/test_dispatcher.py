@@ -472,6 +472,28 @@ async def test_list_all_arg_case_insensitive(cfg: AppConfig):
     assert d.command_arg == "ALL"
 
 
+async def test_kill_command_routes_to_kill(cfg: AppConfig):
+    msg = IncomingMessage(text="/kill req-x", quote_text="", chatid="c", userid="u")
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.COMMAND
+    assert d.command == "kill"
+    assert d.command_arg == "req-x"
+
+
+async def test_kill_no_arg_falls_back_to_quoted_slug(cfg: AppConfig):
+    """/kill 无参 + 引用带 tag 的消息 → 从 quote 反解出 slug 当参数（与 /cancel 一致）。"""
+    msg = IncomingMessage(
+        text="/kill",
+        quote_text="[session: fix-x @feed-web sid: 02158eab-0b3e-4e82-8905-fd96052e7ed2]",
+        chatid="c",
+        userid="u",
+    )
+    d = await classify(msg, cfg, _never_open)
+    assert d.kind == DispatchKind.COMMAND
+    assert d.command == "kill"
+    assert d.command_arg == "fix-x"
+
+
 async def test_list_command_ignores_quote(cfg: AppConfig):
     """即使引用了某个 session 的消息，/list 仍应路由到 COMMAND 而非 CONTINUE。"""
     msg = IncomingMessage(
