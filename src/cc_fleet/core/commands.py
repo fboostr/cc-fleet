@@ -31,7 +31,9 @@ from typing import TYPE_CHECKING, Any
 
 from ..config.schema import AppConfig
 from ..storage.db import Database
-from ..util.text import split_for_chat
+from ..util.ids import format_session_tag
+from ..util.text import split_for_chat, split_for_chat_with_tag
+from .chat import _NO_REPO
 from .state import CHAT_STATES, WORKING_STATES, SessionState
 
 if TYPE_CHECKING:
@@ -365,7 +367,20 @@ async def render_plan(
     if not body.strip():
         return [f"session [{display}] 的 {label} 文件为空（路径：{doc_path}）。"]
 
-    pieces = split_for_chat(body, _PLAN_CHUNK_LIMIT)
+    # 每段都追加 session tag，使用户引用**任意一段** plan（含首/中段）都能反解出 session
+    # 续聊，而非只有尾段可引用。分页头（"**label [display] (i/N)**\n\n"）会前置到每段，
+    # 故用最长形态（99/99）预留其长度，连同 tag 一并从切分预算扣除，保证
+    # "分页头 + 正文 + tag" 不超过单条上限。
+    repo = row.get("repo")
+    tag = "\n\n" + format_session_tag(
+        display,
+        repo=repo if repo and repo != _NO_REPO else None,
+        claude_session_id=row.get("claude_session_id"),
+    )
+    header_margin = len(f"**{label} [{display}] (99/99)**\n\n")
+    pieces = split_for_chat_with_tag(
+        body, tag, _PLAN_CHUNK_LIMIT, extra_reserve=header_margin
+    )
     total = len(pieces)
     if total == 1:
         return pieces
