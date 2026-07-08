@@ -209,6 +209,7 @@ class Session:
                 "worktree_path": None,
                 "branch": None,
                 "default_branch": self.repo_cfg.default_branch,
+                "base_remote": self.repo_cfg.base_remote,
                 "initial_request": initial_request,
                 "chatid": chatid,
                 "userid": userid,
@@ -372,7 +373,7 @@ class Session:
             )
             worktree_path = worktree_root / self.slug
             branch = f"claude/{self.slug}"
-            base = f"origin/{self.repo_cfg.default_branch}"
+            base = f"{self.repo_cfg.base_remote}/{self.repo_cfg.default_branch}"
             # 幂等：主控重启 recover NEW session 时 worktree 可能已存在。已建好（目录在 +
             # 含 `.git` 标记）就直接复用，跳过 fetch + create，避免 `git worktree add -b`
             # 因分支已存在而 GitError。
@@ -381,10 +382,10 @@ class Session:
                 try:
                     if self.fetch_lock is not None:
                         async with self.fetch_lock:
-                            await repo_module.fetch_default_branch(self.repo_cfg.path, self.repo_cfg.default_branch)
+                            await repo_module.fetch_default_branch(self.repo_cfg.path, self.repo_cfg.default_branch, self.repo_cfg.base_remote)
                             await repo_module.create_worktree(self.repo_cfg.path, worktree_path, branch, base)
                     else:
-                        await repo_module.fetch_default_branch(self.repo_cfg.path, self.repo_cfg.default_branch)
+                        await repo_module.fetch_default_branch(self.repo_cfg.path, self.repo_cfg.default_branch, self.repo_cfg.base_remote)
                         await repo_module.create_worktree(self.repo_cfg.path, worktree_path, branch, base)
                 except repo_module.GitError as e:
                     await self._fail(f"创建 worktree 失败:{e}")
@@ -594,7 +595,7 @@ class Session:
 
         # dev 阶段两种模式都只到 commit 为止（remote defer-push 后也不再在 dev 内 push/建 MR），
         # 闸门：确认确有新 commit（local 直接查本地 worktree，remote 经 SSH 查远端 worktree）。
-        base = f"origin/{self.row['default_branch']}"
+        base = f"{self.row['base_remote']}/{self.row['default_branch']}"
         if self._is_remote():
             remote_worktree = self._remote_worktree_path()
             try:
@@ -657,6 +658,7 @@ class Session:
                 target_branch=self.row["default_branch"],
                 title=title,
                 description=description,
+                base_remote=self.row["base_remote"],
             )
         except mr_module.MrCreateError as e:
             await self._fail(f"MR 提交失败：{e}")
@@ -844,7 +846,7 @@ class Session:
             plan_text = plan_path.read_text(encoding="utf-8")
         except OSError:
             plan_text = ""
-        base = f"origin/{self.row['default_branch']}"
+        base = f"{self.row['base_remote']}/{self.row['default_branch']}"
         context = await self._build_requirement_context()
         if self._is_remote():
             # 远端代码在 dev box，Reviewer 经 SSH 只读查看 diff（worktree 路径确定性拼出）
@@ -1185,6 +1187,7 @@ class Session:
             remote_repo_path=self.repo_cfg.remote_repo_path or "",
             remote_worktree_root=self.repo_cfg.remote_worktree_root or "",
             default_branch=self.row["default_branch"],
+            base_remote=self.row["base_remote"],
             display_slug=self.row.get("display_slug") or self.slug,
         )
 
@@ -1232,7 +1235,7 @@ class Session:
             return []
         try:
             return await repo_module.get_commits_ahead_subjects(
-                Path(wt), f"origin/{self.row['default_branch']}"
+                Path(wt), f"{self.row['base_remote']}/{self.row['default_branch']}"
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("session %s 读取 commit subject 失败：%s", self.slug, e)

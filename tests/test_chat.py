@@ -78,18 +78,30 @@ def _cfg(tmp_path: Path, *, default_cwd: Path | None = None, chat_max: int = 4) 
 
 @pytest.fixture(autouse=True)
 def stub_worktree(monkeypatch: pytest.MonkeyPatch):
-    """stub git worktree 创建。chat 已改为只读、不建 worktree，故此列表应始终为空——
-    保留 stub 以断言"chat 不再触碰 worktree 创建"（若回归会立即被捕获）。"""
+    """stub git worktree 操作，避免真起子进程。
+
+    chat 现改为在**共享只读 detached worktree**（`<repo>-worktrees/_chat`）里跑，读到基于最新
+    base 的代码、且不碰仓库主目录。fixture 记录建/同步调用（``created``），供 test 断言 chat 已在
+    只读 worktree 里运行；也保留 create_worktree stub 给走 pipeline handoff 的用例。"""
     created: list = []
 
-    async def fake_fetch(_root: Path, _branch: str) -> None:
+    async def fake_fetch(_root: Path, _branch: str, _remote: str = "origin") -> None:
         pass
+
+    async def fake_create_detached(_root: Path, path: Path, ref: str) -> None:
+        Path(path).mkdir(parents=True, exist_ok=True)
+        created.append(("create", str(path), ref))
+
+    async def fake_sync_detached(path: Path, ref: str) -> None:
+        created.append(("sync", str(path), ref))
 
     async def fake_create(_root: Path, path: Path, branch: str, base: str) -> None:
         Path(path).mkdir(parents=True, exist_ok=True)
-        created.append((str(path), branch, base))
+        created.append(("branch", str(path), branch, base))
 
     monkeypatch.setattr(repo_module, "fetch_default_branch", fake_fetch)
+    monkeypatch.setattr(repo_module, "create_detached_worktree", fake_create_detached)
+    monkeypatch.setattr(repo_module, "sync_detached_worktree", fake_sync_detached)
     monkeypatch.setattr(repo_module, "create_worktree", fake_create)
     return created
 
@@ -147,20 +159,54 @@ async def test_first_turn_session_id_then_resume(db, tmp_path, reply):
     assert calls[1]["resume_from"] == "sid-1"
 
 
-async def test_local_repo_runs_readonly_in_repo_dir(db, tmp_path, reply, stub_worktree):
-    """有 repo 时 chat 在仓库主目录只读运行，不建 worktree、无分支。"""
+async def test_local_repo_runs_readonly_in_shared_worktree(db, tmp_path, reply, stub_worktree):
+    """有 repo 时 chat 在基于最新 base 的**共享只读 worktree**里运行（不碰主目录）、无分支。"""
     cfg = _cfg(tmp_path)
+    repo = cfg.repos[0]
+    expected_wt = repo.path.with_name(repo.path.name + "-worktrees") / "_chat"
     calls: list = []
-    chat = ChatSession(db=db, config=cfg, reply=reply, repo_cfg=cfg.repos[0])
+    chat = ChatSession(db=db, config=cfg, reply=reply, repo_cfg=repo)
     chat.runner = _runner("hi", calls=calls)
     await chat.create_row(text="你好", chatid="c1", userid="u1")
     await chat.run_turn()
     row = await db.get_session(chat.slug)
-    # cwd 是仓库主目录本身，不是隔离 worktree；branch 为空
-    assert row["worktree_path"] == str(cfg.repos[0].path)
+    # cwd 是共享只读 worktree（不是仓库主目录）；branch 为空
+    assert row["worktree_path"] == str(expected_wt)
+    assert row["worktree_path"] != str(repo.path)
     assert row["branch"] is None
     assert calls[0]["permission"] is AgentPermission.READ_ONLY
-    assert stub_worktree == []  # 只读讨论：从不创建 worktree
+    # 首次建了只读 worktree，基于 {base_remote}/{default_branch}
+    assert stub_worktree[0] == ("create", str(expected_wt), f"{repo.base_remote}/{repo.default_branch}")
+
+
+async def test_local_chat_fork_uses_base_remote(db, tmp_path, reply, stub_worktree):
+    """fork 仓库（base_remote=upstream）：只读 worktree 基于 upstream/<default_branch> 起。"""
+    cfg = _cfg(tmp_path)
+    repo = RepoConfig(
+        name="fk", path=tmp_path / "repo-a", default_branch="main", base_remote="upstream"
+    )
+    chat = ChatSession(db=db, config=cfg, reply=reply, repo_cfg=repo)
+    chat.runner = _runner("hi")
+    await chat.create_row(text="你好", chatid="c1", userid="u1")
+    await chat.run_turn()
+    assert stub_worktree[0][0] == "create"
+    assert stub_worktree[0][2] == "upstream/main"  # 从上游起 base，而非 origin
+    row = await db.get_session(chat.slug)
+    assert row["base_remote"] == "upstream"
+
+
+async def test_local_chat_reuses_and_syncs_existing_worktree(db, tmp_path, reply, stub_worktree):
+    """已存在共享只读 worktree 且无其他活跃 chat → 同步到最新（不重建）。"""
+    cfg = _cfg(tmp_path)
+    repo = cfg.repos[0]
+    wt = repo.path.with_name(repo.path.name + "-worktrees") / "_chat"
+    (wt / ".git").mkdir(parents=True)  # 伪装成已建好的 worktree
+    chat = ChatSession(db=db, config=cfg, reply=reply, repo_cfg=repo)
+    chat.runner = _runner("hi")
+    await chat.create_row(text="你好", chatid="c1", userid="u1")
+    await chat.run_turn()
+    # 复用现有目录 → 走 sync（而非 create）
+    assert stub_worktree[0] == ("sync", str(wt), f"{repo.base_remote}/{repo.default_branch}")
 
 
 async def test_no_repo_runs_in_fallback_cwd(db, tmp_path, reply, stub_worktree):

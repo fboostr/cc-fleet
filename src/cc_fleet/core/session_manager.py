@@ -298,6 +298,9 @@ class SessionManager:
             reply=self.reply,
             repo_cfg=repo_cfg,
             fallback_cwd=fallback_cwd,
+            fetch_lock=(
+                self._repo_lock(repo_cfg.name) if repo_cfg is not None else None
+            ),
         )
         display = await chat.create_row(text=text, chatid=chatid, userid=userid)
         ctx = _ChatCtx(chat)
@@ -344,6 +347,9 @@ class SessionManager:
             reply=self.reply,
             repo_cfg=repo_cfg,
             fallback_cwd=fallback_cwd,
+            fetch_lock=(
+                self._repo_lock(repo_cfg.name) if repo_cfg is not None else None
+            ),
         )
         await chat.resume(internal)
         # 无条件注入用户消息 + 转 CHATTING（孤儿可能停在任意 open 态）。

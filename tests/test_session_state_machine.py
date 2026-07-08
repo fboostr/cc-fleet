@@ -72,7 +72,7 @@ def reply(replies: list):
 def stub_git_and_mr(monkeypatch: pytest.MonkeyPatch):
     """整个文件统一 stub git / mr，避免真起子进程。"""
 
-    async def fake_fetch(_root: Path, _branch: str) -> None:
+    async def fake_fetch(_root: Path, _branch: str, _remote: str = "origin") -> None:
         return None
 
     async def fake_create_worktree(_root: Path, path: Path, _branch: str, _base: str) -> None:

@@ -67,6 +67,14 @@ def test_unselected_wechat_section_dropped(tmp_path, monkeypatch):
     assert cfg.wecom is not None and cfg.wecom.bot_id == "id-1"
 
 
+def test_repo_base_remote_default_and_override(tmp_path):
+    """RepoConfig.base_remote 缺省 'origin'（向后兼容），可覆盖为 'upstream'（fork 工作流）。"""
+    from cc_fleet.config.schema import RepoConfig
+
+    assert RepoConfig(name="a", path=tmp_path).base_remote == "origin"
+    assert RepoConfig(name="b", path=tmp_path, base_remote="upstream").base_remote == "upstream"
+
+
 def test_selected_platform_still_requires_its_env(tmp_path, monkeypatch):
     # 选用平台自身缺环境变量时仍应明确报错（没有被放松）
     monkeypatch.delenv("WECOM_BOT_ID", raising=False)

@@ -98,3 +98,34 @@ async def test_run_git_no_timeout_when_fast(monkeypatch: pytest.MonkeyPatch):
     assert rc == 0
     assert out.strip() == "out"
     assert err == ""
+
+
+async def _git(cwd: Path, *args: str) -> None:
+    proc = await asyncio.create_subprocess_exec(
+        "git", *args, cwd=str(cwd),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    _, err = await proc.communicate()
+    assert proc.returncode == 0, err.decode()
+
+
+async def test_detached_worktree_create_and_sync(tmp_path: Path):
+    """真 git：create_detached_worktree 基于 ref 检出，sync_detached_worktree 推进到新 ref。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    await _git(src, "init", "-q", "-b", "main")
+    await _git(src, "config", "user.email", "t@example.com")
+    await _git(src, "config", "user.name", "t")
+    (src / "f.txt").write_text("v1")
+    await _git(src, "add", "-A")
+    await _git(src, "commit", "-qm", "c1")
+    (src / "f.txt").write_text("v2")
+    await _git(src, "commit", "-qam", "c2")
+
+    wt = tmp_path / "wt"
+    # 基于上一个提交（main~1）建只读 detached worktree → 内容是 v1
+    await repo.create_detached_worktree(src, wt, "main~1")
+    assert (wt / "f.txt").read_text() == "v1"
+    # 硬同步到 main → 工作树推进到 v2
+    await repo.sync_detached_worktree(wt, "main")
+    assert (wt / "f.txt").read_text() == "v2"

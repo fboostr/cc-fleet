@@ -124,6 +124,15 @@ repos:
   #   platform: github        # github.com 可省略（auto 能探测）；GitHub Enterprise 必填
   #   # 另需在 .env 配 GITHUB_TOKEN（或 GH_TOKEN）
 
+  # fork / 跨仓库工作流示例（origin=你的 fork，MR/PR 合并落上游 upstream）
+  # - name: my-fork
+  #   aliases: [fk]
+  #   path: ~/workspace/my-fork
+  #   default_branch: main
+  #   keywords: []
+  #   base_remote: upstream   # 从 upstream 起 base（须先 `git remote add upstream <上游 URL>`）；
+  #                           # push 仍走 origin（fork）。默认 origin=同仓库直推，无需配此项。
+
   # 远端开发仓库示例（按你公司环境改）
   # - name: my-project
   #   aliases: [myproj]

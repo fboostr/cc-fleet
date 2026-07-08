@@ -203,6 +203,13 @@ class RepoConfig(BaseModel):
     aliases: list[str] = Field(default_factory=list)
     path: Path
     default_branch: str = "main"
+    # base 远端：fetch base 分支、建 worktree、算「领先几个 commit」、定 MR/PR 目标都用
+    # {base_remote}/{default_branch}。默认 "origin"（同仓库直推：从 origin 起 base、合回
+    # origin，与改动前完全一致）。**fork / 跨仓库工作流**配成 "upstream"：从上游起 base，
+    # 而 push 仍走 origin（你的 fork）——因为合并落在 upstream，只 fetch origin 会漏掉已合入
+    # 上游的提交。该远端名须在本地主 clone（local）/ 远端 dev box（remote）里预先
+    # `git remote add <base_remote> <url>` 配好；cc-fleet 只用其名，不负责创建。
+    base_remote: str = "origin"
     keywords: list[str] = Field(default_factory=list)
 
     # 仓库工作模式：

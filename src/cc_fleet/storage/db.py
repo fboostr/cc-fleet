@@ -162,6 +162,22 @@ class Database:
         row = await cur.fetchone()
         return dict(row) if row else None
 
+    async def has_other_active_chat(self, repo: str, exclude_slug: str) -> bool:
+        """该 repo 是否还有**另一条**活跃 chat（chatting / chat_awaiting）。
+
+        用于共享只读 chat worktree 的并发同步决策：有则跳过 re-sync（复用当前树），避免
+        `checkout --detach` 在别的 chat 正读文件时抽换工作树。字面量 'chatting' /
+        'chat_awaiting' 对应 ``SessionState.CHATTING/CHAT_AWAITING``。
+        """
+        cur = await self.conn.execute(
+            "SELECT 1 FROM sessions"
+            " WHERE repo = ? AND session_kind = 'chat'"
+            "   AND state IN ('chatting', 'chat_awaiting')"
+            "   AND slug != ? LIMIT 1",
+            (repo, exclude_slug),
+        )
+        return await cur.fetchone() is not None
+
     # ---------- messages ----------
 
     async def add_message(
