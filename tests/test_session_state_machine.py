@@ -84,6 +84,12 @@ def stub_git_and_mr(monkeypatch: pytest.MonkeyPatch):
     async def fake_has_commits_ahead_remote(_alias: str, _wt: str, _base: str) -> bool:
         return True
 
+    async def fake_has_uncommitted_changes(_path: Path) -> bool:
+        return False
+
+    async def fake_has_uncommitted_changes_remote(_alias: str, _wt: str) -> bool:
+        return False
+
     async def fake_mr_create(**_kwargs) -> str:
         return "https://gitlab/example/-/merge_requests/42"
 
@@ -91,6 +97,10 @@ def stub_git_and_mr(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(repo_module, "create_worktree", fake_create_worktree)
     monkeypatch.setattr(repo_module, "has_commits_ahead", fake_has_commits_ahead)
     monkeypatch.setattr(repo_module, "has_commits_ahead_remote", fake_has_commits_ahead_remote)
+    monkeypatch.setattr(repo_module, "has_uncommitted_changes", fake_has_uncommitted_changes)
+    monkeypatch.setattr(
+        repo_module, "has_uncommitted_changes_remote", fake_has_uncommitted_changes_remote
+    )
     monkeypatch.setattr(mr_module, "create_mr_via_push", fake_mr_create)
 
 
@@ -451,9 +461,11 @@ async def test_plan_exit_zero_but_is_error_fails(db, cfg, repo_cfg, reply, repli
 # ---- dev 完成但 worktree 无 commit ----
 
 async def test_dev_without_commit_fails(db, cfg, repo_cfg, reply, replies, monkeypatch):
+    """无新 commit 且 worktree 干净（真没写代码）→ 泛化文案「无新 commit」。"""
     async def fake_no_commits(_path, _base):
         return False
     monkeypatch.setattr(repo_module, "has_commits_ahead", fake_no_commits)
+    # worktree 干净（默认已 stub has_uncommitted_changes=False）
 
     claude_stub = make_claude_stub([
         "SLUG: foo-bar\nSTATUS: READY",
@@ -463,7 +475,58 @@ async def test_dev_without_commit_fails(db, cfg, repo_cfg, reply, replies, monke
     await s.start(initial_request="无意义需求", chatid="c1", userid="u1")
     row = await db.get_session(s.slug)
     assert row["state"] == SessionState.FAILED.value
-    assert "commit" in (row["last_error"] or "")
+    assert "无新 commit" in (row["last_error"] or "")
+
+
+async def test_dev_without_commit_but_dirty_reports_uncommitted(
+    db, cfg, repo_cfg, reply, replies, monkeypatch
+):
+    """无新 commit 但 worktree 有未提交改动（写了没 commit，典型如推迟 commit 等后台构建）
+    → 文案应指明「改动未提交、成果未丢」并给 worktree 路径，而非误导为「无新 commit」。"""
+    async def fake_no_commits(_path, _base):
+        return False
+    async def fake_dirty(_path):
+        return True
+    monkeypatch.setattr(repo_module, "has_commits_ahead", fake_no_commits)
+    monkeypatch.setattr(repo_module, "has_uncommitted_changes", fake_dirty)
+
+    claude_stub = make_claude_stub([
+        "SLUG: foo-bar\nSTATUS: READY",
+        "代码改完了，等后台 CUDA 构建完成再 commit。",
+    ])
+    s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=claude_stub)
+    await s.start(initial_request="改点东西", chatid="c1", userid="u1")
+    row = await db.get_session(s.slug)
+    assert row["state"] == SessionState.FAILED.value
+    err = row["last_error"] or ""
+    assert "有未提交改动" in err
+    assert "成果未丢" in err
+    assert "无新 commit" not in err
+
+
+async def test_remote_dev_without_commit_but_dirty_reports_uncommitted(
+    db, cfg, tmp_path, reply, replies, monkeypatch
+):
+    """remote 模式同款：远端 worktree 无新 commit 但有未提交改动 → 「远端 worktree 改动未提交」文案。"""
+    async def fake_no_commits_remote(_alias, _wt, _base):
+        return False
+    async def fake_dirty_remote(_alias, _wt):
+        return True
+    monkeypatch.setattr(repo_module, "has_commits_ahead_remote", fake_no_commits_remote)
+    monkeypatch.setattr(repo_module, "has_uncommitted_changes_remote", fake_dirty_remote)
+
+    repo_cfg = _make_remote_repo_cfg(tmp_path)
+    claude_stub = make_claude_stub([
+        "SLUG: foo-bar\nSTATUS: READY",
+        "远端代码改完了，等后台构建完成再 commit。",
+    ])
+    s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=claude_stub)
+    await s.start(initial_request="改点东西", chatid="c1", userid="u1")
+    row = await db.get_session(s.slug)
+    assert row["state"] == SessionState.FAILED.value
+    err = row["last_error"] or ""
+    assert "远端 worktree 有未提交改动" in err
+    assert "成果未丢" in err
 
 
 # ---- mode=remote ----

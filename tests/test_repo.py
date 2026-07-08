@@ -129,3 +129,53 @@ async def test_detached_worktree_create_and_sync(tmp_path: Path):
     # 硬同步到 main → 工作树推进到 v2
     await repo.sync_detached_worktree(wt, "main")
     assert (wt / "f.txt").read_text() == "v2"
+
+
+async def test_has_uncommitted_changes_real_git(tmp_path: Path):
+    """真 git：干净树 → False；改动未 commit / 新增未跟踪文件 → True。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    await _git(src, "init", "-q", "-b", "main")
+    await _git(src, "config", "user.email", "t@example.com")
+    await _git(src, "config", "user.name", "t")
+    (src / "f.txt").write_text("v1")
+    await _git(src, "add", "-A")
+    await _git(src, "commit", "-qm", "c1")
+
+    # 干净树
+    assert await repo.has_uncommitted_changes(src) is False
+    # 改动已跟踪文件、未 commit
+    (src / "f.txt").write_text("v2")
+    assert await repo.has_uncommitted_changes(src) is True
+    # 恢复后再验未跟踪新文件也算 dirty
+    (src / "f.txt").write_text("v1")
+    assert await repo.has_uncommitted_changes(src) is False
+    (src / "new.txt").write_text("x")
+    assert await repo.has_uncommitted_changes(src) is True
+
+
+async def test_has_uncommitted_changes_nonrepo_returns_false(tmp_path: Path):
+    """非 git 目录：git status rc!=0 → 容错返回 False（退化到泛化文案，不因诊断查询出错盖住主失败）。"""
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert await repo.has_uncommitted_changes(plain) is False
+
+
+async def test_has_uncommitted_changes_remote_timeout_raises(monkeypatch: pytest.MonkeyPatch):
+    """has_uncommitted_changes_remote 的 SSH 调用挂起时超时抛 GitError（与 has_commits_ahead_remote 对仗）。"""
+    monkeypatch.setattr(os, "getpgid", lambda pid: 1)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: None)
+    monkeypatch.setattr(repo, "_DEFAULT_GIT_TIMEOUT_SEC", 0.05)
+
+    proc = _HangingProc()
+
+    async def fake_exec(*_a, **_k):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(repo.GitError) as ei:
+        await repo.has_uncommitted_changes_remote("devbox", "/remote/wt")
+
+    assert "超时" in str(ei.value)
+    assert proc.waited

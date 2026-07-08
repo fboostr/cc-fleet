@@ -508,6 +508,32 @@ class Session:
             )
             await self._notify_clarification(protocol.questions, plan_path)
 
+    async def _no_commit_fail_reason(self, worktree_display: str, *, remote: bool) -> str:
+        """commit 闸门判「无新 commit」时，据 worktree 是否 dirty 细化失败文案。
+
+        dirty（有未 commit 改动）→ 大概率是 claude 写了代码却把 commit 推迟给了本 harness
+        **不存在**的跨轮回调（dev 是单发轮次：子进程一退出，其后台任务/ScheduleWakeup/Monitor
+        轮询都不跨轮存活，也唤不醒 session——唯一唤醒路径是用户回复），成果仍在 worktree、并未
+        丢失；clean → claude 确实没产出。dirty 查询本身出错时降级到泛化文案，绝不盖住主失败。
+        """
+        where = "远端 worktree" if remote else "worktree"
+        try:
+            if remote:
+                dirty = await repo_module.has_uncommitted_changes_remote(
+                    self.repo_cfg.remote_ssh_alias or "", worktree_display
+                )
+            else:
+                dirty = await repo_module.has_uncommitted_changes(Path(worktree_display))
+        except Exception:  # noqa: BLE001
+            dirty = False
+        if dirty:
+            return (
+                f"dev 阶段结束但 {where} 有未提交改动，成果未丢（见 {worktree_display}）；"
+                "疑似把 commit 推迟给了本模式不存在的跨轮回调"
+                "（后台任务/ScheduleWakeup/轮询均不跨轮存活），或未按协议在本轮 commit。"
+            )
+        return f"dev 阶段结束但 {where} 无新 commit。"
+
     async def _do_developing(self) -> None:
         worktree = Path(self.row["worktree_path"])
         guardrail = self.runner.guardrail.prepare(settings_dir=self._session_dir() / ".cc-fleet")
@@ -606,7 +632,7 @@ class Session:
                 await self._fail(f"检查远端 worktree 提交状态失败：{e}")
                 return
             if not ahead:
-                await self._fail("dev 阶段结束但远端 worktree 无新 commit。")
+                await self._fail(await self._no_commit_fail_reason(remote_worktree, remote=True))
                 return
             # 远端 MR 元数据由 publish 阶段 claude 产出，主控此处不解析。
         else:
@@ -617,7 +643,7 @@ class Session:
                 await self._fail(f"检查 worktree 提交状态失败：{e}")
                 return
             if not ahead:
-                await self._fail("dev 阶段结束但 worktree 无新 commit。")
+                await self._fail(await self._no_commit_fail_reason(str(worktree), remote=False))
                 return
 
             # 从 claude 输出抽 MR 元数据缓存到 self；MR_SUBMITTING 阶段优先用，

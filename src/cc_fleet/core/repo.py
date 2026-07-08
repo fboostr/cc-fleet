@@ -184,6 +184,45 @@ async def has_commits_ahead_remote(
         raise GitError(f"ssh {ssh_alias} 远端提交数输出非预期：{out!r}") from e
 
 
+async def has_uncommitted_changes(worktree_path: Path) -> bool:
+    """worktree 是否有未提交改动（已改未 commit / 已 add 未 commit / 未跟踪新文件）。
+
+    用 ``git status --porcelain``：输出非空即 dirty。**仅**用于 commit 闸门失败时区分
+    「claude 没写代码」与「写了没 commit」以给准确文案，故与 ``has_commits_ahead`` 一样对
+    git 失败**容错**（rc!=0 时返回 False，退化到泛化文案），不因这条诊断查询本身出错盖住主失败。
+    """
+    rc, out, _ = await _run_git(worktree_path, "status", "--porcelain")
+    if rc != 0:
+        return False
+    return bool(out.strip())
+
+
+async def has_uncommitted_changes_remote(ssh_alias: str, remote_worktree: str) -> bool:
+    """远端 worktree 是否有未提交改动（经 SSH 查 ``git status --porcelain``，remote 模式用）。
+
+    与 ``has_uncommitted_changes`` 对仗、与 ``has_commits_ahead_remote`` 同构：SSH/git 失败
+    抛 ``GitError``（不静默），由调用方决定是否降级。仅用于 commit 闸门失败时细化文案。
+    """
+    inner = f"cd {shlex.quote(remote_worktree)} && git status --porcelain"
+    proc = await asyncio.create_subprocess_exec(
+        "ssh",
+        ssh_alias,
+        inner,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    out_b, err_b = await _communicate_or_timeout(
+        proc, _DEFAULT_GIT_TIMEOUT_SEC, f"ssh {ssh_alias} 查远端工作区状态"
+    )
+    rc = proc.returncode or 0
+    out = out_b.decode("utf-8", errors="replace").strip()
+    err = err_b.decode("utf-8", errors="replace").strip()
+    if rc != 0:
+        raise GitError(f"ssh {ssh_alias} 查远端工作区状态失败（rc={rc}）：{err or out}")
+    return bool(out)
+
+
 async def ensure_remote_chat_worktree(
     ssh_alias: str,
     remote_repo_path: str,
