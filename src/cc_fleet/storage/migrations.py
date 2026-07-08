@@ -110,4 +110,11 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE sessions ADD COLUMN clarify_phase TEXT;
     """,
+    # base 远端名：fetch base 分支、建 worktree、算领先、定 MR/PR 目标都用
+    # {base_remote}/{default_branch}（见 RepoConfig.base_remote）。默认 'origin'（同仓库
+    # 直推工作流，与改动前完全一致）；fork 工作流配 'upstream'。老 row / 未写该列一律回填
+    # 'origin'，行为与改动前一致。
+    """
+    ALTER TABLE sessions ADD COLUMN base_remote TEXT NOT NULL DEFAULT 'origin';
+    """,
 ]

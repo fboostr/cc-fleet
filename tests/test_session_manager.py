@@ -102,7 +102,7 @@ def stub_repo_and_mr(monkeypatch: pytest.MonkeyPatch):
     """整个文件统一 stub git / mr：让 Session._do_new 跑通而不需要真仓库。"""
     fetch_calls: list[str] = []
 
-    async def fake_fetch(repo_root: Path, _branch: str) -> None:
+    async def fake_fetch(repo_root: Path, _branch: str, _remote: str = "origin") -> None:
         fetch_calls.append(str(repo_root))
 
     async def fake_create_worktree(_root: Path, path: Path, _branch: str, _base: str) -> None:
@@ -290,13 +290,15 @@ async def test_same_repo_fetch_serialized(tmp_path, db, reply, monkeypatch):
     violations: list[str] = []
     orig_fetch = repo_module.fetch_default_branch
 
-    async def watching_fetch(repo_root: Path, branch: str) -> None:
+    async def watching_fetch(
+        repo_root: Path, branch: str, remote: str = "origin"
+    ) -> None:
         in_flight["n"] += 1
         if in_flight["n"] > 1:
             violations.append(f"concurrent fetch on {repo_root}")
         await asyncio.sleep(0.01)  # 给并发一个真窗口
         in_flight["n"] -= 1
-        await orig_fetch(repo_root, branch)  # 调 monkeypatched 那个空实现
+        await orig_fetch(repo_root, branch, remote)  # 调 monkeypatched 那个空实现
 
     monkeypatch.setattr(repo_module, "fetch_default_branch", watching_fetch)
     _patch_claude_smart(monkeypatch, plan_text="SLUG: same-repo\nSTATUS: READY")
@@ -1078,7 +1080,9 @@ async def test_resume_new_with_existing_worktree_is_idempotent(
     fetch_calls: list[str] = []
     create_calls: list[str] = []
 
-    async def watching_fetch(repo_root: Path, _branch: str) -> None:
+    async def watching_fetch(
+        repo_root: Path, _branch: str, _remote: str = "origin"
+    ) -> None:
         fetch_calls.append(str(repo_root))
 
     async def watching_create(_root: Path, path: Path, _branch: str, _base: str) -> None:

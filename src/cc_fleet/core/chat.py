@@ -39,6 +39,7 @@ from .runners.base import AgentPermission, timeout_phrase
 from .runners.claude import format_run_failure
 from .slug import resolve_slug_conflict
 from .state import SessionState
+from . import repo as repo_module
 
 logger = logging.getLogger(__name__)
 
@@ -50,14 +51,21 @@ _NO_REPO = "-"
 # 一轮 claude 没有任何文本输出（例如只做了工具调用）时的兜底文案，避免用户干等。
 _EMPTY_OUTPUT_NOTICE = "（本轮 claude 没有产生文本输出）"
 
+# 共享只读 chat worktree 的固定目录基名：每个 repo 一个、所有 chat 会话复用（detached HEAD）。
+# local 在 `<repo.path>-worktrees/_chat`，remote 在 `<remote_worktree_root>/_chat`。让 chat 在
+# 基于最新 base 的只读检出里跑，读到含最新已合并改动的代码，且完全不碰仓库主目录。
+CHAT_WORKTREE_NAME = "_chat"
+
+
+def _prompt_text(name: str) -> str:
+    return (
+        resources.files("cc_fleet.prompts").joinpath(name).read_text(encoding="utf-8")
+    )
+
 
 def _chat_protocol_text() -> str:
     """chat 阶段注入的极简 system prompt（不含任何输出协议）。"""
-    return (
-        resources.files("cc_fleet.prompts")
-        .joinpath("chat_protocol.md")
-        .read_text(encoding="utf-8")
-    )
+    return _prompt_text("chat_protocol.md")
 
 
 class ChatSession:
@@ -75,13 +83,19 @@ class ChatSession:
         reply: ReplyFunc,
         repo_cfg: RepoConfig | None,
         fallback_cwd: Path | None = None,
+        fetch_lock: asyncio.Lock | None = None,
     ) -> None:
         self.db = db
         self.config = config
         self.reply = reply
         self._repo_cfg = repo_cfg
-        # 无 @repo 时的回退工作目录（SessionManager 解析好传入）；有 repo 时用 repo.path。
+        # 无 @repo 时的回退工作目录（SessionManager 解析好传入）；有 repo 时用只读 chat worktree。
         self._fallback_cwd = fallback_cwd
+        # 由 SessionManager 注入的 per-repo 锁：串行「fetch + 建/同步只读 chat worktree」，
+        # 与 dev 的 fetch_lock 同一把，规避同 repo 并发下 .git refs / worktree 的 fs 竞争。
+        self.fetch_lock = fetch_lock
+        # remote 模式下主控在远端建好的只读 chat worktree 路径，供 remote chat 协议注入。
+        self._remote_chat_worktree: str = ""
         self.runner = get_runner(
             repo_cfg.agent if repo_cfg is not None else AgentTool.CLAUDE, config
         )
@@ -115,6 +129,9 @@ class ChatSession:
         default_branch = (
             self._repo_cfg.default_branch if self._repo_cfg is not None else _NO_REPO
         )
+        base_remote = (
+            self._repo_cfg.base_remote if self._repo_cfg is not None else "origin"
+        )
         await self.db.insert_session(
             {
                 "slug": self.slug,
@@ -125,6 +142,7 @@ class ChatSession:
                 "worktree_path": None,
                 "branch": None,
                 "default_branch": default_branch,
+                "base_remote": base_remote,
                 "initial_request": text,
                 "chatid": chatid,
                 "userid": userid,
@@ -149,25 +167,117 @@ class ChatSession:
     # ---------- 环境准备 ----------
 
     async def ensure_setup_once(self) -> None:
-        """幂等解析只读运行目录：有 @repo 时用仓库主目录，无 repo 时用回退目录。
+        """幂等解析只读运行目录。
 
-        chat 是只读讨论，**不建 worktree、不改代码**，直接在仓库主目录（``repo.path``，
-        local 与 remote 同）里以 ``READ_ONLY`` 权限跑，让 claude 能读到当前代码回答问题。
-        转开发（/dev handoff）时才由 pipeline 侧建 worktree、进入可写流水线。
+        chat 是只读讨论、**不改代码**。绑定了 repo 时，在一个**基于最新
+        ``{base_remote}/{default_branch}`` 的共享只读 worktree**里以 ``READ_ONLY`` 跑：读到含
+        最新已合并改动的代码，且完全不碰仓库主目录（主目录始终只读）。worktree 每个 repo 一个、
+        所有 chat 复用，开场时 fetch + 建/同步到最新。无 repo 时回退 ``fallback_cwd`` / home。
         已有 ``worktree_path``（首轮已解析 / 进程重启后 row 仍在）直接返回，天然抗重启。
         """
         await self._refresh_row()
         if self.row.get("worktree_path"):
+            # 进程重启恢复：remote 协议注入用的 _remote_chat_worktree 需按约定重建（首轮已建过）。
+            cfg = self._repo_cfg
+            if (
+                cfg is not None
+                and cfg.mode == "remote"
+                and not self._remote_chat_worktree
+                and cfg.remote_worktree_root
+            ):
+                self._remote_chat_worktree = (
+                    f"{cfg.remote_worktree_root.rstrip('/')}/{CHAT_WORKTREE_NAME}"
+                )
             return
 
-        # 有 repo → 仓库主目录（只读，不隔离）；无 repo → 回退目录 / home。
-        if self._repo_cfg is not None:
-            cwd = self._repo_cfg.path
-        else:
-            cwd = self._fallback_cwd or Path.home()
-        cwd = cwd.expanduser()
-        cwd.mkdir(parents=True, exist_ok=True)
+        if self._repo_cfg is None:
+            cwd = (self._fallback_cwd or Path.home()).expanduser()
+            cwd.mkdir(parents=True, exist_ok=True)
+            await self._update(worktree_path=str(cwd), branch=None)
+            return
+
+        # 绑定了 repo：建/复用共享只读 chat worktree。任何 git 失败都降级回主目录只读，聊天不中断。
+        try:
+            if self._repo_cfg.mode == "remote":
+                cwd = await self._setup_remote_chat_cwd()
+            else:
+                cwd = await self._setup_local_chat_worktree()
+        except repo_module.GitError as e:
+            logger.warning(
+                "chat %s 准备只读 worktree 失败，降级回仓库主目录只读：%s", self.slug, e
+            )
+            await self.db.add_event(
+                self.slug, "chat_worktree_degraded", {"error": str(e)}
+            )
+            cwd = self._repo_cfg.path.expanduser()
+            cwd.mkdir(parents=True, exist_ok=True)
         await self._update(worktree_path=str(cwd), branch=None)
+
+    async def _setup_local_chat_worktree(self) -> Path:
+        """local：fetch base 后建/同步共享只读 detached worktree，返回其路径（fetch_lock 内串行）。"""
+        cfg = self._repo_cfg
+        assert cfg is not None  # 仅由 ensure_setup_once 在 repo 绑定分支调用
+        repo_path = cfg.path.expanduser()
+        wt_path = repo_path.with_name(repo_path.name + "-worktrees") / CHAT_WORKTREE_NAME
+        ref = f"{cfg.base_remote}/{cfg.default_branch}"
+
+        async def _provision() -> None:
+            await repo_module.fetch_default_branch(
+                repo_path, cfg.default_branch, cfg.base_remote
+            )
+            if not (wt_path.exists() and (wt_path / ".git").exists()):
+                await repo_module.create_detached_worktree(repo_path, wt_path, ref)
+            elif await self.db.has_other_active_chat(cfg.name, self.slug):
+                # 有别的活跃 chat 正用共享 worktree → 跳过同步、复用当前树（避免抽换其在读的文件）
+                logger.info(
+                    "chat %s 复用共享只读 worktree（有其他活跃 chat，跳过同步）", self.slug
+                )
+            else:
+                await repo_module.sync_detached_worktree(wt_path, ref)
+
+        if self.fetch_lock is not None:
+            async with self.fetch_lock:
+                await _provision()
+        else:
+            await _provision()
+        return wt_path
+
+    async def _setup_remote_chat_cwd(self) -> Path:
+        """remote：主控经 ssh 在远端建/同步只读 chat worktree（受控写）；本地 cwd 仍是壳子目录，
+        claude 按 remote chat 协议 ssh **只读**读取远端 worktree。返回本地壳子目录。"""
+        cfg = self._repo_cfg
+        assert cfg is not None
+        chat_wt = f"{(cfg.remote_worktree_root or '').rstrip('/')}/{CHAT_WORKTREE_NAME}"
+        # 有别的活跃 chat → 跳过远端建/同步（复用前一个刚 provision 的），否则 ssh create-or-sync。
+        if not await self.db.has_other_active_chat(cfg.name, self.slug):
+
+            async def _provision() -> None:
+                await repo_module.ensure_remote_chat_worktree(
+                    cfg.remote_ssh_alias or "",
+                    cfg.remote_repo_path or "",
+                    chat_wt,
+                    cfg.base_remote,
+                    cfg.default_branch,
+                )
+
+            if self.fetch_lock is not None:
+                async with self.fetch_lock:
+                    await _provision()
+            else:
+                await _provision()
+        self._remote_chat_worktree = chat_wt
+        return cfg.path.expanduser()
+
+    def _render_chat_protocol(self) -> str:
+        """按模式选 chat system prompt：remote 用 ssh 只读变体，其余用本地只读变体。"""
+        cfg = self._repo_cfg
+        if cfg is not None and cfg.mode == "remote" and self._remote_chat_worktree:
+            return _prompt_text("chat_protocol_remote.md").format(
+                remote_ssh_alias=cfg.remote_ssh_alias or "",
+                remote_chat_worktree=self._remote_chat_worktree,
+                default_branch=cfg.default_branch,
+            )
+        return _chat_protocol_text()
 
     # ---------- 一轮对话 ----------
 
@@ -201,7 +311,7 @@ class ChatSession:
             cwd=cwd,
             # 只读讨论：READ_ONLY 映射到 claude 的 --permission-mode plan，可读文件/搜索但不改代码。
             permission=AgentPermission.READ_ONLY,
-            protocol_text=_chat_protocol_text(),
+            protocol_text=self._render_chat_protocol(),
             session_id=session_id,
             resume_from=resume_from,
             guardrail=guardrail,

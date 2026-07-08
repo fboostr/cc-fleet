@@ -206,14 +206,14 @@ git push 默认走 SSH（macOS 请保证 `ssh-agent` 已加载 key）。提 MR/P
 
 ### 多轮只读讨论（/chat）
 
-`/chat` 开一条**独立于交付流水线**的讨论通道：把 claude 当成通过微信透出来的多轮聊天窗口 —— cc-fleet 只做 I/O 管道，把 claude 的输出原样转发给你、把你的后续输入原样喂回同一个 claude 会话。**这是只读讨论**：claude 会读代码、分析需求来把问题聊清楚，但不建 worktree、不改代码；真正动手实现要靠 `/dev` 转开发。
+`/chat` 开一条**独立于交付流水线**的讨论通道：把 claude 当成通过微信透出来的多轮聊天窗口 —— cc-fleet 只做 I/O 管道，把 claude 的输出原样转发给你、把你的后续输入原样喂回同一个 claude 会话。**这是只读讨论**：claude 在一个基于最新主分支的**只读 worktree**里读代码、分析需求把问题聊清楚，但不改代码（也绝不碰仓库主目录）；真正动手实现要靠 `/dev` 转开发。
 
 ```
 帮我看看这个项目的入口在哪                    # 单仓库：直接说，自动归属唯一仓库
-@my-repo /chat 帮我看看这个项目的入口在哪     # 多仓库：绑定 my-repo，在其主目录只读讨论
+@my-repo /chat 帮我看看这个项目的入口在哪     # 多仓库：绑定 my-repo，只读讨论其最新代码
 ```
 
-- **只读运行**：绑定了仓库时直接在**仓库主目录**（`repo.path`）以只读权限运行，claude 能读到当前代码回答问题，但不会写文件、不执行有副作用的命令（复用与开发流程同一套 PreToolUse 安全护栏）。不建 worktree、不占额外磁盘，讨论成本压到最低。
+- **只读运行**：绑定了仓库时，在一个基于最新 `<base_remote>/<default_branch>` 的**共享只读 worktree**（`<repo>-worktrees/_chat`，每仓库一个、所有 chat 复用）里以只读权限运行——claude 读到的是**含最新已合并改动**的代码，而仓库主目录**始终只读、纹丝不动**。开场时先 fetch 再建/同步该 worktree；只读讨论，不会写文件或执行有副作用的命令（复用与开发流程同一套 PreToolUse 安全护栏）。remote 仓库则由主控在远端建同名只读 worktree，claude 经 ssh 只读读取。
 - **绑定仓库**：单仓库时任何消息（含裸 `/chat`）都自动绑定唯一仓库；多仓库用 `@<repo> /chat`。省略 `@repo`（且非单仓库）时回退到 `chat.default_cwd`（未配置则用户 home），读不到具体仓库代码，并回一条警告——建议带 `@repo`。
 - **多轮续聊**：每条 claude 回复末尾都带 `[session: <slug>]`，**引用该消息**追加内容即可续下一轮（复用与交付 session 相同的引用回复机制）；claude 会话上下文通过 `--resume` 连续。
 - **转发形式**：turn-by-turn —— 你发一条，claude 跑完这一轮，完整输出按 ~4000 字自动分段回发。
@@ -251,7 +251,7 @@ chat:
   # 旧写法 turn_timeout_sec: 3600 仍兼容（等价迁移成三档相等）
 ```
 
-> 注意：`/chat` 是只读讨论，claude 不会改代码；绑定仓库时在仓库主目录只读运行。回退到 home 目录（多仓库省略 `@repo`）时读不到具体仓库代码，建议配置专用 `chat.default_cwd` 或直接带 `@repo`。
+> 注意：`/chat` 是只读讨论，claude 不会改代码；绑定仓库时在一个基于最新主分支的只读 worktree 里运行（不碰仓库主目录）。回退到 home 目录（多仓库省略 `@repo`）时读不到具体仓库代码，建议配置专用 `chat.default_cwd` 或直接带 `@repo`。
 
 ## 管理 CLI
 
@@ -290,6 +290,20 @@ repos:
 ```
 
 设计动机、独立会话、四种 verdict 处理路径、`[review]` 内联指令优先级见 [docs/reviewer.md](./docs/reviewer.md)。
+
+## fork / 跨仓库工作流（base_remote）
+
+若目标仓库走 **fork 工作流**（`origin` 是你的 fork，MR/PR 合并落到**上游 upstream**），在 repo 配置里加 `base_remote`：
+
+```yaml
+repos:
+  - name: my-fork
+    path: ~/workspace/my-fork
+    default_branch: main
+    base_remote: upstream    # 从上游起 base（须先 git remote add upstream <url>）；push 仍走 origin
+```
+
+cc-fleet 会从 `upstream/<default_branch>` 起 worktree base、算「领先几个 commit」，并把 PR 建成 fork→upstream（GitLab 由服务端自动定目标，GitHub 在上游仓库建 PR、head 带 fork owner 前缀）；`push` 仍走 `origin`（你的 fork）。默认 `origin`（同仓库直推）时行为完全不变。`/chat` 的只读 worktree 也基于此 base——讨论时能看到已合并进上游的最新改动。**前提**：F2 依赖的 F1 需已合并进上游；该远端名须预先 `git remote add` 好（cc-fleet 只用其名、不负责创建）。
 
 ## 远端开发仓库（mode=remote）
 

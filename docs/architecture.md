@@ -47,7 +47,8 @@ flowchart LR
      消息、`@repo /dev <需求>`、不带引用的 `/dev <需求>` 直达开发都归此类）
    - `CONTINUE` → `SessionManager.continue_session()`（awaiting：唤醒已等的 task；resumable_terminal：起新 task 复活；chat 分流到 `_continue_chat`）
    - `CHAT` → `SessionManager.new_chat_session()` 起 `/chat` 独立**只读讨论**通道（`default_mode=chat`
-     的普通消息也归此类；在仓库主目录只读运行，不建 worktree）
+     的普通消息也归此类；在基于最新 `<base_remote>/<default_branch>` 的共享只读 worktree
+     `<repo>-worktrees/_chat` 里运行，仓库主目录始终只读不动；remote 仓库则经 ssh 读远端同名只读 worktree）
    - `HANDOFF`（引用 chat 消息的 `/dev`）→ `SessionManager.new_pipeline_from_chat()` 把被引用的 chat 讨论复用同一 claude 会话转成 pipeline，并归档原 chat
    - `COMMAND` → `commands.dispatch_command()` 同步算结果
    - `NOISE` → 直接 reply 提示

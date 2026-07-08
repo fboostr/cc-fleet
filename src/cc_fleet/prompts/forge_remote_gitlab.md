@@ -9,6 +9,7 @@
    ```
    - **description 中的真换行必须替换为字面量 `\n`**，否则 GitLab 服务端会以 "push options must not have new line characters" 拒收（rc=128）
    - title 必须为单行
+   - **fork 工作流**（本 session base 远端 `{base_remote}` 非 origin）：push 仍到 origin（你的 fork），GitLab 会自动把 MR 目标定为上游父项目的 `{default_branch}`，无需也不要手动指定 target 项目
 7. 从 git push 的 stderr 抓 MR URL（GitLab 会输出形如 `remote: ... /-/merge_requests/N`），**在最终回复末尾另起一行严格按以下格式输出**（这是主控解析 MR URL 的唯一锚点）：
    ```
    MR_URL: https://gitlab.example.com/group/repo/-/merge_requests/123

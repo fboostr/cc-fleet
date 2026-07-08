@@ -286,15 +286,34 @@ def _error_message(data: object) -> str:
 
 
 async def _find_existing_pr_url(
-    api_base: str, owner: str, repo: str, branch: str, token: str, timeout_sec: int
+    api_base: str, owner: str, repo: str, head: str, token: str, timeout_sec: int
 ) -> str | None:
-    """目标分支已有 open PR 时回查其 URL（对齐 GitLab「复用已有 MR」的幂等行为）。"""
-    url = f"{api_base}/repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open"
+    """目标分支已有 open PR 时回查其 URL（对齐 GitLab「复用已有 MR」的幂等行为）。
+
+    ``head`` 是 GitHub PR list 的 head 过滤表达式 ``<head_owner>:<branch>``；跨 fork 时
+    head_owner 为 fork owner、``owner/repo`` 为上游仓库；同仓库时 head_owner == owner。
+    """
+    url = f"{api_base}/repos/{owner}/{repo}/pulls?head={head}&state=open"
     status, data = await _github_get_json(url, token, timeout_sec)
     if status == 200 and isinstance(data, list) and data:
         html_url = data[0].get("html_url") if isinstance(data[0], dict) else None
         return html_url
     return None
+
+
+def _github_host_owner_repo(url: str) -> tuple[str, str, str]:
+    """从 GitHub remote URL 解析 ``(host, owner, repo)``（解析失败抛 ValueError）。"""
+    host, _ = _remote_host_and_path(url)
+    owner, repo = parse_github_owner_repo(url)
+    return host, owner, repo
+
+
+async def _remote_url(worktree: Path, remote: str) -> str:
+    """``git remote get-url <remote>``；读不到抛 MrCreateError。"""
+    rc, out, err = await _run(["git", "remote", "get-url", remote], worktree)
+    if rc != 0:
+        raise MrCreateError(f"读取 remote {remote!r} URL 失败：{(err or out).strip()}")
+    return out.strip()
 
 
 async def create_pr_via_api(
@@ -305,12 +324,18 @@ async def create_pr_via_api(
     title: str,
     description: str,
     remote: str = "origin",
+    base_remote: str = "origin",
     token: str | None = None,
     max_attempts: int = 3,
     backoff_base_sec: float = 2.0,
     timeout_sec: int = 300,
 ) -> str:
-    """先普通 push，再调 GitHub REST API 建 PR，返回 PR URL；失败抛 MrCreateError。"""
+    """先普通 push，再调 GitHub REST API 建 PR，返回 PR URL；失败抛 MrCreateError。
+
+    ``base_remote != remote`` 时按 **fork 跨仓库 PR** 处理：push 仍到 ``remote``（origin/fork），
+    PR 建在 ``base_remote`` 指向的**上游仓库**上、head 为 ``<fork_owner>:<source_branch>``；
+    ``base_remote == remote``（默认）走同仓库 PR，行为与改动前一致。
+    """
     tok = _github_token(token)
     if not tok:
         raise MrCreateError(
@@ -319,19 +344,27 @@ async def create_pr_via_api(
             "授予 Pull requests: Read and write）。"
         )
 
-    # 1. 先解析 owner/repo + api base（解析失败早抛，免得白 push）
-    rc, out, err = await _run(["git", "remote", "get-url", remote], worktree)
-    if rc != 0:
-        raise MrCreateError(f"读取 remote {remote!r} URL 失败：{(err or out).strip()}")
-    remote_url = out.strip()
+    # 1. 解析 push 远端（origin/fork）；跨 fork 时再解析上游仓库作为 PR 目标（解析失败早抛，免得白 push）
     try:
-        host, _ = _remote_host_and_path(remote_url)
-        owner, repo = parse_github_owner_repo(remote_url)
+        fork_host, fork_owner, fork_repo = _github_host_owner_repo(
+            await _remote_url(worktree, remote)
+        )
+        cross_fork = base_remote != remote
+        if cross_fork:
+            host, pr_owner, pr_repo = _github_host_owner_repo(
+                await _remote_url(worktree, base_remote)
+            )
+            head = f"{fork_owner}:{source_branch}"
+        else:
+            host, pr_owner, pr_repo = fork_host, fork_owner, fork_repo
+            head = source_branch
     except ValueError as e:
         raise MrCreateError(str(e)) from e
+    # PR list 的 head 过滤始终带 head owner（同仓库时 fork_owner 即 pr_owner）
+    head_filter = f"{fork_owner}:{source_branch}"
     api_base = github_api_base(host)
-    # push 成功后任何建 PR 失败，都给用户一个手动建 PR 的兜底入口（head=源分支、base=目标分支）
-    compare_url = github_compare_url(host, owner, repo, target_branch, source_branch)
+    # push 成功后任何建 PR 失败，都给用户一个手动建 PR 的兜底入口（base=目标分支、head=源）
+    compare_url = github_compare_url(host, pr_owner, pr_repo, target_branch, head)
 
     # 2. 普通 push（**不带任何 push option**；GitHub 不认 GitLab 的 -o merge_request.*）
     prc, pout, perr = await _run(["git", "push", "-u", remote, source_branch], worktree)
@@ -341,11 +374,11 @@ async def create_pr_via_api(
     # 3. 建 PR（网络错误 / 5xx 指数退避重试；4xx 直接失败）
     payload = {
         "title": title,
-        "head": source_branch,
+        "head": head,
         "base": target_branch,
         "body": description,
     }
-    url = f"{api_base}/repos/{owner}/{repo}/pulls"
+    url = f"{api_base}/repos/{pr_owner}/{pr_repo}/pulls"
     last_err = ""
     for attempt in range(max_attempts):
         try:
@@ -358,7 +391,7 @@ async def create_pr_via_api(
                 return data["html_url"]
             if status == 422 and _is_already_exists(data):
                 existing = await _find_existing_pr_url(
-                    api_base, owner, repo, source_branch, tok, timeout_sec
+                    api_base, pr_owner, pr_repo, head_filter, tok, timeout_sec
                 )
                 if existing:
                     return existing
@@ -370,8 +403,8 @@ async def create_pr_via_api(
                 last_err = (
                     f"GitHub API 返回 {status}：{_error_message(data)}。"
                     f"分支已成功 push，但自动建 PR 失败——通常是 GITHUB_TOKEN 没有 "
-                    f"{owner}/{repo} 的 Pull requests:write 权限，或该仓库对当前 token "
-                    f"不可见/不存在（GitHub 对无权限仓库统一返 404）。"
+                    f"{pr_owner}/{pr_repo} 的 Pull requests:write 权限，或该仓库对当前 token "
+                    f"不可见/不存在（GitHub 对无权限仓库统一返 404；跨 fork 时还需 token 能对上游开 PR）。"
                     f"可用此链接手动建 PR：{compare_url}"
                 )
             else:
@@ -398,13 +431,15 @@ async def create_review_request(
     title: str,
     description: str,
     remote: str = "origin",
+    base_remote: str = "origin",
 ) -> str:
     """按平台分发并返回 MR/PR URL：
 
-    - `"github"` → `create_pr_via_api`（push + REST API 建 PR）
+    - `"github"` → `create_pr_via_api`（push + REST API 建 PR；`base_remote != remote` 时跨 fork）
     - 其它（默认 gitlab）→ `create_mr_via_push`（push option 建 MR）
 
-    平台差异收敛在本模块内，session 只调本函数。
+    平台差异收敛在本模块内，session 只调本函数。GitLab 侧不需要 ``base_remote``：从 fork
+    push + `merge_request.create` 时服务端自动把 MR 目标定为上游父项目。
     """
     if platform == "github":
         return await create_pr_via_api(
@@ -414,6 +449,7 @@ async def create_review_request(
             title=title,
             description=description,
             remote=remote,
+            base_remote=base_remote,
         )
     return await create_mr_via_push(
         worktree=worktree,

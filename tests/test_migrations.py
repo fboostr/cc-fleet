@@ -54,6 +54,7 @@ async def test_sessions_has_all_altered_columns(tmp_path: Path):
             "session_kind",
             "origin_chat_slug",
             "clarify_phase",
+            "base_remote",
         ):
             assert c in cols, f"sessions 缺列 {c}"
     finally:
@@ -110,6 +111,29 @@ async def test_session_kind_defaults_to_pipeline(tmp_path: Path):
         )
         row = await db.get_session("req-x")
         assert row is not None and row["session_kind"] == "pipeline"
+    finally:
+        await db.close()
+
+
+async def test_base_remote_defaults_to_origin(tmp_path: Path):
+    """不带 base_remote 的插入（老行 / 老代码路径）应回填默认 'origin'，行为与改动前一致。"""
+    db = Database(tmp_path / "state.db")
+    await db.connect()
+    try:
+        await db.insert_session(
+            {
+                "slug": "req-x",
+                "display_slug": None,
+                "repo": "r",
+                "state": "new",
+                "default_branch": "main",
+                "initial_request": "hi",
+                "chatid": "c",
+                "userid": "u",
+            }
+        )
+        row = await db.get_session("req-x")
+        assert row is not None and row["base_remote"] == "origin"
     finally:
         await db.close()
 

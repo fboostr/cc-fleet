@@ -9,16 +9,16 @@
 - SSH 别名：`{remote_ssh_alias}`（agent 已配好免密）
 - 项目主目录：`{remote_repo_path}`
 - worktree 根：`{remote_worktree_root}`
-- 目标分支：`{default_branch}`
+- 目标分支：`{default_branch}`（起 base 用的远端：`{base_remote}`）
 - 本 session 用的分支名：`claude/{display_slug}`
 - 本 session 用的 worktree 路径：`{remote_worktree_root}/{display_slug}`
 
 ## 开发流程（必须按顺序执行）
 
-1. `ssh {remote_ssh_alias}` 连上去；`cd {remote_repo_path}`；`git fetch origin {default_branch}`
-2. 建 worktree：
+1. `ssh {remote_ssh_alias}` 连上去；`cd {remote_repo_path}`；`git fetch {base_remote} {default_branch}`（`{base_remote}` 是本 session 的 base 远端；fork 工作流下为上游 `upstream`，须已在远端 `git remote add` 好）
+2. 建 worktree（基于最新的 `{base_remote}/{default_branch}`）：
    ```
-   git worktree add {remote_worktree_root}/{display_slug} -b claude/{display_slug} origin/{default_branch}
+   git worktree add {remote_worktree_root}/{display_slug} -b claude/{display_slug} {base_remote}/{default_branch}
    ```
 3. `cd {remote_worktree_root}/{display_slug}`；按本项目 `CLAUDE.md` 的约定补齐 worktree（例如软链 `repos/`、`.env`）
 4. 阅读远端 `{remote_repo_path}/CLAUDE.md`（项目级约定），按 plan 完成所有代码改动

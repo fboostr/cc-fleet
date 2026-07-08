@@ -12,7 +12,7 @@
 
 ## 发布流程
 
-1. `ssh {remote_ssh_alias}`、`cd {remote_worktree_root}/{display_slug}`；先确认改动已在本分支 commit（`git log origin/{default_branch}..HEAD` 应能看到你的提交）。若发现还有未提交改动，先补 `git commit`。
+1. `ssh {remote_ssh_alias}`、`cd {remote_worktree_root}/{display_slug}`；先确认改动已在本分支 commit（`git log {base_remote}/{default_branch}..HEAD` 应能看到你的提交）。若发现还有未提交改动，先补 `git commit`。
 2. 然后按下面"MR 元数据规范"写好协议块，并 push + 建 MR/PR + 输出 `MR_URL:`：
 
 {forge_workflow}
@@ -35,7 +35,7 @@ MR_DESCRIPTION_END
 - 动宾结构、单行、≤60 字符
 - 不带句号、不带"请帮我 / 我想 / 能否"等祈使语气
 - **commit type 前缀按以下规则决定**：
-  1. 用只读 bash 探目标仓库是否已有 MR/commit 规范：依次看 `.gitlab/merge_request_templates/*.md`、根目录 `MERGE_REQUEST_TEMPLATE.md`、`CLAUDE.md`、`CONTRIBUTING.md`；再跑 `git log -20 --pretty=%s origin/{default_branch}` 看近期 commit 风格
+  1. 用只读 bash 探目标仓库是否已有 MR/commit 规范：依次看 `.gitlab/merge_request_templates/*.md`、根目录 `MERGE_REQUEST_TEMPLATE.md`、`CLAUDE.md`、`CONTRIBUTING.md`；再跑 `git log -20 --pretty=%s {base_remote}/{default_branch}` 看近期 commit 风格
   2. **若发现项目已有可识别的规范或风格**（含 `feat:/fix:` 前缀、JIRA tag 前缀等），按项目约定写
   3. **若未发现明确规范**，**强制**使用 `feat:/fix:/docs:/refactor:/test:/chore:` 中合适的前缀
 

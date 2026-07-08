@@ -70,10 +70,12 @@ async def _run_git(
     return proc.returncode or 0, out_b.decode("utf-8", errors="replace"), err_b.decode("utf-8", errors="replace")
 
 
-async def fetch_default_branch(repo_root: Path, default_branch: str) -> None:
-    rc, _, err = await _run_git(repo_root, "fetch", "origin", default_branch)
+async def fetch_default_branch(
+    repo_root: Path, default_branch: str, remote: str = "origin"
+) -> None:
+    rc, _, err = await _run_git(repo_root, "fetch", remote, default_branch)
     if rc != 0:
-        raise GitError(f"git fetch origin {default_branch} 失败：{err.strip()}")
+        raise GitError(f"git fetch {remote} {default_branch} 失败：{err.strip()}")
 
 
 async def create_worktree(
@@ -82,7 +84,7 @@ async def create_worktree(
     branch: str,
     base: str = "origin/main",
 ) -> None:
-    """基于 origin/<default_branch> 起新分支并加 worktree。"""
+    """基于 base（形如 {base_remote}/<default_branch>）起新分支并加 worktree。"""
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
     rc, _, err = await _run_git(
         repo_root, "worktree", "add", "-b", branch, str(worktree_path), base
@@ -90,6 +92,33 @@ async def create_worktree(
     if rc != 0:
         raise GitError(f"git worktree add 失败：{err.strip()}")
     logger.info("worktree 创建：%s（分支 %s，基于 %s）", worktree_path, branch, base)
+
+
+async def create_detached_worktree(repo_root: Path, worktree_path: Path, ref: str) -> None:
+    """基于 ref 建一个 detached（无分支）worktree，用于只读浏览最新代码（如 /chat 只读讨论）。
+
+    detached 而非 `-b <branch>`：只读复用、不占分支命名空间，也不与 dev 的 `claude/<slug>` 撞。
+    """
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    rc, _, err = await _run_git(
+        repo_root, "worktree", "add", "--detach", str(worktree_path), ref
+    )
+    if rc != 0:
+        raise GitError(f"git worktree add --detach 失败：{err.strip()}")
+    logger.info("只读 worktree 创建：%s（基于 %s）", worktree_path, ref)
+
+
+async def sync_detached_worktree(worktree_path: Path, ref: str) -> None:
+    """把已有 detached worktree 硬同步到 ref 的最新提交（`--force` 丢弃任何工作树改动）。
+
+    共享只读 chat worktree 在每次新对话开场时据此推进到最新 base（含刚合并的功能）。
+    """
+    rc, _, err = await _run_git(
+        worktree_path, "checkout", "--detach", "--force", ref
+    )
+    if rc != 0:
+        raise GitError(f"git checkout --detach --force {ref} 失败：{err.strip()}")
+    logger.info("只读 worktree 同步：%s → %s", worktree_path, ref)
 
 
 async def remove_worktree(repo_root: Path, worktree_path: Path, force: bool = False) -> None:
@@ -153,6 +182,50 @@ async def has_commits_ahead_remote(
         return int(out or "0") > 0
     except ValueError as e:
         raise GitError(f"ssh {ssh_alias} 远端提交数输出非预期：{out!r}") from e
+
+
+async def ensure_remote_chat_worktree(
+    ssh_alias: str,
+    remote_repo_path: str,
+    chat_worktree_path: str,
+    base_remote: str,
+    default_branch: str,
+) -> None:
+    """经 SSH 在远端 fetch base 分支并建/同步只读 chat worktree（主控发起的受控写，remote 模式用）。
+
+    远端已存在该 worktree（含 `.git`）→ `checkout --detach --force` 同步到最新；否则
+    `worktree add --detach` 新建。随后 /chat 阶段 claude 经 ssh **只读**读取它（见
+    chat_protocol_remote.md）。参数均来自主控配置或确定性拼接，仍 shlex.quote 兜底。
+    """
+    ref = f"{base_remote}/{default_branch}"
+    git_marker = chat_worktree_path.rstrip("/") + "/.git"
+    inner = (
+        f"cd {shlex.quote(remote_repo_path)} && "
+        f"git fetch {shlex.quote(base_remote)} {shlex.quote(default_branch)} && "
+        f"if [ -e {shlex.quote(git_marker)} ]; then "
+        f"git -C {shlex.quote(chat_worktree_path)} checkout --detach --force {shlex.quote(ref)}; "
+        f"else "
+        f"git worktree add --detach {shlex.quote(chat_worktree_path)} {shlex.quote(ref)}; "
+        f"fi"
+    )
+    proc = await asyncio.create_subprocess_exec(
+        "ssh",
+        ssh_alias,
+        inner,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    out_b, err_b = await _communicate_or_timeout(
+        proc, _DEFAULT_GIT_TIMEOUT_SEC, f"ssh {ssh_alias} 建/同步 chat worktree"
+    )
+    rc = proc.returncode or 0
+    if rc != 0:
+        err = err_b.decode("utf-8", errors="replace").strip()
+        out = out_b.decode("utf-8", errors="replace").strip()
+        raise GitError(
+            f"ssh {ssh_alias} 建/同步远端 chat worktree 失败（rc={rc}）：{err or out}"
+        )
 
 
 async def get_commits_ahead_subjects(

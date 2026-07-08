@@ -84,7 +84,7 @@ def _cfg(tmp_path: Path) -> AppConfig:
 def stub_repo_and_mr(monkeypatch: pytest.MonkeyPatch):
     """统一 stub git / mr：让 chat 建 worktree 与 pipeline _do_new/_do_mr 跑通而无需真仓库。"""
 
-    async def fake_fetch(_root: Path, _branch: str) -> None:
+    async def fake_fetch(_root: Path, _branch: str, _remote: str = "origin") -> None:
         pass
 
     async def fake_create_worktree(_root: Path, path: Path, _branch: str, _base: str) -> None:

@@ -225,6 +225,78 @@ async def test_create_pr_via_api_success(monkeypatch):
     assert seen["payload"] == {"title": "加个功能", "head": "claude/x", "base": "main", "body": "多行\n描述"}
 
 
+def _fake_run_multi(urls: dict, push_rc: int = 0):
+    """按 remote 名返回不同 URL（跨 fork 测试用：origin=fork、base_remote=上游）。"""
+
+    async def _fake_run(cmd, cwd):
+        if cmd[:3] == ["git", "remote", "get-url"]:
+            return 0, urls[cmd[3]] + "\n", ""
+        if cmd[:2] == ["git", "push"]:
+            return push_rc, "", ("push failed" if push_rc else "")
+        return 0, "", ""
+
+    return _fake_run
+
+
+async def test_create_pr_via_api_cross_fork(monkeypatch):
+    """base_remote != origin：PR 建在**上游**仓库、head 带 fork owner 前缀，push 仍到 origin。"""
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(mr_module, "_run", _fake_run_multi(
+        {"origin": "git@github.com:me/proj.git", "upstream": "git@github.com:up/proj.git"}
+    ))
+    seen = {}
+
+    async def fake_post(url, payload, token, timeout_sec):
+        seen["url"] = url
+        seen["payload"] = payload
+        return 201, {"html_url": "https://github.com/up/proj/pull/7"}
+
+    monkeypatch.setattr(mr_module, "_github_post_json", fake_post)
+
+    url = await create_pr_via_api(
+        worktree=mr_module.Path("/tmp"),
+        source_branch="claude/x",
+        target_branch="main",
+        title="t",
+        description="d",
+        base_remote="upstream",
+    )
+    assert url == "https://github.com/up/proj/pull/7"
+    # PR 打到上游仓库、head 带 fork owner 前缀
+    assert seen["url"] == "https://api.github.com/repos/up/proj/pulls"
+    assert seen["payload"]["head"] == "me:claude/x"
+    assert seen["payload"]["base"] == "main"
+
+
+async def test_create_pr_via_api_cross_fork_reuse_and_compare(monkeypatch):
+    """跨 fork 的 422 复用查询与 404 兜底 compare URL 都指向上游仓库、head 带 fork owner。"""
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(mr_module, "_run", _fake_run_multi(
+        {"origin": "git@github.com:me/proj.git", "upstream": "git@github.com:up/proj.git"}
+    ))
+
+    async def fake_post(url, payload, token, timeout_sec):
+        return 422, {"message": "Validation Failed",
+                     "errors": [{"message": "A pull request already exists."}]}
+
+    async def fake_get(url, token, timeout_sec):
+        assert "/repos/up/proj/pulls" in url and "head=me:claude/x" in url
+        return 200, [{"html_url": "https://github.com/up/proj/pull/3"}]
+
+    monkeypatch.setattr(mr_module, "_github_post_json", fake_post)
+    monkeypatch.setattr(mr_module, "_github_get_json", fake_get)
+
+    url = await create_pr_via_api(
+        worktree=mr_module.Path("/tmp"),
+        source_branch="claude/x",
+        target_branch="main",
+        title="t",
+        description="d",
+        base_remote="upstream",
+    )
+    assert url == "https://github.com/up/proj/pull/3"
+
+
 async def test_create_pr_via_api_reuses_existing_pr_on_422(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "tok")
     monkeypatch.setattr(mr_module, "_run", _fake_run_factory("https://github.com/o/r.git"))
