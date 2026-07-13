@@ -6,12 +6,22 @@
 
 ## 当前姿态
 
-cc-fleet 主控让一个 LLM agent（Claude Code）跑在你本机上，可以执行 shell、写文件、操作 git。这本身就是一个高权限场景。当前版本提供的防御层是 **PreToolUse hook**：
+cc-fleet 主控让一个 LLM agent（Claude Code 或 Codex CLI，按 repo 的 `agent` 配置）跑在你本机上，可以执行 shell、写文件、操作 git。这本身就是一个高权限场景。防御层**按工具不同**（原则：每工具尽力而为 + 显式标注差距）：
+
+**Claude Code —— PreToolUse hook**：
 
 - 不依赖 `--dangerously-skip-permissions` 跳过的 `permissions.deny`（那条路径已绕开）
 - 在 claude 调用任何工具前，由本地脚本 `pretool_guard.py` 决定是否放行
 
-这条防御**单层、软**，被 prompt-injection 或 shell 字符串混淆都可能绕过，所以是软护栏，不是硬隔离。
+这条防御**单层、软**，被 prompt-injection 或 shell 字符串混淆都可能绕过，所以是软护栏，不是硬隔离。本文以下「能拦什么 / 拦不住什么」小节均指这套 hook。
+
+**Codex CLI —— OS sandbox（`--sandbox`）**：只读阶段 `read-only`、写阶段 `workspace-write`（写被内核限制在 worktree 内——macOS Seatbelt / 较新 Linux Landlock，路径隔离**强于** hook 的字符串检查、混淆绕不过）。但机制性缺口与 hook 不同：
+
+- **force push 等网络 / exec 操作不拦**（sandbox 只管文件写）——靠注入 prompt 的纪律条款自律，无机械兜底
+- **敏感目录读取不拦**（`read-only` / `workspace-write` 均允许全盘读）
+- 非 macOS / 无 Landlock 的 Linux 上退化为**无路径隔离**
+
+以上缺口在启动期由 `validate_runtime` 发 WARN 点明；`agent: codex` 请只在内部信任环境使用。
 
 ## 能拦什么
 

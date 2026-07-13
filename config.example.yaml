@@ -33,13 +33,15 @@ wechat:
   # 仅允许特定微信用户(from_user_id)触发；为空表示不限制
   allowed_user_ids: []
 
-# coding agent 工具配置。每个工具一个配置块；目前仅 claude 的 runner 已接入，
-# codex / opencode 是预留插槽（repo 配置引用它们会在启动校验被拦，待对应 runner 落地）。
+# coding agent 工具配置。每个工具一个配置块；已接入 claude 与 codex 的 runner，
+# opencode 是预留插槽（repo 配置引用它会在启动校验被拦，待对应 runner 落地）。
 claude:
   binary: claude              # Claude Code CLI 可执行名 / 路径
+# codex 需先 `codex login`。护栏为 OS sandbox（写限制在 worktree 内），但拦不住
+# force-push 等网络操作、不拦敏感目录读取——弱于 claude 的 PreToolUse 钩子，启动时会 WARN。
 # codex:
 #   binary: codex             # Codex CLI 可执行名 / 路径
-#   model: null               # 传给 codex 的模型名；null 用其默认
+#   model: null               # 传给 codex 的模型名（--model）；null 用其默认
 # opencode:
 #   binary: opencode          # opencode 可执行名 / 路径
 #   model: null               # 传给 opencode 的模型名；null 用其默认
@@ -107,7 +109,7 @@ repos:
     path: ~/workspace/demo-repo
     default_branch: main
     keywords: []
-    # agent: claude（默认，可省略；驱动本仓库 Coder 的 AI coding 工具）
+    # agent: claude（默认，可省略；驱动本仓库 Coder 的 AI coding 工具，可选 claude / codex）
     # mode: local（默认，可省略）
     # platform: auto（默认，可省略；GitHub 仓库会自动探测，无需手填）
     # 可选：启用独立 Reviewer（默认关闭）
