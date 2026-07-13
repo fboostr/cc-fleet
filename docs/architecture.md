@@ -2,7 +2,7 @@
 
 # 架构概览
 
-cc-fleet 主控是一个单进程 Python 应用，把 6 个职责装在一起：聊天平台（企微 / 个人微信）接入、消息分类、session 状态机、**可插拔 Agent Runner**（当前实现 Claude Code 与 Codex CLI）子进程驱动、SQLite 持久化、本地 HTTP 只读面板。
+cc-fleet 主控是一个单进程 Python 应用，把 6 个职责装在一起：聊天平台（企微 / 个人微信）接入、消息分类、session 状态机、**可插拔 Agent Runner**（当前实现 Claude Code / Codex / opencode）子进程驱动、SQLite 持久化、本地 HTTP 只读面板。
 
 ## 组件图
 
@@ -14,7 +14,7 @@ flowchart LR
     Disp -- NEW/CONTINUE/COMMAND --> SM[core/session_manager.py]
     SM -- 后台 task --> Sess[core/session.py]
     Sess -- run --> RUN[core/runners/*<br/>可插拔 Agent Runner]
-    RUN -- subprocess --> CC[Claude Code / Codex CLI<br/>opencode 待接入]
+    RUN -- subprocess --> CC[Claude Code / Codex / opencode CLI]
     Sess -- 状态写入 --> DB[(SQLite)]
     Sess -- stream 落盘 --> JL[stream.jsonl]
     Sess -- git --> GIT[git worktree / push]
@@ -56,7 +56,7 @@ flowchart LR
 
 ## 可插拔 Agent Runner（多 coding agent 支持）
 
-cc-fleet 在架构上把「驱动一个 coding agent」做成可插拔的 runner —— 编排层工具无关，工具耦合集中在一层。目前实现了 **Claude Code** 与 **Codex CLI**，opencode 等待接入。
+cc-fleet 在架构上把「驱动一个 coding agent」做成可插拔的 runner —— 编排层工具无关，工具耦合集中在一层。目前实现了 **Claude Code** / **Codex CLI** / **opencode** 三个工具。
 
 ### 设计意图
 
@@ -73,12 +73,14 @@ flowchart TB
     RUNNER --> GUARD[GuardrailProvider<br/>逐工具护栏]
     RUNNER -.->|当前实现| CLAUDE[runners/claude.py<br/>ClaudeRunner / ClaudeInterpreter / ClaudeGuardrailProvider]
     RUNNER -.->|当前实现| CODEX[runners/codex.py<br/>CodexRunner / CodexInterpreter / CodexGuardrailProvider]
+    RUNNER -.->|当前实现| OC[runners/opencode.py<br/>OpencodeRunner / OpencodeInterpreter / OpencodeGuardrailProvider]
 ```
 
 - **`runners/base.py`**：归一接口 —— `AgentRunner`（`run(permission, protocol_text, guardrail, …)`）、`AgentPermission`（READ_ONLY / WRITE，取代 claude 专属的 plan / acceptEdits 字面量）、`AgentRunResult`、`GuardrailProvider` / `GuardrailHandle`。
 - **`runners/engine.py`**：**工具无关**子进程引擎 `run_subprocess`（`start_new_session` 进程组回收、chunk 读 stream 避开 readline 64 KiB 上限）+ `StreamInterpreter` 协议（「一条事件如何抽文本 / session_id / 终态错误 / **工具生命周期**」逐工具实现）。回收不再按墙钟总时长一刀切，而是每 1s 轮询的**三档空闲监控**（`_overrun`：无工具在飞 `idle_sec` / 有工具在飞 `tool_sec` / 绝对上限 `hard_cap_sec`，见 `TimeoutPolicy`），任一触发或收到 `kill_event`（`/kill` 强杀）即 SIGTERM→SIGKILL 杀进程组。「工具在飞」由 `interpreter.tool_activity` 配对 `tool_use`/`tool_result` 判定，从而不误杀大型编译 / 测试。
 - **`runners/claude.py`**：Claude 实现 —— `ClaudeRunner` / `ClaudeInterpreter` / `ClaudeGuardrailProvider`。
 - **`runners/codex.py`**：Codex 实现 —— `CodexRunner`（protocol_text 前置进 prompt、`--output-last-message` 权威文本、会话 id 捕获式）/ `CodexInterpreter`（`thread.started` / `item.*` / `turn.completed|failed`；瞬态 `error` 事件不判终态）/ `CodexGuardrailProvider`（护栏走 `--sandbox`，无 settings 文件）。
+- **`runners/opencode.py`**：opencode 实现 —— `OpencodeRunner`（protocol_text 前置、会话 id 捕获式、流内 `text` part 拼最终文本）/ `OpencodeInterpreter`（顶层 `sessionID`、`text`/`error` 事件、`step_start/finish` 按 `messageID` 配对当「工具在飞」信号——工具事件只在结束时发一条，运行期间流静默）/ `OpencodeGuardrailProvider`（纯 prompt 软护栏，空 handle）。
 - **`runner_factory.get_runner(tool, config)`**：按 `RepoConfig.agent` 选 runner；`SUPPORTED_TOOLS` 是「已接入」的单一事实源，启动校验据此拦未接入工具。
 - **配置层对称**：每个工具一个配置块（`ClaudeConfig` / `CodexConfig` / `OpencodeConfig`，都至少含 `binary`），经 `AppConfig.agent_config(tool)` 统一取用；工具无关的阶段超时 / 澄清轮次在 `PipelineConfig`。
 
@@ -101,7 +103,7 @@ flowchart TB
 |---|---|---|---|
 | Claude Code | ✅ 已实现 | `claude -p` / stream-json | PreToolUse hook（settings.json） |
 | Codex | ✅ 已实现（local） | `codex exec` / `--json` | OS sandbox（`--sandbox`；**不拦 force-push / 敏感读**，启动 WARN） |
-| opencode | 待接入 | `opencode run` / `--format json` | prompt 软护栏（已拍板不上 JS 插件） |
+| opencode | ✅ 已实现（local） | `opencode run` / `--format json` | **纯 prompt 软护栏**（已拍板不上 JS 插件；写档零机械拦截，启动 WARN） |
 
 多工具横切层已落地（session-id「分配 / 捕获」双模 + `agent_tool` 钉行 + prompt 措辞中性化，见 PR #18）；codex 的会话 id 由工具分配、首跑后从 `thread.started` 捕获，续聊走 `codex exec resume <id>`。遗留的命名耦合（`claude_session_id` 列名、events 的 `claude.<type>` 前缀、`claude/{slug}` 分支前缀）**功能上已可承载非 claude 工具**，仅名字未泛化——刻意保留，避免无谓迁移。
 
