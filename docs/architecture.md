@@ -2,7 +2,7 @@
 
 # 架构概览
 
-cc-fleet 主控是一个单进程 Python 应用，把 6 个职责装在一起：聊天平台（企微 / 个人微信）接入、消息分类、session 状态机、**可插拔 Agent Runner**（当前实现 Claude Code）子进程驱动、SQLite 持久化、本地 HTTP 只读面板。
+cc-fleet 主控是一个单进程 Python 应用，把 6 个职责装在一起：聊天平台（企微 / 个人微信）接入、消息分类、session 状态机、**可插拔 Agent Runner**（当前实现 Claude Code 与 Codex CLI）子进程驱动、SQLite 持久化、本地 HTTP 只读面板。
 
 ## 组件图
 
@@ -14,7 +14,7 @@ flowchart LR
     Disp -- NEW/CONTINUE/COMMAND --> SM[core/session_manager.py]
     SM -- 后台 task --> Sess[core/session.py]
     Sess -- run --> RUN[core/runners/*<br/>可插拔 Agent Runner]
-    RUN -- subprocess --> CC[Claude Code CLI<br/>codex / opencode 待接入]
+    RUN -- subprocess --> CC[Claude Code / Codex CLI<br/>opencode 待接入]
     Sess -- 状态写入 --> DB[(SQLite)]
     Sess -- stream 落盘 --> JL[stream.jsonl]
     Sess -- git --> GIT[git worktree / push]
@@ -56,7 +56,7 @@ flowchart LR
 
 ## 可插拔 Agent Runner（多 coding agent 支持）
 
-cc-fleet 在架构上把「驱动一个 coding agent」做成可插拔的 runner —— 编排层工具无关，工具耦合集中在一层。目前实现了 **Claude Code**，Codex / opencode 等待接入。
+cc-fleet 在架构上把「驱动一个 coding agent」做成可插拔的 runner —— 编排层工具无关，工具耦合集中在一层。目前实现了 **Claude Code** 与 **Codex CLI**，opencode 等待接入。
 
 ### 设计意图
 
@@ -72,13 +72,15 @@ flowchart TB
     RUNNER --> INTERP[StreamInterpreter<br/>逐工具解析事件]
     RUNNER --> GUARD[GuardrailProvider<br/>逐工具护栏]
     RUNNER -.->|当前实现| CLAUDE[runners/claude.py<br/>ClaudeRunner / ClaudeInterpreter / ClaudeGuardrailProvider]
+    RUNNER -.->|当前实现| CODEX[runners/codex.py<br/>CodexRunner / CodexInterpreter / CodexGuardrailProvider]
 ```
 
 - **`runners/base.py`**：归一接口 —— `AgentRunner`（`run(permission, protocol_text, guardrail, …)`）、`AgentPermission`（READ_ONLY / WRITE，取代 claude 专属的 plan / acceptEdits 字面量）、`AgentRunResult`、`GuardrailProvider` / `GuardrailHandle`。
 - **`runners/engine.py`**：**工具无关**子进程引擎 `run_subprocess`（`start_new_session` 进程组回收、chunk 读 stream 避开 readline 64 KiB 上限）+ `StreamInterpreter` 协议（「一条事件如何抽文本 / session_id / 终态错误 / **工具生命周期**」逐工具实现）。回收不再按墙钟总时长一刀切，而是每 1s 轮询的**三档空闲监控**（`_overrun`：无工具在飞 `idle_sec` / 有工具在飞 `tool_sec` / 绝对上限 `hard_cap_sec`，见 `TimeoutPolicy`），任一触发或收到 `kill_event`（`/kill` 强杀）即 SIGTERM→SIGKILL 杀进程组。「工具在飞」由 `interpreter.tool_activity` 配对 `tool_use`/`tool_result` 判定，从而不误杀大型编译 / 测试。
 - **`runners/claude.py`**：Claude 实现 —— `ClaudeRunner` / `ClaudeInterpreter` / `ClaudeGuardrailProvider`。
-- **`runner_factory.get_runner(tool, config)`**：按 `RepoConfig.agent` 选 runner。
-- **配置层对称**：每个工具一个配置块（`ClaudeConfig`，未来 `CodexConfig` / `OpencodeConfig`，都至少含 `binary`）；工具无关的阶段超时 / 澄清轮次在 `PipelineConfig`。
+- **`runners/codex.py`**：Codex 实现 —— `CodexRunner`（protocol_text 前置进 prompt、`--output-last-message` 权威文本、会话 id 捕获式）/ `CodexInterpreter`（`thread.started` / `item.*` / `turn.completed|failed`；瞬态 `error` 事件不判终态）/ `CodexGuardrailProvider`（护栏走 `--sandbox`，无 settings 文件）。
+- **`runner_factory.get_runner(tool, config)`**：按 `RepoConfig.agent` 选 runner；`SUPPORTED_TOOLS` 是「已接入」的单一事实源，启动校验据此拦未接入工具。
+- **配置层对称**：每个工具一个配置块（`ClaudeConfig` / `CodexConfig` / `OpencodeConfig`，都至少含 `binary`），经 `AppConfig.agent_config(tool)` 统一取用；工具无关的阶段超时 / 澄清轮次在 `PipelineConfig`。
 
 ### tool × mode 正交（加法不是乘法）
 
@@ -98,16 +100,10 @@ flowchart TB
 | 工具 | 状态 | 无头 / 流 | 护栏机制 |
 |---|---|---|---|
 | Claude Code | ✅ 已实现 | `claude -p` / stream-json | PreToolUse hook（settings.json） |
-| Codex | 待接入 | `codex exec` / `--json` | OS sandbox（`--sandbox`） |
-| opencode | 待接入 | `opencode run` / `--format json` | JS 插件 / permission |
+| Codex | ✅ 已实现（local） | `codex exec` / `--json` | OS sandbox（`--sandbox`；**不拦 force-push / 敏感读**，启动 WARN） |
+| opencode | 待接入 | `opencode run` / `--format json` | prompt 软护栏（已拍板不上 JS 插件） |
 
-P1 已把「子进程驱动 + 护栏」工具无关化，但有三处 claude 耦合按「逐工具适配」留到接 codex 时、用真实需求驱动解耦（避免无第二个工具时凭空泛化错方向）：
-
-1. **session-id 模型** —— `session.py:_do_new` 预生成 UUID + DB 列 `claude_session_id`。claude 自建 id，codex / opencode 由工具分配，需改为「捕获式」+ 放宽 `util/ids` 的 sid 正则。
-2. **prompt / 协议措辞** —— `prompts/*.md` 里 `CLAUDE.md` / 「会被外部 hook 拦截」等。协议**结构**（`SLUG` / `STATUS` / `MR_*` / `REVIEW_VERDICT`）本身工具无关，需中性化**措辞**。
-3. **DB / 事件命名** —— `claude_session_id` 列、events 的 `claude.<type>` 前缀。功能上可承载非 claude，命名可选泛化。
-
-> 即：衡量「耦合多深」要看这三处，而非 `ClaudeConfig` 的字段数 —— 后者只是 claude 的工具配置块（对称占位）。
+多工具横切层已落地（session-id「分配 / 捕获」双模 + `agent_tool` 钉行 + prompt 措辞中性化，见 PR #18）；codex 的会话 id 由工具分配、首跑后从 `thread.started` 捕获，续聊走 `codex exec resume <id>`。遗留的命名耦合（`claude_session_id` 列名、events 的 `claude.<type>` 前缀、`claude/{slug}` 分支前缀）**功能上已可承载非 claude 工具**，仅名字未泛化——刻意保留，避免无谓迁移。
 
 ## SQLite schema
 

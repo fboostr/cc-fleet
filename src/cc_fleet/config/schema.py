@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import sys
 from enum import Enum
 from pathlib import Path
 from typing import Literal
@@ -65,8 +66,9 @@ class ClaudeConfig(BaseModel):
 class CodexConfig(BaseModel):
     """Codex CLI 工具的专属配置块（与 ``ClaudeConfig`` 对称）。
 
-    runner 接入前仅是配置插槽：``agent: codex`` 会被 ``validate_runtime``
-    启动期拦下，直到 ``core/runner_factory.py`` 加上对应分支。
+    runner 见 ``core/runners/codex.py``。护栏走 OS sandbox（与 claude 的 PreToolUse
+    钩子不同机制），已知缺口（force-push / 敏感读不拦）在启动期 WARN 点明。
+    需先 ``codex login``（登录态在 codex 自己的配置目录，子进程继承 HOME 自动生效）。
     """
 
     binary: str = "codex"
@@ -472,6 +474,22 @@ class AppConfig(BaseModel):
 
         supported = "、".join(sorted(t.value for t in SUPPORTED_TOOLS))
         errs: list[str] = []
+        # codex 护栏与 claude 有差距（sandbox 只管文件写），启动期一次性 WARN 点明缺口
+        codex_repos = [
+            r.name
+            for r in self.repos
+            if r.agent is AgentTool.CODEX or r.reviewer.tool is AgentTool.CODEX
+        ]
+        if codex_repos:
+            degraded = "" if sys.platform in ("darwin", "linux") else "——退化为无路径隔离，谨慎使用"
+            logger.warning(
+                "repo %s 使用 codex：OS sandbox 只限制文件写入，拦不住 force-push 等网络操作、"
+                "不拦敏感目录读取（缺口由 prompt 纪律条款自律兜底）；sandbox 仅 macOS(Seatbelt) / "
+                "较新 Linux(Landlock) 生效，当前平台 %s%s",
+                "、".join(codex_repos),
+                sys.platform,
+                degraded,
+            )
         for r in self.repos:
             for field_name, tool in (("agent", r.agent), ("reviewer.tool", r.reviewer.tool)):
                 if tool is not None and tool not in SUPPORTED_TOOLS:
