@@ -79,7 +79,9 @@ class CodexConfig(BaseModel):
 class OpencodeConfig(BaseModel):
     """opencode 工具的专属配置块（与 ``ClaudeConfig`` 对称）。
 
-    runner 接入前仅是配置插槽，同 ``CodexConfig``。
+    runner 见 ``core/runners/opencode.py``。护栏为**纯 prompt 软防护**（无 JS 插件 /
+    无机械拦截——已拍板的取舍），启动期 WARN 点明；仅建议内部信任环境使用。
+    需先配置 provider 凭据（``opencode auth login`` 或对应环境变量）。
     """
 
     binary: str = "opencode"
@@ -489,6 +491,19 @@ class AppConfig(BaseModel):
                 "、".join(codex_repos),
                 sys.platform,
                 degraded,
+            )
+        # opencode 是三工具里护栏最弱的：写档零机械拦截（纯 prompt 自律），必须显式提醒
+        opencode_repos = [
+            r.name
+            for r in self.repos
+            if r.agent is AgentTool.OPENCODE or r.reviewer.tool is AgentTool.OPENCODE
+        ]
+        if opencode_repos:
+            logger.warning(
+                "repo %s 使用 opencode：写阶段**无任何机械护栏**（越界写 / force-push / "
+                "敏感路径均仅靠 prompt 纪律自律，无沙箱、无钩子），是当前支持工具里护栏最弱的；"
+                "请仅在内部信任环境使用",
+                "、".join(opencode_repos),
             )
         for r in self.repos:
             for field_name, tool in (("agent", r.agent), ("reviewer.tool", r.reviewer.tool)):

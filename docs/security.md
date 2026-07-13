@@ -6,7 +6,7 @@
 
 ## 当前姿态
 
-cc-fleet 主控让一个 LLM agent（Claude Code 或 Codex CLI，按 repo 的 `agent` 配置）跑在你本机上，可以执行 shell、写文件、操作 git。这本身就是一个高权限场景。防御层**按工具不同**（原则：每工具尽力而为 + 显式标注差距）：
+cc-fleet 主控让一个 LLM agent（Claude Code / Codex CLI / opencode，按 repo 的 `agent` 配置）跑在你本机上，可以执行 shell、写文件、操作 git。这本身就是一个高权限场景。防御层**按工具不同**（原则：每工具尽力而为 + 显式标注差距）：
 
 **Claude Code —— PreToolUse hook**：
 
@@ -22,6 +22,8 @@ cc-fleet 主控让一个 LLM agent（Claude Code 或 Codex CLI，按 repo 的 `a
 - 非 macOS / 无 Landlock 的 Linux 上退化为**无路径隔离**
 
 以上缺口在启动期由 `validate_runtime` 发 WARN 点明；`agent: codex` 请只在内部信任环境使用。
+
+**opencode —— 纯 prompt 软防护（三工具最弱）**：只读阶段用内置 `plan` agent 限权；写阶段 `--agent build --auto` 下**没有任何机械护栏**——越界写、force-push、敏感路径读写全部只靠注入 prompt 的纪律条款自律（已拍板不上 JS 插件的取舍）。启动期 WARN 点明；`agent: opencode` 仅建议内部信任环境使用。
 
 ## 能拦什么
 

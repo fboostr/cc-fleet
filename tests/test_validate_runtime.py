@@ -91,8 +91,17 @@ def test_remote_missing_shell_dir_fails(tmp_path: Path):
     assert len(errs) == 1 and "不存在" in errs[0]
 
 
-def test_agent_without_runner_fails(tmp_path: Path):
-    """agent 引用枚举已有、runner 未接入的工具（opencode）→ 启动期报错，而非运行到工厂才炸。"""
+def test_agent_without_runner_fails(tmp_path: Path, monkeypatch):
+    """agent 引用枚举已有、runner 未接入的工具 → 启动期报错，而非运行到工厂才炸。
+
+    三个枚举工具的 runner 均已接入，用收缩后的 SUPPORTED_TOOLS 模拟「未接入」场景，
+    保住这条校验路径的回归覆盖。"""
+    from cc_fleet.core import runner_factory
+    from cc_fleet.config.schema import AgentTool
+
+    monkeypatch.setattr(
+        runner_factory, "SUPPORTED_TOOLS", frozenset({AgentTool.CLAUDE})
+    )
     repo = tmp_path / "r"
     repo.mkdir()
     (repo / ".git").mkdir()
@@ -116,8 +125,28 @@ def test_agent_codex_passes_with_warning(tmp_path: Path, caplog):
     assert any("force-push" in r.message for r in caplog.records)
 
 
-def test_reviewer_tool_without_runner_fails(tmp_path: Path):
-    """reviewer.tool 同样受「runner 已接入」校验。"""
+def test_agent_opencode_passes_with_weakest_guard_warning(tmp_path: Path, caplog):
+    """opencode runner 已接入：配置通过校验（零 error），但 WARN 点明「写档零机械护栏」。"""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    cfg = _make_cfg(tmp_path, [RepoConfig(name="x", path=repo, agent="opencode")])
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="cc_fleet.config.schema"):
+        errs = cfg.validate_runtime()
+    assert errs == []
+    assert any("无任何机械护栏" in r.message for r in caplog.records)
+
+
+def test_reviewer_tool_without_runner_fails(tmp_path: Path, monkeypatch):
+    """reviewer.tool 同样受「runner 已接入」校验（收缩 SUPPORTED_TOOLS 模拟未接入）。"""
+    from cc_fleet.core import runner_factory
+    from cc_fleet.config.schema import AgentTool
+
+    monkeypatch.setattr(
+        runner_factory, "SUPPORTED_TOOLS", frozenset({AgentTool.CLAUDE})
+    )
     repo = tmp_path / "r"
     repo.mkdir()
     (repo / ".git").mkdir()

@@ -17,6 +17,7 @@ from cc_fleet.config.schema import (
 from cc_fleet.core.runner_factory import SUPPORTED_TOOLS, get_runner
 from cc_fleet.core.runners.claude import ClaudeRunner
 from cc_fleet.core.runners.codex import CodexRunner
+from cc_fleet.core.runners.opencode import OpencodeRunner
 
 
 def _cfg(tmp_path: Path, *, binary: str = "claude") -> AppConfig:
@@ -53,12 +54,16 @@ def test_get_runner_codex_returns_codex_runner(tmp_path: Path):
     assert runner._binary == "/custom/codex"
 
 
-def test_get_runner_enum_without_runner_raises(tmp_path: Path):
-    """枚举已有但 runner 未接入的工具（opencode）走 ValueError 兜底。"""
-    with pytest.raises(ValueError, match="unsupported"):
-        get_runner(AgentTool.OPENCODE, _cfg(tmp_path))
+def test_get_runner_opencode_returns_opencode_runner(tmp_path: Path):
+    cfg = _cfg(tmp_path)
+    cfg.opencode.binary = "/custom/opencode"
+    runner = get_runner(AgentTool.OPENCODE, cfg)
+    assert isinstance(runner, OpencodeRunner)
+    assert runner._binary == "/custom/opencode"
 
 
-def test_supported_tools_claude_and_codex():
+def test_supported_tools_all_three():
     """SUPPORTED_TOOLS 是「runner 已接入」的单一事实源；接入新工具时同步更新此断言。"""
-    assert SUPPORTED_TOOLS == frozenset({AgentTool.CLAUDE, AgentTool.CODEX})
+    assert SUPPORTED_TOOLS == frozenset(
+        {AgentTool.CLAUDE, AgentTool.CODEX, AgentTool.OPENCODE}
+    )
