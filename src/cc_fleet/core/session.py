@@ -1446,16 +1446,23 @@ class Session:
         RESUMABLE_TERMINAL（FAILED/TIMEOUT/COMPLETED）可被 ``apply_followup`` 引用
         回复唤醒回 WORKING，是合法转换——这里**不**对它们设防。
         """
-        await self._refresh_row()
-        current = SessionState(self.row["state"])
-        if current == SessionState.CANCELLED and state != SessionState.CANCELLED:
-            logger.info(
-                "session %s 已 CANCELLED，忽略 _set_state(%s)（/cancel 抢占了状态机推进）",
+        if state == SessionState.CANCELLED:
+            await self._update(state=state.value, **extra)
+        else:
+            updated = await self.db.update_session_unless_state(
                 self.slug,
-                state.value,
+                SessionState.CANCELLED.value,
+                state=state.value,
+                **extra,
             )
-            return
-        await self._update(state=state.value, **extra)
+            await self._refresh_row()
+            if not updated:
+                logger.info(
+                    "session %s 已 CANCELLED，原子拒绝 _set_state(%s)",
+                    self.slug,
+                    state.value,
+                )
+                return
         await self.db.add_event(self.slug, "state", {"to": state.value, **extra})
         # 可读日志里补一条阶段流转标题——这是 stream.jsonl 结构上没有的主控侧信息。
         self._session_log().write_phase(state.value.upper())
@@ -1493,11 +1500,19 @@ class Session:
                 )
                 return
         chatid = self.row.get("chatid") or ""
-        await self.db.add_message(self.slug, "out", text)
+        message_id = await self.db.add_message(
+            self.slug, "out", text, delivery_status="pending"
+        )
         # 把发给用户的通知（含 ❌ 失败原因、超时、plan 就绪、澄清等）也缝进可读日志——
         # 这正是「为什么被主控判失败」这半信息，stream.jsonl 里没有。
         self._session_log().write_note(text)
-        await self.reply(chatid, text)
+        try:
+            await self.reply(chatid, text)
+        except Exception:
+            await self.db.update_message_delivery(message_id, "failed")
+            raise
+        else:
+            await self.db.update_message_delivery(message_id, "sent")
 
     async def _notify_clarification(
         self, questions: list[str], plan_path: Path | None = None

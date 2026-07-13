@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import sys
+
 import pytest
 
 from cc_fleet.core import mr as mr_module
@@ -190,7 +193,7 @@ async def test_create_pr_via_api_missing_token_raises(monkeypatch):
 
 
 def _fake_run_factory(remote_url: str, push_rc: int = 0):
-    async def _fake_run(cmd, cwd):
+    async def _fake_run(cmd, cwd, **kwargs):
         if cmd[:3] == ["git", "remote", "get-url"]:
             return 0, remote_url + "\n", ""
         if cmd[:2] == ["git", "push"]:
@@ -228,7 +231,7 @@ async def test_create_pr_via_api_success(monkeypatch):
 def _fake_run_multi(urls: dict, push_rc: int = 0):
     """按 remote 名返回不同 URL（跨 fork 测试用：origin=fork、base_remote=上游）。"""
 
-    async def _fake_run(cmd, cwd):
+    async def _fake_run(cmd, cwd, **kwargs):
         if cmd[:3] == ["git", "remote", "get-url"]:
             return 0, urls[cmd[3]] + "\n", ""
         if cmd[:2] == ["git", "push"]:
@@ -236,6 +239,23 @@ def _fake_run_multi(urls: dict, push_rc: int = 0):
         return 0, "", ""
 
     return _fake_run
+
+
+async def test_run_timeout_kills_child_process(tmp_path):
+    """MR 命令超时后必须杀掉子进程，不能让后台 push 继续完成。"""
+    marker = tmp_path / "child-survived"
+    cmd = [
+        sys.executable,
+        "-c",
+        (
+            "import time,pathlib; time.sleep(0.3); "
+            f"pathlib.Path({str(marker)!r}).write_text('x')"
+        ),
+    ]
+    with pytest.raises(asyncio.TimeoutError):
+        await mr_module._run(cmd, tmp_path, timeout_sec=0.05)
+    await asyncio.sleep(0.4)
+    assert not marker.exists()
 
 
 async def test_create_pr_via_api_cross_fork(monkeypatch):

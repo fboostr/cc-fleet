@@ -3,7 +3,7 @@
 不走真实 claude / git：用 FakeRunner 注入脚本化输出。覆盖：
 - 首轮 --session-id、次轮 --resume；READ_ONLY 权限（只读讨论）
 - 输出分段回发、每段带 tag；空输出兜底文案；失败 → FAILED（不落 sid）
-- 有 repo 在仓库主目录只读运行（不建 worktree）；无 repo 回退 cwd + 警告
+- 有 repo 在共享只读 worktree 运行；无 repo 回退 cwd + 警告
 - apply_user_message 在 CHATTING 时拒绝；cancel 吸收后续状态写入
 - SessionManager：建 chat row、continue 分流续聊、chat 不占 pipeline 槽、cancel
 """
@@ -196,7 +196,7 @@ async def test_local_chat_fork_uses_base_remote(db, tmp_path, reply, stub_worktr
 
 
 async def test_local_chat_reuses_and_syncs_existing_worktree(db, tmp_path, reply, stub_worktree):
-    """已存在共享只读 worktree 且无其他活跃 chat → 同步到最新（不重建）。"""
+    """已存在共享只读 worktree时同步到最新（不重建）。"""
     cfg = _cfg(tmp_path)
     repo = cfg.repos[0]
     wt = repo.path.with_name(repo.path.name + "-worktrees") / "_chat"
@@ -207,6 +207,27 @@ async def test_local_chat_reuses_and_syncs_existing_worktree(db, tmp_path, reply
     await chat.run_turn()
     # 复用现有目录 → 走 sync（而非 create）
     assert stub_worktree[0] == ("sync", str(wt), f"{repo.base_remote}/{repo.default_branch}")
+
+
+async def test_new_chat_syncs_even_when_old_chat_is_awaiting(
+    db, tmp_path, reply, stub_worktree
+):
+    """长期 awaiting 的旧对话不能让后续新 chat 永久停留在旧提交。"""
+    cfg = _cfg(tmp_path)
+    repo = cfg.repos[0]
+    wt = repo.path.with_name(repo.path.name + "-worktrees") / "_chat"
+    (wt / ".git").mkdir(parents=True)
+
+    old = ChatSession(db=db, config=cfg, reply=reply, repo_cfg=repo)
+    old.runner = _runner("old")
+    await old.create_row(text="旧对话", chatid="c1", userid="u1")
+    await db.update_session(old.slug, state=SessionState.CHAT_AWAITING.value)
+
+    new = ChatSession(db=db, config=cfg, reply=reply, repo_cfg=repo)
+    new.runner = _runner("new")
+    await new.create_row(text="新对话", chatid="c2", userid="u2")
+    await new.run_turn()
+    assert ("sync", str(wt), f"{repo.base_remote}/{repo.default_branch}") in stub_worktree
 
 
 async def test_no_repo_runs_in_fallback_cwd(db, tmp_path, reply, stub_worktree):

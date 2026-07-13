@@ -13,7 +13,7 @@ import logging
 import time
 from aibot import WSClient, WSClientOptions  # type: ignore[import-not-found]
 
-from ..base import BotRunner, OnMessage
+from ..base import BotDeliveryError, BotRunner, OnMessage
 from ..message import IncomingMessage
 
 logger = logging.getLogger(__name__)
@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 _RATE_LIMIT_PER_MIN = 25
 _RATE_WINDOW_SEC = 60
 _MIN_SEND_INTERVAL = 3.5  # 秒
+_SEND_MAX_ATTEMPTS = 3
+_SEND_RETRY_BASE_SEC = 1.0
 
 
 def _extract_quote_text(quote: dict) -> str:
@@ -133,21 +135,36 @@ class WecomBotRunner(BotRunner):
     async def reply(self, chatid: str, text: str) -> None:
         """向指定 chatid 主动发送一条 markdown 消息。"""
         if not chatid:
-            logger.warning("reply 调用缺少 chatid，忽略")
-            return
+            raise BotDeliveryError("reply 调用缺少 chatid")
         async with self._send_lock:
-            elapsed = time.monotonic() - self._last_send_time
-            if elapsed < _MIN_SEND_INTERVAL:
-                await asyncio.sleep(_MIN_SEND_INTERVAL - elapsed)
-            await self._acquire_send_slot(chatid)
-            try:
-                await self._ws.send_message(
-                    chatid,
-                    {"msgtype": "markdown", "markdown": {"content": text}},
-                )
-                self._last_send_time = time.monotonic()
-            except Exception:  # noqa: BLE001
-                logger.exception("发送企微消息失败 chatid=%s", chatid)
+            last_error: Exception | None = None
+            for attempt in range(_SEND_MAX_ATTEMPTS):
+                elapsed = time.monotonic() - self._last_send_time
+                if elapsed < _MIN_SEND_INTERVAL:
+                    await asyncio.sleep(_MIN_SEND_INTERVAL - elapsed)
+                await self._acquire_send_slot(chatid)
+                try:
+                    await self._ws.send_message(
+                        chatid,
+                        {"msgtype": "markdown", "markdown": {"content": text}},
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    logger.warning(
+                        "发送企微消息失败 chatid=%s attempt=%d/%d：%s",
+                        chatid,
+                        attempt + 1,
+                        _SEND_MAX_ATTEMPTS,
+                        exc,
+                    )
+                    if attempt + 1 < _SEND_MAX_ATTEMPTS:
+                        await asyncio.sleep(_SEND_RETRY_BASE_SEC * (2**attempt))
+                else:
+                    self._last_send_time = time.monotonic()
+                    return
+            raise BotDeliveryError(
+                f"企微消息重试 {_SEND_MAX_ATTEMPTS} 次仍失败：{last_error}"
+            ) from last_error
 
     # ---------- 生命周期 ----------
 

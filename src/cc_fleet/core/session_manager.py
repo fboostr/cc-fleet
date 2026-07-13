@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ from ..config.schema import AppConfig, RepoConfig
 from ..storage.db import Database
 from ..util.ids import format_session_tag
 from .chat import _NO_REPO, ChatSession
+from . import repo as repo_module
 from .session import ReplyFunc, Session
 from .state import SessionState, is_open, is_resumable_terminal, is_terminal
 
@@ -54,10 +56,11 @@ class _SessionCtx:
 class _ChatCtx:
     """单 chat 会话的内存上下文：task + 用户回复事件 + 取消标志（结构同 _SessionCtx）。"""
 
-    __slots__ = ("chat", "task", "resume_event", "cancel_requested")
+    __slots__ = ("chat", "task", "resume_event", "cancel_requested", "turn_lock")
 
-    def __init__(self, chat: ChatSession) -> None:
+    def __init__(self, chat: ChatSession, turn_lock: asyncio.Lock | None = None) -> None:
         self.chat = chat
+        self.turn_lock = turn_lock
         self.task: asyncio.Task | None = None
         self.resume_event = asyncio.Event()
         self.cancel_requested = False
@@ -72,6 +75,9 @@ class SessionManager:
         # /chat 独立并发池：与交付流水线的 _slot 完全隔离，避免长对话饿死 plan/dev。
         self._chat_slot = asyncio.Semaphore(config.chat.max_concurrent)
         self._repo_locks: dict[str, asyncio.Lock] = {}
+        # 同一 repo 的 chat 共享一个可被同步的只读 worktree。整轮串行可确保同步时没有
+        # 另一个 agent 正在读取，避免用数据库里的长期 awaiting 状态误判“正在使用”。
+        self._chat_turn_locks: dict[str, asyncio.Lock] = {}
         self._sessions: dict[str, _SessionCtx] = {}
         self._chats: dict[str, _ChatCtx] = {}
         # dispatch 路径上看见的 in-flight 数（已建 row 但尚未进 terminal）；用来算"前面 N 个"。
@@ -82,6 +88,13 @@ class SessionManager:
         if lock is None:
             lock = asyncio.Lock()
             self._repo_locks[repo_name] = lock
+        return lock
+
+    def _chat_turn_lock(self, repo_name: str) -> asyncio.Lock:
+        lock = self._chat_turn_locks.get(repo_name)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._chat_turn_locks[repo_name] = lock
         return lock
 
     def _build(self, repo_cfg: RepoConfig) -> Session:
@@ -303,7 +316,10 @@ class SessionManager:
             ),
         )
         display = await chat.create_row(text=text, chatid=chatid, userid=userid)
-        ctx = _ChatCtx(chat)
+        ctx = _ChatCtx(
+            chat,
+            self._chat_turn_lock(repo_cfg.name) if repo_cfg is not None else None,
+        )
         self._chats[chat.slug] = ctx
         ctx.task = asyncio.create_task(self._chat_loop(ctx), name=f"chat:{chat.slug}")
         return display, note
@@ -356,7 +372,10 @@ class SessionManager:
         await self.db.add_message(internal, "in", text, quote_text=quote_text)
         chat.pending_user_message = text
         await chat._set_state(SessionState.CHATTING)
-        ctx = _ChatCtx(chat)
+        ctx = _ChatCtx(
+            chat,
+            self._chat_turn_lock(repo_cfg.name) if repo_cfg is not None else None,
+        )
         self._chats[internal] = ctx
         ctx.task = asyncio.create_task(
             self._chat_loop(ctx), name=f"chat:{internal}:revive"
@@ -391,7 +410,12 @@ class SessionManager:
                 async with self._chat_slot:
                     if ctx.cancel_requested:
                         break
-                    await ctx.chat.run_turn()  # 首轮内部会 ensure_setup（解析只读运行目录）
+                    if ctx.turn_lock is None:
+                        await ctx.chat.run_turn()
+                    else:
+                        # setup 可能同步共享 worktree，必须与使用该树的整轮 agent 互斥。
+                        async with ctx.turn_lock:
+                            await ctx.chat.run_turn()
                 state = SessionState(ctx.chat.row["state"])
                 if state != SessionState.CHAT_AWAITING:
                     break  # FAILED / CANCELLED → 退出
@@ -716,6 +740,67 @@ class SessionManager:
 
     async def list_sessions(self, *, state: SessionState | None = None) -> list[dict[str, Any]]:
         return await self.db.list_sessions(state.value if state else None)
+
+    async def cleanup_expired_worktrees(self) -> int:
+        """清理超过保留期的 completed/cancelled 本地 worktree，返回成功数量。
+
+        failed/timeout 仍可恢复，remote 路径也不由本地主控删除。认领动作在数据库中原子
+        清空 ``worktree_path``，与 completed follow-up 竞争时只会有一方成功。
+        """
+        cutoff = datetime.now().astimezone() - timedelta(
+            hours=self.config.worktree_retention_hours
+        )
+        cleaned = 0
+        for row in await self.db.list_sessions():
+            if row.get("state") not in {
+                SessionState.COMPLETED.value,
+                SessionState.CANCELLED.value,
+            }:
+                continue
+            raw_path = row.get("worktree_path")
+            if not raw_path:
+                continue
+            repo_cfg = self.config.repo_by_name_or_alias(row.get("repo") or "")
+            if repo_cfg is None or repo_cfg.mode != "local":
+                continue
+            try:
+                updated = datetime.fromisoformat(row["updated_at"])
+                if updated.tzinfo is None:
+                    updated = updated.astimezone()
+            except (KeyError, TypeError, ValueError):
+                logger.warning("session %s updated_at 非法，跳过 worktree 清理", row.get("slug"))
+                continue
+            if updated > cutoff:
+                continue
+
+            worktree = Path(raw_path).expanduser().resolve()
+            expected_root = repo_cfg.path.with_name(
+                repo_cfg.path.name + "-worktrees"
+            ).resolve()
+            if not worktree.is_relative_to(expected_root) or worktree.name == "_chat":
+                logger.error(
+                    "session %s worktree=%s 越出预期根目录 %s，拒绝自动清理",
+                    row["slug"], worktree, expected_root,
+                )
+                continue
+            claimed = await self.db.claim_worktree_cleanup(
+                row["slug"], raw_path, row["updated_at"]
+            )
+            if not claimed:
+                continue
+            try:
+                if worktree.exists():
+                    async with self._repo_lock(repo_cfg.name):
+                        await repo_module.remove_worktree(
+                            repo_cfg.path, worktree, force=True
+                        )
+            except Exception:  # noqa: BLE001
+                await self.db.restore_worktree_after_cleanup(row["slug"], raw_path)
+                logger.exception("session %s 自动清理 worktree 失败", row["slug"])
+                continue
+            cleaned += 1
+            logger.info("session %s 过期 worktree 已清理：%s", row["slug"], worktree)
+        return cleaned
 
     # ---------- 后台 driver ----------
 

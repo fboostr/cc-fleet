@@ -9,6 +9,7 @@ import pytest
 
 from cc_fleet.bot.wecom import runner as runner_mod
 from cc_fleet.bot.wecom.runner import WecomBotRunner, _extract_quote_text
+from cc_fleet.bot.base import BotDeliveryError
 
 
 async def _noop(_m) -> None:
@@ -127,7 +128,7 @@ async def test_dispatch_skips_empty_text():
 
 # ---------- reply ----------
 
-async def test_reply_ignores_empty_chatid():
+async def test_reply_rejects_empty_chatid():
     runner = _runner()
     sent = []
 
@@ -136,7 +137,8 @@ async def test_reply_ignores_empty_chatid():
             sent.append(a)
 
     runner._ws = _WS()  # type: ignore[assignment]
-    await runner.reply("", "hi")
+    with pytest.raises(BotDeliveryError, match="缺少 chatid"):
+        await runner.reply("", "hi")
     assert sent == []
 
 
@@ -158,17 +160,27 @@ async def test_reply_sends_markdown_payload():
     assert payload["markdown"]["content"] == "**hi**"
 
 
-async def test_reply_swallows_send_error(caplog):
+async def test_reply_retries_then_raises_send_error(caplog, monkeypatch):
     runner = _runner()
     runner._last_send_time = time.monotonic() - 100
 
     class _WS:
+        calls = 0
+
         async def send_message(self, *a, **k):
+            self.calls += 1
             raise RuntimeError("net down")
 
-    runner._ws = _WS()  # type: ignore[assignment]
-    with caplog.at_level("ERROR"):
-        await runner.reply("room", "x")  # 不向上抛
+    ws = _WS()
+    runner._ws = ws  # type: ignore[assignment]
+
+    async def no_sleep(_secs):
+        return None
+
+    monkeypatch.setattr(runner_mod.asyncio, "sleep", no_sleep)
+    with caplog.at_level("WARNING"), pytest.raises(BotDeliveryError, match="重试 3 次"):
+        await runner.reply("room", "x")
+    assert ws.calls == 3
     assert any("发送企微消息失败" in r.message for r in caplog.records)
 
 

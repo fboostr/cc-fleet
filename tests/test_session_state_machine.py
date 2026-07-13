@@ -124,6 +124,25 @@ def make_claude_stub(scripted: list[str]) -> Callable:
     return stub
 
 
+async def test_outbound_delivery_failure_is_persisted(db, cfg, repo_cfg):
+    async def failed_reply(_chatid: str, _text: str) -> None:
+        raise RuntimeError("network down")
+
+    s = Session(
+        db=db,
+        config=cfg,
+        repo_cfg=repo_cfg,
+        reply=failed_reply,
+        claude_run=make_claude_stub(["unused"]),
+    )
+    await s.create_row(initial_request="测试投递", chatid="c1", userid="u1")
+    with pytest.raises(RuntimeError, match="network down"):
+        await s._notify("通知")
+    messages = await db.list_messages(s.slug)
+    assert messages[-1]["direction"] == "out"
+    assert messages[-1]["delivery_status"] == "failed"
+
+
 def make_recording_stub(scripted: list[str]) -> tuple[Callable, list[dict]]:
     """同 make_claude_stub，但把每次调用的 kwargs 记进 calls，便于断言注入的 prompt。"""
     calls: list[dict] = []

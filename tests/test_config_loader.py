@@ -9,10 +9,13 @@ import pytest
 
 from cc_fleet.config.loader import load_config
 from cc_fleet.config.schema import (
+    AppConfig,
     ChatConfig,
     HttpConfig,
+    LimitsConfig,
     PipelineConfig,
     PlatformType,
+    ReviewerConfig,
     StageTimeout,
 )
 
@@ -129,6 +132,32 @@ def test_chat_section_defaults_when_absent(tmp_path, monkeypatch):
     assert cfg.chat.default_cwd is None
     assert cfg.chat.max_concurrent == 4
     assert cfg.chat.turn.hard_cap_sec == 3600
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: LimitsConfig(max_concurrent_sessions=0),
+        lambda: ChatConfig(max_concurrent=0),
+        lambda: ChatConfig(auto_continue_window_sec=-1),
+        lambda: PipelineConfig(max_clarify_rounds=-1),
+        lambda: ReviewerConfig(max_rounds=-1),
+    ],
+)
+def test_non_negative_and_positive_runtime_limits_reject_invalid(factory):
+    with pytest.raises(ValueError):
+        factory()
+
+
+def test_app_config_requires_at_least_one_repo(tmp_path):
+    with pytest.raises(ValueError, match="repos"):
+        AppConfig(
+            workspace_root=tmp_path / "ws",
+            log_dir=tmp_path / "logs",
+            db_path=tmp_path / "state.db",
+            wecom={"bot_id": "x", "bot_secret": "y"},
+            repos=[],
+        )
 
 
 # ── 超时结构化：三档约束 / 旧标量等价迁移（方案 C）/ 按仓库覆盖 ──────────

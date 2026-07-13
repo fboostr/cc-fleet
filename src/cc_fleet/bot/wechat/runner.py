@@ -5,7 +5,7 @@
   带回的 context_token，而上层 ``reply(chatid, text)`` 只有 chatid（单聊里等于
   from_user_id），故在本层补齐 token（详见 plan 风险 1：token 有效期需联调确认）
 - 收到消息即 best-effort 发一次 typing「正在输入」
-- 长轮询游标 ``get_updates_buf`` 持久化到文件，避免重启重复/丢消息
+- 长轮询游标 ``get_updates_buf`` 在整批消息处理成功后持久化，避免崩溃丢消息
 - 内置最小节流：全局最小发送间隔 + 每用户 60s 滑动窗口
 """
 
@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 from .ilink_client import IlinkClient, IlinkMessage
-from ..base import BotRunner, OnMessage
+from ..base import BotDeliveryError, BotRunner, OnMessage
 from ..message import IncomingMessage
 from ...util.ids import find_session_tag
 
@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 _RATE_LIMIT_PER_MIN = 20
 _RATE_WINDOW_SEC = 60
 _MIN_SEND_INTERVAL = 1.0  # 秒
+_SEND_MAX_ATTEMPTS = 3
+_SEND_RETRY_BASE_SEC = 1.0
 
 # 单次长轮询异常后的重试退避上限
 _MAX_BACKOFF_SEC = 30.0
@@ -73,10 +75,6 @@ class WechatBotRunner(BotRunner):
         self._send_timestamps: dict[str, list[float]] = {}
         self._last_send_time: float = 0.0
         self._send_lock = asyncio.Lock()
-        # inbound 收到后投入队列，由单独的 worker 顺序消费，避免发送/开 session/typing
-        # 卡住 getupdates 长轮询（详见 run_forever / _worker）。
-        self._inbox: asyncio.Queue[IlinkMessage] = asyncio.Queue()
-        self._worker_task: asyncio.Task | None = None
         self._stop = False
 
     # ---------- 游标持久化 ----------
@@ -208,6 +206,7 @@ class WechatBotRunner(BotRunner):
             await self._on_message(msg)
         except Exception:  # noqa: BLE001
             logger.exception("处理 ilink 消息失败 from=%s", m.from_user_id)
+            raise
 
     async def _maybe_send_typing(self, user_id: str) -> None:
         """best-effort：失败不影响主流程。"""
@@ -243,20 +242,17 @@ class WechatBotRunner(BotRunner):
     async def reply(self, chatid: str, text: str) -> None:
         """向指定用户（chatid==from_user_id）发一条文本消息。
 
-        ilink 回复需带 inbound 的 context_token；找不到则告警跳过（不崩）。
-        发送失败（含 ret!=0 的 IlinkError）只记日志、不向上抛，避免拖垮消费 worker。
+        ilink 回复需带 inbound 的 context_token；找不到时明确报告投递失败。
+        发送失败（含 ret!=0 的 IlinkError）有限重试后向上抛，让存储层记录 failed。
         """
         if not chatid:
-            logger.warning("reply 缺少目标 user_id，忽略")
-            return
+            raise BotDeliveryError("reply 缺少目标 user_id")
         entry = self._context_tokens.get(chatid)
         if not entry:
-            logger.warning(
-                "找不到 user=%s 的 context_token，无法回复"
-                "（进程重启丢失，或从未收到该用户消息）",
-                chatid,
+            raise BotDeliveryError(
+                f"找不到 user={chatid} 的 context_token，无法回复"
+                "（进程重启丢失，或从未收到该用户消息）"
             )
-            return
         token, captured = entry
         age = time.monotonic() - captured
         logger.info(
@@ -268,50 +264,52 @@ class WechatBotRunner(BotRunner):
             if elapsed < _MIN_SEND_INTERVAL:
                 await asyncio.sleep(_MIN_SEND_INTERVAL - elapsed)
             await self._acquire_send_slot(chatid)
-            try:
-                await self._client.send_message(
-                    to_user_id=chatid, context_token=token, text=text
-                )
-                self._last_send_time = time.monotonic()
-                logger.info("reply 发送成功 user=%s", chatid)
-                # 记录出站 session 标签 → 发送时刻，供用户引用该消息时按 create_time_ms 反查还原。
-                tag = find_session_tag(text)
-                if tag:
-                    self._record_outbound_ref(int(time.time() * 1000), tag)
-            except Exception:  # noqa: BLE001
-                # IlinkError 的 __str__ 已含 ret 与响应体；token_age 一并打出便于判断 TTL
-                logger.exception(
-                    "发送 ilink 消息失败 user=%s token_age=%.0fs", chatid, age
-                )
+            last_error: Exception | None = None
+            for attempt in range(_SEND_MAX_ATTEMPTS):
+                try:
+                    await self._client.send_message(
+                        to_user_id=chatid, context_token=token, text=text
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    logger.warning(
+                        "发送 ilink 消息失败 user=%s token_age=%.0fs attempt=%d/%d：%s",
+                        chatid,
+                        age,
+                        attempt + 1,
+                        _SEND_MAX_ATTEMPTS,
+                        exc,
+                    )
+                    if attempt + 1 < _SEND_MAX_ATTEMPTS:
+                        await asyncio.sleep(_SEND_RETRY_BASE_SEC * (2**attempt))
+                else:
+                    self._last_send_time = time.monotonic()
+                    logger.info("reply 发送成功 user=%s", chatid)
+                    # 记录出站 session 标签 → 发送时刻，供用户引用该消息时按 create_time_ms 反查还原。
+                    tag = find_session_tag(text)
+                    if tag:
+                        self._record_outbound_ref(int(time.time() * 1000), tag)
+                    return
+            raise BotDeliveryError(
+                f"个人微信消息重试 {_SEND_MAX_ATTEMPTS} 次仍失败：{last_error}"
+            ) from last_error
 
     # ---------- 生命周期 ----------
 
-    async def _worker(self) -> None:
-        """顺序消费 inbox 里的消息。
-
-        放到独立协程里，使「发送/开 session/typing 耗时」不会阻塞下面 run_forever 的
-        getupdates 长轮询；单 worker 保证处理顺序与收到顺序一致。
-        """
-        while True:
-            m = await self._inbox.get()
-            try:
-                await self._handle(m)
-            finally:
-                self._inbox.task_done()
-
     async def run_forever(self) -> None:
-        logger.info("微信(ilink)机器人启动，开始长轮询")
-        self._worker_task = asyncio.create_task(self._worker())
+        logger.info("微信(ilink)机器人启动，开始长轮询（整批成功后提交游标）")
         backoff = 1.0
         while not self._stop:
             try:
                 msgs, new_buf = await self._client.get_updates(self._cursor)
-                backoff = 1.0
+                # 先顺序处理完整批次，再推进游标。处理中崩溃时重启会重取本批消息
+                #（at-least-once），不会因“游标已落盘、内存队列未消费”而永久丢消息。
                 for m in msgs:
-                    self._inbox.put_nowait(m)  # 入队不阻塞，立刻回到收消息
+                    await self._handle(m)
                 if new_buf != self._cursor:
                     self._cursor = new_buf
                     self._persist_cursor()
+                backoff = 1.0
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
@@ -322,10 +320,4 @@ class WechatBotRunner(BotRunner):
     async def shutdown(self) -> None:
         logger.info("微信(ilink)机器人停止")
         self._stop = True
-        if self._worker_task is not None:
-            self._worker_task.cancel()
-            try:
-                await self._worker_task
-            except asyncio.CancelledError:
-                pass
         await self._client.close()

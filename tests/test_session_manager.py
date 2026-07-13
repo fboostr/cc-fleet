@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
@@ -50,6 +51,47 @@ async def _wait_state(db: Database, slug: str, target: SessionState, timeout: fl
             return
         await asyncio.sleep(0.01)
     raise AssertionError(f"session {slug} 未在 {timeout}s 内进入 {target}")
+
+
+async def test_cleanup_only_removes_expired_completed_or_cancelled_local_worktrees(
+    db, cfg, reply, monkeypatch
+):
+    cfg.worktree_retention_hours = 1
+    repo = cfg.repos[0]
+    root = repo.path.with_name(repo.path.name + "-worktrees")
+    old_wt = root / "old-completed"
+    failed_wt = root / "old-failed"
+    old_wt.mkdir(parents=True)
+    failed_wt.mkdir(parents=True)
+    old = (datetime.now().astimezone() - timedelta(hours=2)).isoformat()
+    base = {
+        "display_slug": None,
+        "repo": repo.name,
+        "default_branch": "main",
+        "initial_request": "x",
+        "chatid": "c",
+        "userid": "u",
+        "created_at": old,
+        "updated_at": old,
+    }
+    await db.insert_session(
+        {**base, "slug": "old-completed", "state": "completed", "worktree_path": str(old_wt)}
+    )
+    await db.insert_session(
+        {**base, "slug": "old-failed", "state": "failed", "worktree_path": str(failed_wt)}
+    )
+    removed: list[Path] = []
+
+    async def fake_remove(_root: Path, path: Path, force: bool = False):
+        assert force is True
+        removed.append(path)
+
+    monkeypatch.setattr(repo_module, "remove_worktree", fake_remove)
+    mgr = SessionManager(db, cfg, reply)
+    assert await mgr.cleanup_expired_worktrees() == 1
+    assert removed == [old_wt.resolve()]
+    assert (await db.get_session("old-completed"))["worktree_path"] is None
+    assert (await db.get_session("old-failed"))["worktree_path"] == str(failed_wt)
 
 
 @pytest.fixture

@@ -89,6 +89,51 @@ class Database:
         )
         await self.conn.commit()
 
+    async def update_session_unless_state(
+        self, slug: str, excluded_state: str, **fields: Any
+    ) -> bool:
+        """仅当当前状态不是 ``excluded_state`` 时原子更新，返回是否命中。
+
+        用于状态机的 CANCELLED 吸收语义。不能用“先 SELECT、再 UPDATE”实现，否则取消
+        恰好发生在两条语句之间时，后续阶段仍会把 CANCELLED 覆盖掉。
+        """
+        if not fields:
+            return False
+        fields["updated_at"] = _now()
+        set_clause = ", ".join(f"{k} = ?" for k in fields)
+        cur = await self.conn.execute(
+            f"UPDATE sessions SET {set_clause} WHERE slug = ? AND state != ?",
+            (*fields.values(), slug, excluded_state),
+        )
+        await self.conn.commit()
+        return cur.rowcount == 1
+
+    async def claim_worktree_cleanup(
+        self, slug: str, worktree_path: str, updated_at: str
+    ) -> bool:
+        """原子认领过期终态 worktree，把行内路径置空，避免与 follow-up 恢复竞态。
+
+        故意不刷新 ``updated_at``：清理失败恢复路径后，下一轮清理仍可立即重试。
+        """
+        cur = await self.conn.execute(
+            "UPDATE sessions SET worktree_path = NULL"
+            " WHERE slug = ? AND worktree_path = ? AND updated_at = ?"
+            " AND state IN ('completed', 'cancelled')",
+            (slug, worktree_path, updated_at),
+        )
+        await self.conn.commit()
+        return cur.rowcount == 1
+
+    async def restore_worktree_after_cleanup(self, slug: str, worktree_path: str) -> None:
+        """清理命令失败时恢复刚认领的路径；若状态已变化则不覆盖。"""
+        await self.conn.execute(
+            "UPDATE sessions SET worktree_path = ?"
+            " WHERE slug = ? AND worktree_path IS NULL"
+            " AND state IN ('completed', 'cancelled')",
+            (worktree_path, slug),
+        )
+        await self.conn.commit()
+
     async def get_session(self, slug: str) -> dict[str, Any] | None:
         cur = await self.conn.execute("SELECT * FROM sessions WHERE slug = ?", (slug,))
         row = await cur.fetchone()
@@ -162,22 +207,6 @@ class Database:
         row = await cur.fetchone()
         return dict(row) if row else None
 
-    async def has_other_active_chat(self, repo: str, exclude_slug: str) -> bool:
-        """该 repo 是否还有**另一条**活跃 chat（chatting / chat_awaiting）。
-
-        用于共享只读 chat worktree 的并发同步决策：有则跳过 re-sync（复用当前树），避免
-        `checkout --detach` 在别的 chat 正读文件时抽换工作树。字面量 'chatting' /
-        'chat_awaiting' 对应 ``SessionState.CHATTING/CHAT_AWAITING``。
-        """
-        cur = await self.conn.execute(
-            "SELECT 1 FROM sessions"
-            " WHERE repo = ? AND session_kind = 'chat'"
-            "   AND state IN ('chatting', 'chat_awaiting')"
-            "   AND slug != ? LIMIT 1",
-            (repo, exclude_slug),
-        )
-        return await cur.fetchone() is not None
-
     # ---------- messages ----------
 
     async def add_message(
@@ -186,11 +215,22 @@ class Database:
         direction: str,
         text: str,
         quote_text: str | None = None,
-    ) -> None:
+        delivery_status: str | None = None,
+    ) -> int:
+        cur = await self.conn.execute(
+            "INSERT INTO messages(session_slug, direction, text, quote_text, ts, delivery_status)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (session_slug, direction, text, quote_text, _now(), delivery_status),
+        )
+        await self.conn.commit()
+        return int(cur.lastrowid)
+
+    async def update_message_delivery(self, message_id: int, status: str) -> None:
+        if status not in {"pending", "sent", "failed"}:
+            raise ValueError(f"非法消息投递状态：{status}")
         await self.conn.execute(
-            "INSERT INTO messages(session_slug, direction, text, quote_text, ts)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (session_slug, direction, text, quote_text, _now()),
+            "UPDATE messages SET delivery_status = ? WHERE id = ? AND direction = 'out'",
+            (status, message_id),
         )
         await self.conn.commit()
 

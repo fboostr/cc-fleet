@@ -161,8 +161,9 @@ limits:
   max_concurrent_sessions: 4
 
 # ── /chat 只读讨论通道（独立于交付流水线）───────────────────
-# `/chat <消息>`（或 `@<repo> /chat`）开一条与 claude 的多轮**只读讨论**：直接在仓库主目录
-# 只读运行（读代码 / 理清需求，不建 worktree、不改代码），引用机器人回复即续聊；聊清楚后
+# `/chat <消息>`（或 `@<repo> /chat`）开一条与 agent 的多轮**只读讨论**：绑定仓库时在
+# `<repo>-worktrees/_chat` 共享只读 worktree 运行，不改代码也不触碰主工作树；同仓库轮次串行，
+# 确保新对话同步到最新 base 时没有其它 agent 正在读取。引用机器人回复即续聊；聊清楚后
 # 引用该对话消息发 /dev 才转成正式开发。单仓库时自动绑定唯一仓库；多仓库省略 @repo 时回退到
 # default_cwd（不配则用户 home）并给出警告。整段可省略，全部字段都有默认值。
 chat:
@@ -186,5 +187,6 @@ http:
   bind: 127.0.0.1
   port: 8787
 
-# 终态 worktree 自动清理（小时）
+# completed/cancelled 本地 worktree 自动清理保留期（小时）。启动时及之后每小时检查；
+# failed/timeout 仍可恢复，不清理；remote worktree 不由本地主控删除。0 表示终态后尽快清理。
 worktree_retention_hours: 168       # 7 天
