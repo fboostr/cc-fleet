@@ -61,6 +61,7 @@ import asyncio
 import importlib.resources as resources
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -90,6 +91,32 @@ from .slug import parse_plan_output, resolve_slug_conflict, strip_plan_protocol_
 from .state import SessionState, is_resumable_terminal
 
 logger = logging.getLogger(__name__)
+
+# dev「有 commit 但未声明完成（未输出 STATUS: READY）」时挂起复用 AWAITING_USER_CLARIFICATION，
+# 用 clarify_phase 的这个专用字面量与 plan/dev 澄清（"planning"/"developing"）区分——避免与
+# 澄清回路的注入 prompt / 恢复路由混淆。存 DB 的 clarify_phase 是裸 TEXT 列，无需迁移。
+DEV_CONFIRM_PHASE = "dev_confirm"
+
+# dev-confirm 挂起后用户回复的意图匹配：命中「完成」类前缀 → 强制建 MR；否则一律「继续」。
+# 保守偏向「继续」：误判「完成」为「继续」只多跑一轮（无损）；误判「继续」为「完成」会把
+# 半成品 ship（有害）。含任一「继续/未完成」标记即立刻判「继续」，不看前缀。
+_DEV_COMPLETE_PREFIXES = (
+    "完成", "已完成", "做完", "搞定", "建mr", "提mr", "建pr", "提pr",
+    "直接提", "直接建", "就这样", "可以了", "done", "ship", "lgtm",
+)
+_DEV_CONTINUE_MARKERS = (
+    "还没", "没完成", "未完成", "没做完", "先别", "别急", "不要", "不用",
+    "继续", "接着", "还差", "还有", "补一下", "再改", "等等",
+)
+
+
+def _is_affirmative_complete(text: str) -> bool:
+    """判断 dev-confirm 挂起后的用户回复是否为「确认完成、直接建 MR」意图（保守偏向继续）。"""
+    t = text.strip().lower()
+    if any(marker in t for marker in _DEV_CONTINUE_MARKERS):
+        return False
+    norm = re.sub(r"[\s，,。.!！、：:；;]+", "", t)
+    return norm.startswith(_DEV_COMPLETE_PREFIXES)
 
 ReplyFunc = Callable[[str, str], Awaitable[None]]
 ClaudeRunFunc = Callable[..., Awaitable[ClaudeRunResult]]
@@ -177,6 +204,13 @@ class Session:
         # 供 _do_developing 顶部把注入 prompt 的措辞从「追加反馈」调成「回答上一轮的待确认问题」。
         # 仅内存、一次性消费：同一 Session 对象在 awaiting park 期间存活，跨进程重启本就无法唤醒 awaiting。
         self._resuming_dev_clarification: bool = False
+        # dev 完成正向信号回路（clarify_phase=dev_confirm）：dev 一轮「有 commit 但未声明
+        # STATUS: READY」时挂起等用户；用户回「完成」→ 置 _dev_confirmed 强制完成（绕过再跑
+        # agent），回「继续」→ 置 _resuming_dev_confirm 重跑 dev 并注入「上一轮未声明完成」措辞。
+        # 均一次性消费；_dev_confirmed 由 _do_developing 完成判定处读后即清，另在 apply_followup
+        # 起点重置，防「强制完成→MR_SUBMITTING（未过 dev）」后残留 True 泄漏到未来的 followup dev 轮。
+        self._dev_confirmed: bool = False
+        self._resuming_dev_confirm: bool = False
 
     # ---------- 公开入口 ----------
 
@@ -289,7 +323,22 @@ class Session:
             return False
         await self.db.add_message(self.slug, "in", text, quote_text=quote_text)
         self.pending_user_message = text
-        if self.row.get("clarify_phase") == SessionState.DEVELOPING.value:
+        phase = self.row.get("clarify_phase")
+        if phase == DEV_CONFIRM_PHASE:
+            # dev「疑似未完成」挂起的恢复路由：区分「完成」（强制建 MR，绕过再跑 agent）
+            # 与「继续」（重跑 dev）。意图判定见 _is_affirmative_complete（保守偏向「继续」）。
+            if _is_affirmative_complete(text):
+                self._dev_confirmed = True
+                target = (
+                    SessionState.CODE_REVIEWING
+                    if self._code_review_enabled()
+                    else SessionState.MR_SUBMITTING
+                )
+            else:
+                self._resuming_dev_confirm = True
+                target = SessionState.DEVELOPING
+            await self._set_state(target)
+        elif phase == SessionState.DEVELOPING.value:
             self._resuming_dev_clarification = True
             await self._set_state(SessionState.DEVELOPING)
         else:
@@ -311,6 +360,10 @@ class Session:
         收到 False 后通过 ``_last_followup_notice`` 拿到给用户的中文提示再回包。
         """
         self._last_followup_notice = None
+        # 防「强制完成」残留：dev-confirm 走 MR_SUBMITTING（未经 dev 消费 _dev_confirmed）
+        # 完成后，若用户再引用回复唤醒回 DEVELOPING，本轮 dev 必须重新要求 STATUS: READY。
+        self._dev_confirmed = False
+        self._resuming_dev_confirm = False
         await self._refresh_row()
         state = SessionState(self.row["state"])
         if not is_resumable_terminal(state):
@@ -567,6 +620,31 @@ class Session:
             )
         return f"dev 阶段结束但 {where} 无新 commit。"
 
+    async def _safe_head_sha(self, worktree: Path, remote_worktree: str | None) -> str | None:
+        """取 worktree 当前 HEAD sha（remote 经 SSH）。**仅诊断用**，任何异常都降级为 None，
+        绝不 fail session——与 has_commits_ahead[_remote]「失败即判 dev 失败」的 ground-truth
+        闸门刻意不同：那个是完成判定依据，这个只是 PARK 通知里的「本轮有无新增提交」文案。"""
+        try:
+            if remote_worktree is not None:
+                return await repo_module.head_sha_remote(
+                    self.repo_cfg.remote_ssh_alias or "", remote_worktree
+                )
+            return await repo_module.head_sha(worktree)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "session %s 取 HEAD sha 失败（本轮提交增量降级为未知）：%s", self.slug, e
+            )
+            return None
+
+    async def _made_commit_this_turn(
+        self, pre_head: str | None, worktree: Path, remote_worktree: str | None
+    ) -> bool | None:
+        """本轮是否新增了 commit：对比 run 前后的 HEAD sha。任一未知（取失败）→ 返回 None。"""
+        post_head = await self._safe_head_sha(worktree, remote_worktree)
+        if pre_head is None or post_head is None:
+            return None
+        return pre_head != post_head
+
     async def _do_developing(self) -> None:
         worktree = Path(self.row["worktree_path"])
         guardrail = self.runner.guardrail.prepare(settings_dir=self._session_dir() / ".cc-fleet")
@@ -578,6 +656,9 @@ class Session:
         # dev 澄清回路标志一次性消费（无论下面走哪个分支都复位，避免泄漏到后续 dev 轮）
         resuming_dev_clarification = self._resuming_dev_clarification
         self._resuming_dev_clarification = False
+        # dev-confirm 回路标志一次性消费（用户对「疑似未完成」挂起回「继续」时置）
+        resuming_dev_confirm = self._resuming_dev_confirm
+        self._resuming_dev_confirm = False
         if self._pending_revision_feedback is not None:
             # 从 CODE_REVIEWING 回来：把 Reviewer 代码审查意见作为修订指令注入。
             # approved 由配对标志 _pending_revision_was_approved 决定 prompt 语气；同时消费并清零。
@@ -594,6 +675,16 @@ class Session:
                 "请据此继续开发；其它规则见已注入的 system prompt。\n"
                 "若仍需用户决策，按 dev 协议输出 STATUS: NEED_CLARIFICATION + QUESTIONS。"
             )
+        elif followup and resuming_dev_confirm:
+            # dev-confirm 回路：上一轮 dev「有 commit 但未声明完成」被挂起，用户回「继续」。
+            # 措辞区别于澄清回路——模型上一轮没提问，而是没声明完成（漏了 STATUS: READY）。
+            prompt = (
+                "你上一轮已提交了部分改动，但**没有声明完成**（未输出 STATUS: READY），"
+                f"疑似还没做完。用户的答复如下：\n{followup}\n\n"
+                "请据此继续开发；确认**全部做完**后，务必在回复末尾按协议输出 "
+                "STATUS: READY 及 MR 元数据。\n"
+                "若仍有必须用户拍板的阻塞，按 dev 协议输出 STATUS: NEED_CLARIFICATION。"
+            )
         elif followup:
             # 引用回复唤醒（failed/timeout/completed → DEVELOPING）时把用户消息注入 prompt
             prompt = (
@@ -606,6 +697,13 @@ class Session:
                 "现在按上一阶段的 plan 完成开发；具体规则见已注入的 system prompt。\n"
                 "若遇阻塞，请在回复中明确说明，并附上原始命令与原始报错。"
             )
+
+        # run 前捕获 HEAD，供「疑似未完成」挂起通知区分「本轮有/无新增提交」（仅诊断文案，
+        # 非完成闸门；取失败降级为「未知」，绝不影响主流程）。
+        remote_worktree_for_head = (
+            self._remote_worktree_path() if self._is_remote() else None
+        )
+        pre_head = await self._safe_head_sha(worktree, remote_worktree_for_head)
 
         result = await self.runner.run(
             prompt=prompt,
@@ -652,10 +750,21 @@ class Session:
             await self._notify_clarification(clarify.questions)
             return
 
-        # dev 阶段两种模式都只到 commit 为止（remote defer-push 后也不再在 dev 内 push/建 MR），
-        # 闸门：确认确有新 commit（local 直接查本地 worktree，remote 经 SSH 查远端 worktree）。
+        # 完成正向信号：dev 真做完必须显式输出 STATUS: READY（复用 parse_plan_output 的
+        # status；用户对「疑似未完成」挂起回「完成」时置的 _dev_confirmed 也视为已声明）。
+        # 缺省即「未声明完成」——把「静默误完成」的旧语义翻转为「显式问一句」。
+        declared_done = clarify.status == "READY" or self._dev_confirmed
+        self._dev_confirmed = False  # 一次性消费（另在 apply_followup 起点重置防泄漏）
+
+        # dev 阶段两种模式都只到 commit 为止（remote defer-push 后也不再在 dev 内 push/建 MR）。
+        # 完成判定矩阵（NEED_CLARIFICATION 已在上方拦截，此处 clarify.status ∈ {READY, None}）：
+        #   ahead=False             → FAIL（无提交可发；声明完成也一样，走同一 dirty-aware 文案）
+        #   ahead=True + 未声明完成 → PARK（疑似未完成，挂起等用户；正是本次修复的 bug 场景）
+        #   ahead=True + 已声明完成 → COMPLETE（local 在此抽 MR 元数据）
+        # 闸门 ahead：确认确有新 commit（local 直接查本地 worktree，remote 经 SSH 查远端）。
         base = f"{self.row['base_remote']}/{self.row['default_branch']}"
-        if self._is_remote():
+        remote = self._is_remote()
+        if remote:
             remote_worktree = self._remote_worktree_path()
             try:
                 ahead = await repo_module.has_commits_ahead_remote(
@@ -664,22 +773,35 @@ class Session:
             except Exception as e:  # noqa: BLE001
                 await self._fail(f"检查远端 worktree 提交状态失败：{e}")
                 return
-            if not ahead:
-                await self._fail(await self._no_commit_fail_reason(remote_worktree, remote=True))
-                return
-            # 远端 MR 元数据由 publish 阶段 claude 产出，主控此处不解析。
+            wt_display = remote_worktree
         else:
-            # 本地模式：claude 应该已经 commit；主控负责 push + 提 MR
             try:
                 ahead = await repo_module.has_commits_ahead(worktree, base)
             except Exception as e:  # noqa: BLE001
                 await self._fail(f"检查 worktree 提交状态失败：{e}")
                 return
-            if not ahead:
-                await self._fail(await self._no_commit_fail_reason(str(worktree), remote=False))
-                return
+            wt_display = str(worktree)
 
-            # 从 claude 输出抽 MR 元数据缓存到 self；MR_SUBMITTING 阶段优先用，
+        if not ahead:
+            await self._fail(await self._no_commit_fail_reason(wt_display, remote=remote))
+            return
+
+        if not declared_done:
+            # 有 commit 但没声明完成 → 疑似没做完，挂起等用户确认（既不判完成也不判失败）。
+            # 复用 AWAITING_USER_CLARIFICATION + clarify_phase=dev_confirm（不占澄清轮数）；
+            # 恢复路由见 apply_clarification 的 dev_confirm 分支。
+            made_progress = await self._made_commit_this_turn(
+                pre_head, worktree, remote_worktree_for_head
+            )
+            await self._set_state(
+                SessionState.AWAITING_USER_CLARIFICATION,
+                clarify_phase=DEV_CONFIRM_PHASE,
+            )
+            await self._notify_dev_confirm(made_progress=made_progress)
+            return
+
+        if not remote:
+            # 本地模式：从 claude 输出抽 MR 元数据缓存到 self；MR_SUBMITTING 阶段优先用，
             # 缺失则在 _mr_title / _mr_description 内走 git log 兜底。
             meta = parse_mr_metadata(result.text_output)
             self._pending_mr_title = meta.title
@@ -692,6 +814,7 @@ class Session:
                     "ok" if meta.title else "missing",
                     "ok" if meta.description else "missing",
                 )
+        # remote 模式：MR 元数据由 publish 阶段 claude 产出，主控此处不解析。
 
         # 两模式统一：commit 完成后，开了审查就先审代码，否则直接进发布
         if self._code_review_enabled():
@@ -1527,6 +1650,26 @@ class Session:
             f"需要进一步确认：\n{bullets}\n\n"
             f"{plan_line}"
             f"请**引用本消息**回复以补充信息。{self._tag()}"
+        )
+        await self._notify(text)
+
+    async def _notify_dev_confirm(self, *, made_progress: bool | None) -> None:
+        """dev「有 commit 但未声明完成」挂起时的通知：点明疑似未完成 + 给「继续/完成」恢复入口。
+
+        与 _notify_clarification 一样走「引用本消息回复」约定，但语义是「未声明完成」而非「有问题
+        要问」。made_progress 仅用于文案（本轮有/无新增提交），非控制流。
+        """
+        branch = self.row.get("branch") or self.row.get("display_slug") or self.slug
+        if made_progress is True:
+            delta = "（本轮有新增提交）"
+        elif made_progress is False:
+            delta = "（本轮无新增提交，改动来自更早的轮次）"
+        else:
+            delta = ""
+        text = (
+            f"本轮结束但未声明完成（未输出 STATUS: READY），疑似还没做完{delta}。\n"
+            f"已提交的改动安全保存在分支 `{branch}`。\n"
+            f"请**引用本消息**回复：『继续』续跑剩余部分 / 『完成』直接建 MR。{self._tag()}"
         )
         await self._notify(text)
 
