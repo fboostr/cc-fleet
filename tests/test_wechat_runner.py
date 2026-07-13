@@ -18,6 +18,7 @@ from cc_fleet.bot.wechat.ilink_client import (
     _parse_message,
 )
 from cc_fleet.bot.wechat.runner import WechatBotRunner
+from cc_fleet.bot.base import BotDeliveryError
 
 
 # ── 测试替身 ────────────────────────────────────────────────
@@ -520,35 +521,46 @@ async def test_reply_uses_stored_context_token(tmp_path):
     assert fake.sent == [("alice", "ctx1", "reply-text")]
 
 
-async def test_reply_without_context_token_is_noop(tmp_path):
+async def test_reply_without_context_token_raises(tmp_path):
     runner = _runner(tmp_path)
     fake = FakeClient()
     runner._client = fake
-    await runner.reply("ghost", "x")  # 没收到过该用户消息
+    with pytest.raises(BotDeliveryError, match="context_token"):
+        await runner.reply("ghost", "x")
     assert fake.sent == []
 
 
-async def test_reply_empty_chatid_is_noop(tmp_path):
+async def test_reply_empty_chatid_raises(tmp_path):
     runner = _runner(tmp_path)
     fake = FakeClient()
     runner._client = fake
-    await runner.reply("", "x")
+    with pytest.raises(BotDeliveryError, match="缺少目标"):
+        await runner.reply("", "x")
     assert fake.sent == []
 
 
-async def test_reply_swallows_send_error(tmp_path, caplog):
-    """send_message 抛 IlinkError（ret!=0）时，reply 不向上抛、只记 error。"""
+async def test_reply_retries_then_raises_send_error(tmp_path, caplog, monkeypatch):
+    """send_message 持续失败时重试三次并向上报告投递失败。"""
     runner = _runner(tmp_path)
     fake = FakeClient()
+
+    calls = 0
 
     async def boom(*, to_user_id, context_token, text):
+        nonlocal calls
+        calls += 1
         raise IlinkError("/ilink/bot/sendmessage", 1, {"ret": 1})
 
     fake.send_message = boom
     runner._client = fake
     await runner._handle(_parse_message(_raw("alice", "ctx1", "hi")))
-    with caplog.at_level("ERROR"):
-        await runner.reply("alice", "boom-text")  # 不应抛
+    async def no_sleep(_secs):
+        return None
+
+    monkeypatch.setattr("cc_fleet.bot.wechat.runner.asyncio.sleep", no_sleep)
+    with caplog.at_level("WARNING"), pytest.raises(BotDeliveryError, match="重试 3 次"):
+        await runner.reply("alice", "boom-text")
+    assert calls == 3
     assert any("发送 ilink 消息失败" in r.message for r in caplog.records)
 
 
@@ -563,7 +575,7 @@ async def test_run_forever_dispatches_in_order_and_persists_cursor(tmp_path):
 
     runner = _runner(tmp_path, on_message=on_msg)
     fake = FakeClient()
-    # 一批两条，验证 worker 顺序消费
+    # 一批两条，验证同步顺序消费
     batch = [_parse_message(_raw("alice", "c", "first")), _parse_message(_raw("alice", "c", "second"))]
     n = {"i": 0}
 
@@ -578,13 +590,33 @@ async def test_run_forever_dispatches_in_order_and_persists_cursor(tmp_path):
     runner._client = fake
 
     await runner.run_forever()
-    # run_forever 入队即返回，需等 worker 把队列消费完
-    await asyncio.wait_for(runner._inbox.join(), timeout=2)
-
     assert got == ["first", "second"]  # 保序
     assert runner._cursor == "buf-after-1"
     assert (tmp_path / "cur.txt").read_text(encoding="utf-8").strip() == "buf-after-1"
-    await runner.shutdown()  # 收尾：取消 worker
+    await runner.shutdown()
+
+
+async def test_run_forever_does_not_advance_cursor_when_batch_fails(tmp_path, monkeypatch):
+    async def on_msg(_m):
+        raise RuntimeError("dispatch failed")
+
+    runner = _runner(tmp_path, on_message=on_msg)
+    fake = FakeClient()
+    batch = [_parse_message(_raw("alice", "c", "first"))]
+
+    async def fake_get_updates(_buf):
+        return batch, "must-not-commit"
+
+    async def stop_after_backoff(_secs):
+        runner._stop = True
+
+    fake.get_updates = fake_get_updates
+    runner._client = fake
+    monkeypatch.setattr("cc_fleet.bot.wechat.runner.asyncio.sleep", stop_after_backoff)
+
+    await runner.run_forever()
+    assert runner._cursor == ""
+    assert not (tmp_path / "cur.txt").exists()
 
 
 def test_cursor_persist_roundtrip(tmp_path):

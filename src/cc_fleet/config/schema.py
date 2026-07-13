@@ -191,7 +191,7 @@ class PipelineConfig(BaseModel):
     plan: StageTimeout = Field(default_factory=_default_stage(300, 900, 3600))
     dev: StageTimeout = Field(default_factory=_default_stage(600, 3600, 28800))
     review: StageTimeout = Field(default_factory=_default_stage(300, 900, 3600))
-    max_clarify_rounds: int = 5
+    max_clarify_rounds: int = Field(default=5, ge=0)
 
     @model_validator(mode="before")
     @classmethod
@@ -223,7 +223,7 @@ class ReviewerConfig(BaseModel):
     """
 
     enabled: bool = False
-    max_rounds: int = 1
+    max_rounds: int = Field(default=1, ge=0)
     # 预留：Reviewer 用与 Coder 不同的 AI 工具 / 大模型（None = 跟随 repo.agent）。
     # P1 仅声明字段、不接线；跨工具审查待后续阶段工具就位后实现。
     tool: AgentTool | None = None
@@ -294,7 +294,7 @@ class RepoConfig(BaseModel):
 
 
 class LimitsConfig(BaseModel):
-    max_concurrent_sessions: int = 4
+    max_concurrent_sessions: int = Field(default=4, gt=0)
 
 
 class HttpConfig(BaseModel):
@@ -329,11 +329,11 @@ class HttpConfig(BaseModel):
 class ChatConfig(BaseModel):
     """`/chat` 自由对话通道的配置（独立于 plan→dev→MR 交付流水线）。
 
-    chat 是只读的需求讨论：绑定了仓库时直接在仓库主目录（``repo.path``）以只读权限跑，
-    不建 worktree、不改代码。
+    chat 是只读的需求讨论：绑定仓库时在每仓库共享的 ``_chat`` worktree 中运行，
+    不改代码也不触碰主工作树；同仓库的 chat 轮次串行，确保同步时没有并发读取。
 
     - default_cwd：`/chat` 未带 `@repo`（且非单仓库自动绑定）时的回退工作目录；为空则
-      回退到用户 home。绑定了仓库时忽略本项，cwd 用仓库主目录。
+      回退到用户 home。绑定了仓库时忽略本项，cwd 使用仓库的共享只读 worktree。
     - max_concurrent：并发 chat 轮次上限。独立于 ``limits.max_concurrent_sessions``，
       chat 常长时间挂着等用户，用独立池避免饿死交付流水线。
     - turn：单轮 claude 子进程的空闲超时策略（``StageTimeout``，三档语义同 pipeline 各阶段）。
@@ -346,9 +346,9 @@ class ChatConfig(BaseModel):
     """
 
     default_cwd: Path | None = None
-    max_concurrent: int = 4
+    max_concurrent: int = Field(default=4, gt=0)
     turn: StageTimeout = Field(default_factory=_default_stage(300, 600, 3600))
-    auto_continue_window_sec: int = 1800
+    auto_continue_window_sec: int = Field(default=1800, ge=0)
 
     @model_validator(mode="before")
     @classmethod
@@ -378,7 +378,7 @@ class AppConfig(BaseModel):
     codex: CodexConfig = Field(default_factory=CodexConfig)
     opencode: OpencodeConfig = Field(default_factory=OpencodeConfig)
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
-    repos: list[RepoConfig]
+    repos: list[RepoConfig] = Field(min_length=1)
 
     # 无命令、无引用、无显式 @repo 的普通消息，默认按哪种模式处理（用于降低新手门槛）：
     # - chat（默认）：进入 /chat 多轮讨论，聊清楚后引用消息发 /dev 转正式开发；更贴合普通用户
@@ -390,7 +390,7 @@ class AppConfig(BaseModel):
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     http: HttpConfig = Field(default_factory=HttpConfig)
     chat: ChatConfig = Field(default_factory=ChatConfig)
-    worktree_retention_hours: int = 168
+    worktree_retention_hours: int = Field(default=168, ge=0)
 
     @model_validator(mode="before")
     @classmethod

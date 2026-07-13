@@ -124,7 +124,7 @@ git push uses SSH by default (load your key into `ssh-agent` on macOS). MR/PR cr
 | `/resume <slug>` | Explicitly revive a "working" orphan session (left after the controller was killed) |
 | `/plan <slug>` | Show the session's current `plan.md` in full |
 | `/repos` | List configured repos with their `aliases` / `keywords` / `mode` |
-| `/chat <msg>` | Start a multi-turn free-form conversation with the agent (writable, isolated in a dedicated worktree); `@<repo> /chat <msg>` binds a repo, omit `@repo` to use a fallback dir (with a warning). See "Free-form chat" below |
+| `/chat <msg>` | Start a read-only multi-turn conversation; `@<repo> /chat <msg>` binds a repo and uses its shared `_chat` worktree, while omitting `@repo` uses a fallback directory with a warning. See "Free-form chat" below |
 | `/dev [notes]` | **Quote** a `/chat` message to turn that discussion into a real delivery task (reuses the chat context, runs the full plan→dev→MR pipeline). See "Hand a chat off to development" below |
 | `/help` | Help text |
 
@@ -140,7 +140,7 @@ You can also override the Reviewer per request: add `[review]` (force on) or `[r
 @my-repo /chat where is the entry point of this project?
 ```
 
-- **Repo-bound + isolated**: `@<repo> /chat` creates a dedicated worktree at `<repo>-worktrees/<slug>` (branch `chat/<slug>`); the agent has full tools, is **writable and can run commands**, but is confined to that worktree by the same PreToolUse guardrails used for development.
+- **Repo-bound + read-only**: `@<repo> /chat` uses `<repo>-worktrees/_chat`, a detached worktree shared by that repo's conversations and synchronized to the latest base branch. Turns for the same repo are serialized so synchronization never races an agent reading the tree. The agent runs with read-only permissions and does not touch the main checkout.
 - **Fallback without `@repo`**: a bare `/chat <msg>` runs in `chat.default_cwd` (or the user's home dir if unset), **without** a worktree, and replies with a warning naming the fallback path. Prefer binding a repo.
 - **Multi-turn**: every reply ends with `[session: <slug>]`; **quote that message** and add text to continue the next turn (same quote-reply mechanism as delivery sessions); context continuity is via `--resume`.
 - **Turn-by-turn**: you send one message, the agent finishes that turn, and the full output is auto-split into ~4000-char chunks.

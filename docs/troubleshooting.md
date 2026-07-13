@@ -136,6 +136,9 @@ ss -ltnp | grep 8787  # macOS 用 lsof -nP -iTCP:8787 -sTCP:LISTEN
 
 claude SDK 事件是全量原文，长 session 可能上百 MB。当前没做轮转，按需手动处理：
 
+`worktree_retention_hours` 只会自动清理过期的 completed/cancelled **本地 worktree**；
+session 日志目录、failed/timeout worktree 与 remote worktree 不会自动删除。
+
 ```bash
 # 看活跃 session 之外的可清理空间
 du -sh $workspace_root/sessions/*/stream.jsonl | sort -h

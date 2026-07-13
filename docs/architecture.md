@@ -144,6 +144,7 @@ flowchart TB
 | `direction` | TEXT | `in` / `out` |
 | `text` | TEXT | 消息正文 |
 | `quote_text` | TEXT | 用户引用的原消息 |
+| `delivery_status` | TEXT NULL | 出站消息 `pending` / `sent` / `failed`；入站为 NULL |
 | `ts` | TEXT | 时间戳 |
 
 ### events

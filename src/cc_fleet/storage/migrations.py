@@ -124,4 +124,9 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE sessions ADD COLUMN agent_tool TEXT;
     """,
+    # 出站消息投递状态：NULL=入站消息；pending/sent/failed=机器人出站消息。
+    # 老数据无法可靠判断真实投递结果，保持 NULL，不伪装成 sent。
+    """
+    ALTER TABLE messages ADD COLUMN delivery_status TEXT;
+    """,
 ]

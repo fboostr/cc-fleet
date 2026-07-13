@@ -20,9 +20,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
+import signal
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -165,14 +167,40 @@ def build_push_cmd(
     ]
 
 
-async def _run(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
+def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
+    """终止 git 及其派生的 ssh 子进程；POSIX 失败时退回直接 kill。"""
+    if proc.returncode is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (AttributeError, OSError, ProcessLookupError):
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+
+
+async def _run(
+    cmd: list[str], cwd: Path, *, timeout_sec: float | None = None
+) -> tuple[int, str, str]:
+    """运行 git 命令；超时或调用协程被取消时保证杀进程组并收尸。"""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=str(cwd),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
-    out_b, err_b = await proc.communicate()
+    try:
+        if timeout_sec is None:
+            out_b, err_b = await proc.communicate()
+        else:
+            out_b, err_b = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout_sec
+            )
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        _kill_process_group(proc)
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        raise
     return (
         proc.returncode or 0,
         out_b.decode("utf-8", errors="replace"),
@@ -204,7 +232,7 @@ async def create_mr_via_push(
     last_err = ""
     for attempt in range(max_attempts):
         try:
-            rc, out, err = await asyncio.wait_for(_run(cmd, worktree), timeout=timeout_sec)
+            rc, out, err = await _run(cmd, worktree, timeout_sec=timeout_sec)
         except asyncio.TimeoutError:
             last_err = f"git push 超时（{timeout_sec}s）"
             logger.warning("MR 第 %d 次尝试超时", attempt + 1)
@@ -367,7 +395,14 @@ async def create_pr_via_api(
     compare_url = github_compare_url(host, pr_owner, pr_repo, target_branch, head)
 
     # 2. 普通 push（**不带任何 push option**；GitHub 不认 GitLab 的 -o merge_request.*）
-    prc, pout, perr = await _run(["git", "push", "-u", remote, source_branch], worktree)
+    try:
+        prc, pout, perr = await _run(
+            ["git", "push", "-u", remote, source_branch],
+            worktree,
+            timeout_sec=timeout_sec,
+        )
+    except asyncio.TimeoutError as e:
+        raise MrCreateError(f"git push 超时（{timeout_sec}s），已终止子进程") from e
     if prc != 0:
         raise MrCreateError(f"git push 失败：{(perr or pout).strip()}")
 

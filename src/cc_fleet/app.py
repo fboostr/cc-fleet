@@ -52,6 +52,14 @@ class App:
         self._bot: BotRunner | None = None
         self._manager: SessionManager | None = None
         self._web: WebServer | None = None
+        self._cleanup_task: asyncio.Task | None = None
+
+    async def _worktree_cleanup_loop(self) -> None:
+        """主进程存活期间每小时清理一次过期终态 worktree。"""
+        assert self._manager is not None
+        while True:
+            await asyncio.sleep(3600)
+            await self._manager.cleanup_expired_worktrees()
 
     async def _on_message(self, msg: IncomingMessage) -> None:
         assert self._manager is not None and self._bot is not None
@@ -221,11 +229,22 @@ class App:
         try:
             self._bot = create_bot(self.config, on_message=self._on_message)
             self._manager = SessionManager(self.db, self.config, self._bot.reply)
+            await self._manager.cleanup_expired_worktrees()
+            self._cleanup_task = asyncio.create_task(
+                self._worktree_cleanup_loop(), name="worktree-cleanup"
+            )
             self._web = WebServer(self.db, self.config.http, self.config.workspace_root)
             await self._web.start()
             logger.info("cc-fleet 启动")
             await self._bot.run_forever()
         finally:
+            if self._cleanup_task is not None:
+                self._cleanup_task.cancel()
+                try:
+                    await self._cleanup_task
+                except asyncio.CancelledError:
+                    pass
+                self._cleanup_task = None
             if self._manager is not None:
                 await self._manager.shutdown()
             if self._bot is not None:

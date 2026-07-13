@@ -62,6 +62,15 @@ async def test_sessions_has_all_altered_columns(tmp_path: Path):
         await db.close()
 
 
+async def test_messages_has_delivery_status_column(tmp_path: Path):
+    db = Database(tmp_path / "state.db")
+    await db.connect()
+    try:
+        assert "delivery_status" in await _columns(db, "messages")
+    finally:
+        await db.close()
+
+
 async def test_origin_chat_slug_unique_index(tmp_path: Path):
     """部分唯一索引 idx_sessions_origin_chat：同一非空 origin_chat_slug 只能有一行。"""
     import sqlite3

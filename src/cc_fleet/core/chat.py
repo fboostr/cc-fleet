@@ -4,10 +4,9 @@
 轻量路径，把 Claude 当成通过微信透出来的多轮对话窗口。cc-fleet 只做 I/O 管道——每收到
 一条用户输入就用 ``--resume`` 起一次性 claude 子进程跑完这一轮，把完整输出分段回发。
 
-chat 定位为**只读的需求讨论**：以 ``READ_ONLY`` 权限直接在仓库主目录里跑，不建 worktree、
-不改代码——聊清楚需求后，用户引用消息发 ``/dev`` 才转成正式开发（handoff → pipeline，
-那时才建 worktree、进入可写的 plan→dev 流水线）。这样普通用户"先聊几轮"的成本被压到最低，
-也避免闲聊阶段误改仓库。
+chat 定位为**只读的需求讨论**：绑定仓库时以 ``READ_ONLY`` 权限在每仓库共享的 ``_chat``
+worktree 中运行，不改代码也不触碰主工作树；未绑定仓库才使用配置的回退目录。聊清楚需求后，
+用户引用消息发 ``/dev`` 才转成正式开发（handoff → pipeline）。
 
 复用现有基础设施，不重复造轮子：
 
@@ -227,11 +226,6 @@ class ChatSession:
             )
             if not (wt_path.exists() and (wt_path / ".git").exists()):
                 await repo_module.create_detached_worktree(repo_path, wt_path, ref)
-            elif await self.db.has_other_active_chat(cfg.name, self.slug):
-                # 有别的活跃 chat 正用共享 worktree → 跳过同步、复用当前树（避免抽换其在读的文件）
-                logger.info(
-                    "chat %s 复用共享只读 worktree（有其他活跃 chat，跳过同步）", self.slug
-                )
             else:
                 await repo_module.sync_detached_worktree(wt_path, ref)
 
@@ -248,23 +242,20 @@ class ChatSession:
         cfg = self._repo_cfg
         assert cfg is not None
         chat_wt = f"{(cfg.remote_worktree_root or '').rstrip('/')}/{CHAT_WORKTREE_NAME}"
-        # 有别的活跃 chat → 跳过远端建/同步（复用前一个刚 provision 的），否则 ssh create-or-sync。
-        if not await self.db.has_other_active_chat(cfg.name, self.slug):
+        async def _provision() -> None:
+            await repo_module.ensure_remote_chat_worktree(
+                cfg.remote_ssh_alias or "",
+                cfg.remote_repo_path or "",
+                chat_wt,
+                cfg.base_remote,
+                cfg.default_branch,
+            )
 
-            async def _provision() -> None:
-                await repo_module.ensure_remote_chat_worktree(
-                    cfg.remote_ssh_alias or "",
-                    cfg.remote_repo_path or "",
-                    chat_wt,
-                    cfg.base_remote,
-                    cfg.default_branch,
-                )
-
-            if self.fetch_lock is not None:
-                async with self.fetch_lock:
-                    await _provision()
-            else:
+        if self.fetch_lock is not None:
+            async with self.fetch_lock:
                 await _provision()
+        else:
+            await _provision()
         self._remote_chat_worktree = chat_wt
         return cfg.path.expanduser()
 
@@ -432,14 +423,23 @@ class ChatSession:
         /cancel 是软取消——不 kill 正在跑的 claude；若不设防，run_turn 末尾的
         ``_set_state(CHAT_AWAITING)`` 会把 CANCELLED 覆盖回去，导致会话被误判为仍 open。
         """
-        await self._refresh_row()
-        current = SessionState(self.row["state"])
-        if current == SessionState.CANCELLED and state != SessionState.CANCELLED:
-            logger.info(
-                "chat %s 已 CANCELLED，忽略 _set_state(%s)", self.slug, state.value
+        if state == SessionState.CANCELLED:
+            await self.db.update_session(self.slug, state=state.value, **extra)
+        else:
+            updated = await self.db.update_session_unless_state(
+                self.slug,
+                SessionState.CANCELLED.value,
+                state=state.value,
+                **extra,
             )
-            return
-        await self.db.update_session(self.slug, state=state.value, **extra)
+            if not updated:
+                await self._refresh_row()
+                logger.info(
+                    "chat %s 已 CANCELLED，原子拒绝 _set_state(%s)",
+                    self.slug,
+                    state.value,
+                )
+                return
         await self.db.add_event(self.slug, "state", {"to": state.value, **extra})
         await self._refresh_row()
 
@@ -451,5 +451,13 @@ class ChatSession:
                 logger.info("chat %s 已 CANCELLED，抑制通知：%s", self.slug, text[:40])
                 return
         chatid = self.row.get("chatid") or ""
-        await self.db.add_message(self.slug, "out", text)
-        await self.reply(chatid, text)
+        message_id = await self.db.add_message(
+            self.slug, "out", text, delivery_status="pending"
+        )
+        try:
+            await self.reply(chatid, text)
+        except Exception:
+            await self.db.update_message_delivery(message_id, "failed")
+            raise
+        else:
+            await self.db.update_message_delivery(message_id, "sent")

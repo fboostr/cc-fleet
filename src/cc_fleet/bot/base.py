@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 OnMessage = Callable[[IncomingMessage], Awaitable[None]]
 
 
+class BotDeliveryError(RuntimeError):
+    """消息在有限重试后仍未投递，调用方必须把它视为失败。"""
+
+
 class BotRunner(ABC):
     """聊天平台 Runner 的最小接口合约。
 
@@ -32,7 +36,7 @@ class BotRunner(ABC):
 
     @abstractmethod
     async def reply(self, chatid: str, text: str) -> None:
-        """向指定 *chatid* 发送一条消息（内容为平台支持的富文本格式）。"""
+        """向指定 *chatid* 发送消息；无法确认投递时抛 ``BotDeliveryError``。"""
         ...
 
     @abstractmethod
