@@ -91,6 +91,31 @@ def test_remote_missing_shell_dir_fails(tmp_path: Path):
     assert len(errs) == 1 and "不存在" in errs[0]
 
 
+def test_agent_without_runner_fails(tmp_path: Path):
+    """agent 引用枚举已有、runner 未接入的工具（codex）→ 启动期报错，而非运行到工厂才炸。"""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    cfg = _make_cfg(tmp_path, [RepoConfig(name="x", path=repo, agent="codex")])
+    errs = cfg.validate_runtime()
+    assert len(errs) == 1
+    assert "codex" in errs[0] and "尚未接入" in errs[0]
+
+
+def test_reviewer_tool_without_runner_fails(tmp_path: Path):
+    """reviewer.tool 同样受「runner 已接入」校验。"""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    cfg = _make_cfg(
+        tmp_path,
+        [RepoConfig(name="x", path=repo, reviewer={"enabled": True, "tool": "opencode"})],
+    )
+    errs = cfg.validate_runtime()
+    assert len(errs) == 1
+    assert "opencode" in errs[0] and "reviewer.tool" in errs[0]
+
+
 def test_multiple_repos_collect_all_errors(tmp_path: Path):
     bad1 = tmp_path / "bad1"
     bad1.mkdir()

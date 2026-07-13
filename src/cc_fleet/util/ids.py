@@ -15,10 +15,12 @@ from .time import now_local_compact
 #   - 渐进式渲染（claude_session_id 出来后再补 sid；slug 字段在首次 ack 时为
 #     internal slug，plan 拿到可读 slug 后切到 display_slug）
 #   - 兼容历史消息（只有 [session: <slug>] 这种旧格式仍能解析）
+# sid 字符类是 [\w-] 而非 UUID 形的 [0-9a-f-]：claude 的 sid 是自建 UUID，但 codex /
+# opencode 等工具的会话 id 由工具自行分配，可能含大写字母或非 hex 字符，须原样 round-trip。
 SESSION_TAG_PATTERN = re.compile(
     r"\[session:\s*([a-z0-9][a-z0-9-]{2,80})"
     r"(?:\s+@([\w.-]+))?"
-    r"(?:\s+sid:\s*([0-9a-f-]{8,}))?"
+    r"(?:\s+sid:\s*([\w-]{8,}))?"
     r"\s*\]",
     re.IGNORECASE,
 )
@@ -98,7 +100,8 @@ def extract_quote_context(text: str) -> QuoteContext:
         return QuoteContext(
             slug=m.group(1).lower() if m.group(1) else None,
             repo=m.group(2) if m.group(2) else None,
-            claude_session_id=m.group(3).lower() if m.group(3) else None,
+            # sid 不做 .lower()：codex / opencode 的会话 id 可能大小写敏感，须原样保留
+            claude_session_id=m.group(3) if m.group(3) else None,
         )
 
     rm = REPO_ONLY_TAG_PATTERN.search(text)

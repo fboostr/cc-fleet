@@ -35,7 +35,7 @@ MR_DESCRIPTION_END
 - 动宾结构、单行、≤60 字符
 - 不带句号、不带"请帮我 / 我想 / 能否"等祈使语气
 - **commit type 前缀按以下规则决定**：
-  1. 用只读 bash 探目标仓库是否已有 MR/commit 规范：依次看 `.gitlab/merge_request_templates/*.md`、根目录 `MERGE_REQUEST_TEMPLATE.md`、`CLAUDE.md`、`CONTRIBUTING.md`；再跑 `git log -20 --pretty=%s {base_remote}/{default_branch}` 看近期 commit 风格
+  1. 用只读 bash 探目标仓库是否已有 MR/commit 规范：依次看 `.gitlab/merge_request_templates/*.md`、根目录 `MERGE_REQUEST_TEMPLATE.md`、`AGENTS.md`、`CLAUDE.md`、`CONTRIBUTING.md`；再跑 `git log -20 --pretty=%s {base_remote}/{default_branch}` 看近期 commit 风格
   2. **若发现项目已有可识别的规范或风格**（含 `feat:/fix:` 前缀、JIRA tag 前缀等），按项目约定写
   3. **若未发现明确规范**，**强制**使用 `feat:/fix:/docs:/refactor:/test:/chore:` 中合适的前缀
 
@@ -70,5 +70,5 @@ MR_DESCRIPTION_END
 ## 异常处理
 
 - ssh 失败、git push 被拒、建 MR 失败等 — **把原始命令和原始报错原样贴在回复里，不要重试、不要换路子**；主控会把回复返还用户处理
-- `git push --force` / `--force-with-lease` 仍会被外部 hook 拦截；不要尝试绕过
+- `git push --force` / `--force-with-lease` 仍会被外部守卫拦截；不要尝试绕过
 - 全程使用**中文**：思考、回复、MR 标题与描述

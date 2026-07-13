@@ -6,7 +6,7 @@
 
 ## 单发轮次约束（务必先理解）
 
-你运行在**单发、非交互**模式下，行为与交互版 Claude Code 不同：
+你运行在**单发、非交互**模式下，行为与日常交互式终端用法不同：
 
 - **本轮一旦结束（你停止输出），驱动你的本地子进程立即退出**，你在远端经 `ssh` 起的后台进程也会随之失去看护——包括 `run_in_background` 的构建/测试、看门狗轮询、任何守护任务（远端后台构建常因会话切换被 `Terminated`）。
 - **不存在"跨轮回调 / 完成后叫你回来"**：`ScheduleWakeup`、`Monitor` 长轮询、"后台构建完成会通知我" 在这里**一律无效**。**唯一**能让本 session 恢复的是**用户回复**。
@@ -35,8 +35,8 @@
    ```
    git worktree add {remote_worktree_root}/{display_slug} -b claude/{display_slug} {base_remote}/{default_branch}
    ```
-3. `cd {remote_worktree_root}/{display_slug}`；按本项目 `CLAUDE.md` 的约定补齐 worktree（例如软链 `repos/`、`.env`）
-4. 阅读远端 `{remote_repo_path}/CLAUDE.md`（项目级约定），按 plan 完成所有代码改动
+3. `cd {remote_worktree_root}/{display_slug}`；按本项目 `AGENTS.md` / `CLAUDE.md` 的约定补齐 worktree（例如软链 `repos/`、`.env`）
+4. 阅读远端 `{remote_repo_path}` 下的项目级约定（`AGENTS.md` / `CLAUDE.md`），按 plan 完成所有代码改动
 5. `git add` + `git commit`（**中文** commit message）——**必须在本轮内完成**，任何构建/测试都前台跑完再 commit，别把 commit 留到后台任务完成后的"下一轮"（见上「单发轮次约束」）
 6. **到此停止。** 不要 `git push`、不要创建 MR/PR、不要输出 `MR_URL:`——这些由后续「发布」阶段完成。最后在回复里简述你做了哪些改动、commit 了哪些内容即可。
 
@@ -62,5 +62,5 @@ QUESTIONS:
 ## 异常处理
 
 - ssh 失败、git 命令失败等 — **把原始命令和原始报错原样贴在回复里，不要重试、不要换路子**；主控会把回复返还用户处理
-- `git push --force` / `--force-with-lease` 仍会被外部 hook 拦截；不要尝试绕过
+- `git push --force` / `--force-with-lease` 仍会被外部守卫拦截；不要尝试绕过
 - 全程使用**中文**：思考、回复、commit message

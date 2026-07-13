@@ -33,6 +33,28 @@ def test_reviewer_tool_parses_from_string(tmp_path: Path):
     assert rc.reviewer.tool is AgentTool.CLAUDE
 
 
+def test_agent_tool_enum_has_codex_and_opencode():
+    """枚举插槽已开：codex / opencode 可从字符串解析（runner 接入与否由 validate_runtime 把关）。"""
+    assert AgentTool("codex") is AgentTool.CODEX
+    assert AgentTool("opencode") is AgentTool.OPENCODE
+
+
+def test_agent_config_maps_tool_to_block(tmp_path: Path):
+    """AppConfig.agent_config 按工具取对应配置块，默认 binary 与工具同名。"""
+    cfg = AppConfig(
+        workspace_root=tmp_path / "ws",
+        log_dir=tmp_path / "logs",
+        db_path=tmp_path / "state.db",
+        wecom={"bot_id": "x", "bot_secret": "y"},
+        repos=[{"name": "x", "path": str(tmp_path)}],
+    )
+    assert cfg.agent_config(AgentTool.CLAUDE) is cfg.claude
+    assert cfg.agent_config(AgentTool.CODEX) is cfg.codex
+    assert cfg.agent_config(AgentTool.OPENCODE) is cfg.opencode
+    assert cfg.codex.binary == "codex" and cfg.codex.model is None
+    assert cfg.opencode.binary == "opencode" and cfg.opencode.model is None
+
+
 def test_migrated_timeout_in_claude_section_raises(tmp_path: Path):
     """阶段超时 / 澄清轮次已迁到 pipeline 段；旧 claude 段残留这些字段时显式报错（不静默失效）。"""
     raw = {

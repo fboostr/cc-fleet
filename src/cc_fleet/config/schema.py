@@ -40,22 +40,49 @@ class WechatConfig(BaseModel):
 
 
 class AgentTool(str, Enum):
-    """驱动 Coder / Reviewer 的 AI coding 工具。后续新增工具在此注册。"""
+    """驱动 Coder / Reviewer 的 AI coding 工具。后续新增工具在此注册。
+
+    枚举值存在 ≠ runner 已接入：以 ``core/runner_factory.py`` 的 ``SUPPORTED_TOOLS``
+    为准，配置引用未接入的工具会在 ``AppConfig.validate_runtime`` 被启动期拦下。
+    """
 
     CLAUDE = "claude"
-    # 后续阶段在此注册：CODEX = "codex"、OPENCODE = "opencode"
+    CODEX = "codex"
+    OPENCODE = "opencode"
 
 
 class ClaudeConfig(BaseModel):
     """Claude Code 工具的专属配置块。
 
-    与后续 ``CodexConfig`` / ``OpencodeConfig`` 对称——每个 coding agent 一个配置块，
-    都至少有 ``binary``，各自再加工具专属项（如 codex 的 sandbox 档位、登录方式）。
-    目前仅 ``binary`` 是对称占位，后续会被 claude 专属 flag（model、特定 env 等）填实，
-    并非冗余。工具无关的阶段超时 / 澄清轮次见 ``PipelineConfig``。
+    与 ``CodexConfig`` / ``OpencodeConfig`` 对称——每个 coding agent 一个配置块，
+    都至少有 ``binary``，各自再加工具专属项。工具无关的阶段超时 / 澄清轮次见
+    ``PipelineConfig``。
     """
 
     binary: str = "claude"
+
+
+class CodexConfig(BaseModel):
+    """Codex CLI 工具的专属配置块（与 ``ClaudeConfig`` 对称）。
+
+    runner 接入前仅是配置插槽：``agent: codex`` 会被 ``validate_runtime``
+    启动期拦下，直到 ``core/runner_factory.py`` 加上对应分支。
+    """
+
+    binary: str = "codex"
+    # 传给 codex 的模型名（--model）；None 用 codex 自身默认。
+    model: str | None = None
+
+
+class OpencodeConfig(BaseModel):
+    """opencode 工具的专属配置块（与 ``ClaudeConfig`` 对称）。
+
+    runner 接入前仅是配置插槽，同 ``CodexConfig``。
+    """
+
+    binary: str = "opencode"
+    # 传给 opencode 的模型名；None 用 opencode 自身默认。
+    model: str | None = None
 
 
 class StageTimeout(BaseModel):
@@ -344,6 +371,8 @@ class AppConfig(BaseModel):
     wecom: WecomConfig | None = None
     wechat: WechatConfig | None = None
     claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
+    codex: CodexConfig = Field(default_factory=CodexConfig)
+    opencode: OpencodeConfig = Field(default_factory=OpencodeConfig)
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
     repos: list[RepoConfig]
 
@@ -408,6 +437,15 @@ class AppConfig(BaseModel):
                 return repo
         return None
 
+    def agent_config(self, tool: AgentTool) -> ClaudeConfig | CodexConfig | OpencodeConfig:
+        """按工具取对应的配置块（claude → ``self.claude`` 等），供 runner 工厂统一取用。"""
+        blocks: dict[AgentTool, ClaudeConfig | CodexConfig | OpencodeConfig] = {
+            AgentTool.CLAUDE: self.claude,
+            AgentTool.CODEX: self.codex,
+            AgentTool.OPENCODE: self.opencode,
+        }
+        return blocks[tool]
+
     def stage_timeout(
         self, repo: RepoConfig, stage: Literal["plan", "dev", "review"]
     ) -> StageTimeout:
@@ -424,11 +462,23 @@ class AppConfig(BaseModel):
 
         - mode=local 的 path 必须存在，且看起来是 git 仓库（含 `.git` 目录或文件）
         - mode=remote 的 path 必须存在（壳子目录）
+        - agent / reviewer.tool 引用的工具必须已接入 runner（枚举存在但工厂无分支时
+          在此拦下，而不是等运行到工厂才抛 ``ValueError``）
 
         返回错误清单（空表示通过）；caller 用它决定是否拒绝启动。
         """
+        # 延迟 import 避免 config→core 的模块级依赖环（同 StageTimeout.to_policy 先例）。
+        from ..core.runner_factory import SUPPORTED_TOOLS
+
+        supported = "、".join(sorted(t.value for t in SUPPORTED_TOOLS))
         errs: list[str] = []
         for r in self.repos:
+            for field_name, tool in (("agent", r.agent), ("reviewer.tool", r.reviewer.tool)):
+                if tool is not None and tool not in SUPPORTED_TOOLS:
+                    errs.append(
+                        f"repo {r.name!r}: {field_name}={tool.value} 的 runner 尚未接入"
+                        f"（当前支持：{supported}）"
+                    )
             if not r.path.exists():
                 errs.append(f"repo {r.name!r}: path {r.path} 不存在")
                 continue

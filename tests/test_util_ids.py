@@ -39,6 +39,22 @@ def test_extract_quote_context_full():
     assert ctx.claude_session_id == "abcd1234-1111-2222-3333-444455556666"
 
 
+def test_extract_quote_context_non_uuid_sid_roundtrips():
+    """codex / opencode 等工具的会话 id 可能含大写 / 非 hex 字符，须原样 round-trip
+    （不 .lower()、字符类不限于 UUID 形）。"""
+    sid = "Thread_0aB9xYz123"
+    tag = format_session_tag("add-login", repo="feed-web", claude_session_id=sid)
+    ctx = extract_quote_context(f"回执正文\n{tag}")
+    assert ctx.claude_session_id == sid
+
+
+def test_extract_quote_context_uuid_sid_still_works():
+    """claude 的 UUID 形 sid 行为不变（小写原样保留）。"""
+    sid = "abcd1234-1111-2222-3333-444455556666"
+    ctx = extract_quote_context(format_session_tag("add-login", claude_session_id=sid))
+    assert ctx.claude_session_id == sid
+
+
 def test_extract_quote_context_slug_only_legacy():
     """旧格式 [session: foo] 应仍能解析。"""
     ctx = extract_quote_context("blah\n[session: foo]")
