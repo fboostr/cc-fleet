@@ -4,7 +4,7 @@
 
 - 你的 cwd 已经是该需求的专属 git worktree（一个独立分支）
 - **全程使用中文**：思考、回复、commit message、代码注释
-- **只能在 cwd（worktree）内写文件**；写入工作目录外、`force push`、访问 `~/.ssh` 等敏感目录会被外部 hook 拦截
+- **只能在 cwd（worktree）内写文件**；写入工作目录外、`force push`、访问 `~/.ssh` 等敏感目录会被外部守卫或工作目录隔离拦截
 - 完成后必须 `git add` + `git commit`（用清晰的中文 commit message）
 - **不要 push、不要创建 MR** — 主控会负责 push 并自动提 MR
 - 完成时给出一段中文的"完成报告"，说明改动点
@@ -12,7 +12,7 @@
 
 ## 单发轮次约束（务必先理解）
 
-你运行在**单发、非交互**模式下，行为与交互版 Claude Code 不同：
+你运行在**单发、非交互**模式下，行为与日常交互式终端用法不同：
 
 - **本轮一旦结束（你停止输出），你的子进程立即退出**，它派生的一切后台进程会随进程组被杀——包括 `run_in_background` 的构建/测试、看门狗轮询、你起的任何守护任务。
 - **不存在"跨轮回调 / 完成后叫你回来"**：`ScheduleWakeup`、`Monitor` 长轮询、"后台构建完成会通知我" 在这里**一律无效**，不会有人在构建结束时把你唤回续跑。**唯一**能让本 session 恢复的是**用户回复**。
@@ -60,7 +60,7 @@ MR_DESCRIPTION_END
 - 动宾结构、单行、≤60 字符
 - 不带句号、不带"请帮我 / 我想 / 能否"等祈使语气
 - **commit type 前缀按以下规则决定**：
-  1. 用只读 bash 探目标仓库是否已有 MR/commit 规范：依次看 `.gitlab/merge_request_templates/*.md`、根目录 `MERGE_REQUEST_TEMPLATE.md`、`CLAUDE.md`、`CONTRIBUTING.md`；再跑 `git log -20 --pretty=%s origin/<base>` 看近期 commit 风格
+  1. 用只读 bash 探目标仓库是否已有 MR/commit 规范：依次看 `.gitlab/merge_request_templates/*.md`、根目录 `MERGE_REQUEST_TEMPLATE.md`、`AGENTS.md`、`CLAUDE.md`、`CONTRIBUTING.md`；再跑 `git log -20 --pretty=%s origin/<base>` 看近期 commit 风格
   2. **若发现项目已有可识别的规范或风格**（含 `feat:/fix:` 前缀、JIRA tag 前缀等），按项目约定写
   3. **若未发现明确规范**，**强制**使用 `feat:/fix:/docs:/refactor:/test:/chore:` 中合适的前缀（如 `feat: 在 README 顶部新增项目简介行`）
 

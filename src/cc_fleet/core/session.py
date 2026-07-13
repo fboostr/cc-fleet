@@ -64,7 +64,7 @@ import os
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from ..config.schema import AppConfig, RepoConfig
+from ..config.schema import AgentTool, AppConfig, RepoConfig
 from ..storage.db import Database
 from ..util.ids import format_session_tag, new_internal_slug, new_uuid
 from . import mr as mr_module
@@ -133,6 +133,10 @@ class Session:
             if claude_run
             else get_runner(repo_cfg.reviewer.tool or repo_cfg.agent, config)
         )
+        # 是否由工厂解析（非显式注入）。恢复旧 session 时只有工厂解析的 runner 才按行内
+        # 钉住的 agent_tool 重建（见 resume / _pin_runner_to_row），显式注入的保持原样。
+        self._runner_from_factory = runner is None and claude_run is None
+        self._reviewer_from_factory = reviewer_runner is None and claude_run is None
         # 由 SessionManager 注入的 per-repo lock：fetch_default_branch + create_worktree 写
         # `.git/refs/remotes/origin/<default>` 在并发下有 fs 竞争，按 repo 串行规避。
         # None 表示无并发场景（单测、或单仓 + max_concurrent_sessions=1），直接跑。
@@ -220,6 +224,8 @@ class Session:
                     None if review_override is None else int(review_override)
                 ),
                 "origin_chat_slug": origin_chat_slug,
+                # 把创建时刻的工具钉在行上；恢复 / 唤醒经 _agent_tool() 优先读此值
+                "agent_tool": self.repo_cfg.agent.value,
             }
         )
         await self.db.add_message(self.slug, "in", initial_request)
@@ -244,9 +250,28 @@ class Session:
         await self.drive()
 
     async def resume(self, slug: str) -> None:
-        """从已有 slug 加载 row，准备继续驱动。"""
+        """从已有 slug 加载 row，准备继续驱动。
+
+        加载后按行内钉住的 ``agent_tool`` 校准 runner：进行中的会话跨重启不随配置改动
+        换工具（换了会丢工具端会话上下文、resume 不回原会话）。
+        """
         self.slug = slug
         await self._refresh_row()
+        self._pin_runner_to_row()
+
+    def _pin_runner_to_row(self) -> None:
+        """行内 agent_tool 与当前配置不一致时，按行内工具重建工厂解析的 runner。
+
+        只动工厂解析的（显式注入 / 测试 stub 保持原样）；reviewer 仅在「跟随 coder」
+        （``reviewer.tool`` 未配置）时随行内工具走，显式配了 reviewer.tool 则以配置为准。
+        """
+        tool = self._agent_tool()
+        if tool is self.repo_cfg.agent:
+            return
+        if self._runner_from_factory:
+            self.runner = get_runner(tool, self.config)
+        if self._reviewer_from_factory and self.repo_cfg.reviewer.tool is None:
+            self.reviewer_runner = get_runner(tool, self.config)
 
     async def apply_clarification(self, text: str, quote_text: str | None = None) -> bool:
         """同步部分：入 in 消息、设 pending、按 clarify_phase 转回工作态。返回 True 表示已就绪可 drive。
@@ -391,9 +416,13 @@ class Session:
                     await self._fail(f"创建 worktree 失败:{e}")
                     return
 
-        # 保留已分配的 claude_session_id：NEW 阶段中途崩溃 recover 时 sid 可能已有，
-        # 重新生成会丢 claude SDK 端会话上下文（resume_from 续会话依赖此 id 不变）。
-        sid = self.row.get("claude_session_id") or new_uuid()
+        # 会话 id 按工具分「分配式 / 捕获式」：claude 支持 --session-id，预生成 UUID 分配；
+        # codex / opencode 等由工具自行分配 id，这里留空、待首跑成功后从 result.session_id
+        # 捕获（见 _do_planning 的回写）。保留已有的 claude_session_id：NEW 阶段中途崩溃
+        # recover 时 sid 可能已有，重新生成会丢工具端会话上下文（resume_from 依赖此 id 不变）。
+        sid = self.row.get("claude_session_id")
+        if not sid and self._agent_tool() is AgentTool.CLAUDE:
+            sid = new_uuid()
         await self._update(
             worktree_path=str(worktree_path),
             branch=branch,
@@ -441,7 +470,8 @@ class Session:
             cwd=worktree,
             permission=AgentPermission.READ_ONLY,
             protocol_text=_prompt_str("plan_protocol.md"),
-            session_id=self.row["claude_session_id"],
+            # 捕获式工具（codex 等）首跑时行内 sid 尚为空，传空串占位（runner 不使用）
+            session_id=self.row["claude_session_id"] or "",
             resume_from=resume_from,
             guardrail=guardrail,
             timeout=self.config.stage_timeout(self.repo_cfg, "plan").to_policy(),
@@ -464,11 +494,14 @@ class Session:
             await self._fail(format_run_failure(result, "plan"))
             return
 
-        # /dev handoff 首轮 --resume 的是外部（chat）建的会话，claude 可能 fork 出新 id；
-        # 采纳它，否则后续轮会 resume 到陈旧 id。普通 pipeline 首轮走 --session-id 不受影响，
-        # 故以 resumed_handoff 守卫，对普通路径零副作用（与 chat.py:run_turn 同类处理对称）。
+        # 首跑（resume_from=None）或 /dev handoff 首轮，采纳 result.session_id 回写：
+        # - handoff：--resume 外部（chat）建的会话，claude 可能 fork 出新 id，不采纳则后续轮
+        #   resume 到陈旧 id（与 chat.py:run_turn 同类处理对称）；
+        # - 普通首跑：claude 走 --session-id 预分配，回写值恒等、no-op；捕获式工具（codex 等）
+        #   行内 sid 尚为空，在此把工具分配的 id 落库。
+        # 后续 resume 轮（resume_from 非空且非 handoff）不采纳，保持既有行为不变。
         if (
-            resumed_handoff
+            (resumed_handoff or resume_from is None)
             and result.session_id
             and result.session_id != self.row["claude_session_id"]
         ):
@@ -579,7 +612,7 @@ class Session:
             cwd=worktree,
             permission=AgentPermission.WRITE,
             protocol_text=dev_protocol_text,
-            session_id=self.row["claude_session_id"],
+            session_id=self.row["claude_session_id"] or "",
             resume_from=self.row["claude_session_id"],
             guardrail=guardrail,
             timeout=self.config.stage_timeout(self.repo_cfg, "dev").to_policy(),
@@ -714,7 +747,7 @@ class Session:
             cwd=worktree,
             permission=AgentPermission.WRITE,
             protocol_text=publish_protocol_text,
-            session_id=self.row["claude_session_id"],
+            session_id=self.row["claude_session_id"] or "",
             resume_from=self.row["claude_session_id"],
             guardrail=guardrail,
             timeout=self.config.stage_timeout(self.repo_cfg, "dev").to_policy(),
@@ -1217,12 +1250,22 @@ class Session:
             display_slug=self.row.get("display_slug") or self.slug,
         )
 
+    def _agent_tool(self) -> AgentTool:
+        """本 session 使用的 coding 工具。
+
+        优先读行里钉住的 ``agent_tool``（create_row 落库，跨重启不随配置改动漂移）；
+        老数据（列为空）回退当前配置的 ``repo_cfg.agent``。
+        """
+        raw = self.row.get("agent_tool")
+        return AgentTool(raw) if raw else self.repo_cfg.agent
+
     def _tag(self) -> str:
         """嵌入到外发消息末尾的标识符行。
 
-        - slug 优先用 display_slug（claude 给的可读名），回退 internal slug
+        - slug 优先用 display_slug（coding 工具给的可读名），回退 internal slug
         - repo 与 claude_session_id 任一缺位时 format_session_tag 自动省略对应段
-        - 带 sid 是为了机器人异常时用户能 `claude --resume <sid>` 手工兜底
+        - 带 sid 是为了机器人异常时用户能用对应工具的 resume 能力（如 `claude --resume
+          <sid>`）手工兜底
         """
         s = self.row.get("display_slug") or self.slug
         return "\n\n" + format_session_tag(

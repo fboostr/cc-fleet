@@ -117,4 +117,11 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE sessions ADD COLUMN base_remote TEXT NOT NULL DEFAULT 'origin';
     """,
+    # 驱动本 session 的 coding 工具（AgentTool 枚举值，如 'claude'/'codex'/'opencode'）。
+    # create_row 时按当时的 repo.agent 落库，把工具「钉」在会话上：恢复 / 唤醒时优先用行内
+    # 值重建 runner，避免两次运行之间改配置导致进行中的会话被换工具（会丢工具端会话上下文）。
+    # 老 row / NULL 回退当前配置的 repo.agent，行为与改动前完全一致。
+    """
+    ALTER TABLE sessions ADD COLUMN agent_tool TEXT;
+    """,
 ]
