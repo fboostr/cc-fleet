@@ -11,6 +11,7 @@ claude 的解析见 ``claude.py`` 的 ``ClaudeInterpreter``；后续 codex/openc
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -330,73 +331,90 @@ async def run_subprocess(
     loop = asyncio.get_running_loop()
     activity = _ActivityTracker(loop.time)
     events: list[dict] = []
+    # 提前置空，供 finally 在任一步抛错 / 协程被取消时统一回收。
+    stdout_task: asyncio.Task | None = None
+    stderr_task: asyncio.Task | None = None
+    wait_task: asyncio.Future[int | None] | None = None
 
-    stdout_task = asyncio.create_task(
-        _read_stream_json(proc.stdout, stream_log_path, events, on_event, interpreter, activity)
-    )
-    stderr_task = asyncio.create_task(_read_stderr(proc.stderr))
-
-    # prompt 经 stdin 写入。必须在 stdout reader task 已就绪后再写：大 prompt 写入时
-    # 子进程会同时往 stdout 回吐，不并发 drain stdout 会双方互等死锁。_escape_leading_slash
-    # 兜底仍保留——leading-`/` 在 stdin 模式下也可能被 CLI 当 slash 指令解析。
     try:
-        proc.stdin.write(_escape_leading_slash(stdin_text).encode("utf-8"))
-        await proc.stdin.drain()
-        proc.stdin.close()
-    except (BrokenPipeError, ConnectionResetError):
-        # 子进程在读完 stdin 前已退出（如 flag 错误）；失败根因由 exit_code/stderr 兜住
-        logger.warning("agent stdin 写入中断，子进程可能已提前退出")
-
-    # 监控循环：常驻一个 proc.wait() future，每 _POLL_INTERVAL_SEC 醒来检查空闲 / 绝对
-    # 上限 / 手动终止。用 asyncio.wait(timeout=...) 而非 wait_for——超时只唤醒本轮、不取消
-    # wait_task，下轮复用同一个等待。
-    timeout_kind: TimeoutKind | None = None
-    killed = False
-    start = loop.time()
-    wait_task: asyncio.Future[int | None] = asyncio.ensure_future(proc.wait())
-    while True:
-        done, _ = await asyncio.wait({wait_task}, timeout=_POLL_INTERVAL_SEC)
-        if wait_task in done:
-            exit_code = wait_task.result()  # 进程自然退出
-            break
-        if kill_event is not None and kill_event.is_set():
-            killed = True
-            logger.warning("收到手动终止（kill_event），SIGTERM 杀进程组")
-            exit_code = await _kill_and_reap(proc, wait_task)
-            break
-        timeout_kind = _overrun(
-            now=loop.time(),
-            start=start,
-            last_event_at=activity.last_event_at,
-            in_flight=activity.tool_in_flight,
-            timeout=timeout,
+        stdout_task = asyncio.create_task(
+            _read_stream_json(proc.stdout, stream_log_path, events, on_event, interpreter, activity)
         )
-        if timeout_kind is not None:
-            logger.warning(
-                "agent 被回收（%s 档超时），SIGTERM 杀进程组；idle/tool/hard_cap=%s/%s/%s",
-                timeout_kind,
-                timeout.idle_sec,
-                timeout.tool_sec,
-                timeout.hard_cap_sec,
+        stderr_task = asyncio.create_task(_read_stderr(proc.stderr))
+
+        # prompt 经 stdin 写入。必须在 stdout reader task 已就绪后再写：大 prompt 写入时
+        # 子进程会同时往 stdout 回吐，不并发 drain stdout 会双方互等死锁。_escape_leading_slash
+        # 兜底仍保留——leading-`/` 在 stdin 模式下也可能被 CLI 当 slash 指令解析。
+        try:
+            proc.stdin.write(_escape_leading_slash(stdin_text).encode("utf-8"))
+            await proc.stdin.drain()
+            proc.stdin.close()
+        except (BrokenPipeError, ConnectionResetError):
+            # 子进程在读完 stdin 前已退出（如 flag 错误）；失败根因由 exit_code/stderr 兜住
+            logger.warning("agent stdin 写入中断，子进程可能已提前退出")
+
+        # 监控循环：常驻一个 proc.wait() future，每 _POLL_INTERVAL_SEC 醒来检查空闲 / 绝对
+        # 上限 / 手动终止。用 asyncio.wait(timeout=...) 而非 wait_for——超时只唤醒本轮、不取消
+        # wait_task，下轮复用同一个等待。
+        timeout_kind: TimeoutKind | None = None
+        killed = False
+        start = loop.time()
+        wait_task = asyncio.ensure_future(proc.wait())
+        while True:
+            done, _ = await asyncio.wait({wait_task}, timeout=_POLL_INTERVAL_SEC)
+            if wait_task in done:
+                exit_code = wait_task.result()  # 进程自然退出
+                break
+            if kill_event is not None and kill_event.is_set():
+                killed = True
+                logger.warning("收到手动终止（kill_event），SIGTERM 杀进程组")
+                exit_code = await _kill_and_reap(proc, wait_task)
+                break
+            timeout_kind = _overrun(
+                now=loop.time(),
+                start=start,
+                last_event_at=activity.last_event_at,
+                in_flight=activity.tool_in_flight,
+                timeout=timeout,
             )
-            exit_code = await _kill_and_reap(proc, wait_task)
-            break
+            if timeout_kind is not None:
+                logger.warning(
+                    "agent 被回收（%s 档超时），SIGTERM 杀进程组；idle/tool/hard_cap=%s/%s/%s",
+                    timeout_kind,
+                    timeout.idle_sec,
+                    timeout.tool_sec,
+                    timeout.hard_cap_sec,
+                )
+                exit_code = await _kill_and_reap(proc, wait_task)
+                break
 
-    timed_out = timeout_kind is not None
-    text_output, init_session_id = await stdout_task
-    stderr_tail = await stderr_task
+        timed_out = timeout_kind is not None
+        text_output, init_session_id = await stdout_task
+        stderr_tail = await stderr_task
 
-    result_is_error, error_message = interpreter.terminal_error(events)
+        result_is_error, error_message = interpreter.terminal_error(events)
 
-    return EngineResult(
-        exit_code=exit_code,
-        text_output=text_output,
-        init_session_id=init_session_id,
-        stderr_tail=stderr_tail,
-        timed_out=timed_out,
-        events=events,
-        result_is_error=result_is_error,
-        error_message=error_message,
-        timeout_kind=timeout_kind,
-        killed=killed,
-    )
+        return EngineResult(
+            exit_code=exit_code,
+            text_output=text_output,
+            init_session_id=init_session_id,
+            stderr_tail=stderr_tail,
+            timed_out=timed_out,
+            events=events,
+            result_is_error=result_is_error,
+            error_message=error_message,
+            timeout_kind=timeout_kind,
+            killed=killed,
+        )
+    finally:
+        # 协程被取消（主控 shutdown / cancel）或中途抛异常时的兜底回收：子进程用
+        # start_new_session 自成进程组，不显式回收会变成孤儿继续跑（烧 API/CPU）。
+        # 这里 SIGKILL 整个进程组并收尸，再取消仍在跑的 reader task。正常返回路径下
+        # 进程已退出、task 已 done，全为 no-op。
+        if proc.returncode is None:
+            _terminate_process_tree(proc, signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                await proc.wait()
+        for t in (wait_task, stdout_task, stderr_task):
+            if t is not None and not t.done():
+                t.cancel()

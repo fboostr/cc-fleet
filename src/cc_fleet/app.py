@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import signal
 from datetime import datetime
 
 from .bot.base import BotRunner
@@ -223,6 +225,44 @@ class App:
         else:
             await self._bot.reply(chatid, decision.reason)
 
+    async def _run_until_signal(self) -> None:
+        """跑 bot 长轮询，同时监听 SIGTERM / SIGINT。任一信号到达即返回，让 ``run``
+        的 ``finally`` 走优雅退出（取消 session task → engine 回收 agent 子进程组）。
+
+        不装信号处理器时（如收到 SIGTERM），进程被直接杀死、``finally`` 不执行，正在跑
+        的 agent 子进程会变成孤儿。某些平台 / 非主线程不支持 add_signal_handler，静默降级。
+        """
+        assert self._bot is not None
+        loop = asyncio.get_running_loop()
+        stop = asyncio.Event()
+        installed: list[int] = []
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+                installed.append(sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass
+        bot_task = asyncio.create_task(self._bot.run_forever(), name="bot-run-forever")
+        stop_task = asyncio.create_task(stop.wait(), name="await-signal")
+        try:
+            await asyncio.wait({bot_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+            if bot_task.done() and not bot_task.cancelled():
+                # bot 自己退出（通常是异常）——原样抛出，交给上层记录
+                exc = bot_task.exception()
+                if exc is not None:
+                    raise exc
+            else:
+                logger.info("收到停止信号，开始优雅退出")
+        finally:
+            for sig in installed:
+                with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                    loop.remove_signal_handler(sig)
+            for t in (bot_task, stop_task):
+                if not t.done():
+                    t.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await t
+
     async def run(self) -> None:
         setup_logging(self.config.log_dir)
         await self.db.connect()
@@ -236,7 +276,7 @@ class App:
             self._web = WebServer(self.db, self.config.http, self.config.workspace_root)
             await self._web.start()
             logger.info("cc-fleet 启动")
-            await self._bot.run_forever()
+            await self._run_until_signal()
         finally:
             if self._cleanup_task is not None:
                 self._cleanup_task.cancel()

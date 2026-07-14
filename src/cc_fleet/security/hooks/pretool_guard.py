@@ -31,12 +31,13 @@ from pathlib import Path
 
 # 1. 各种 force push 形态（git 与 push 之间允许 -c xxx=yyy 等任意全局选项）
 #    - git push --force
-#    - git push -f
+#    - git push -f / -uf / -fu（合并短选项里含 f 即代表 force——push 的短选项里只有
+#      -f 表示 force，故任意含 f 的单横杠簇都按 force 拦）
 #    - git push --force-with-lease[=xxx]
 #    - git push origin +ref:ref（refspec 加号前缀代表 force）
 FORCE_PUSH_PATTERNS = [
     re.compile(r"\bgit\b[^\n]*?\bpush\b[^\n]*?--force(?:-with-lease)?(?:\s|=|$)"),
-    re.compile(r"\bgit\b[^\n]*?\bpush\b[^\n]*?\s-f(?:\s|$)"),
+    re.compile(r"\bgit\b[^\n]*?\bpush\b[^\n]*?\s-[a-zA-Z]*f[a-zA-Z]*(?:\s|=|$)"),
     re.compile(r"\bgit\b[^\n]*?\bpush\b[^\n]*?\s\+[^\s:]+:[^\s]+"),
 ]
 
@@ -73,6 +74,36 @@ SAFE_DEVICE_PATHS = frozenset(
 def _is_safe_device(token: str) -> bool:
     """token 是否为安全伪设备 / 标准流（写入无副作用），如 /dev/null、/dev/fd/2。"""
     return token in SAFE_DEVICE_PATHS or token.startswith("/dev/fd/")
+
+
+# 候选写入目标路径 token：绝对路径 `/...`，或 shell 会展开成 home 的 `~/...`
+#（未加引号的 `~/` 在 bash 里展开到 home，同样可能落在 worktree 外）。在剥过
+# heredoc / 引号 / fd-dup 的 sanitized 串上扫描。
+_PATH_TOKEN = re.compile(r"(?<![\w/])~?/[\w./~-]+")
+
+# 「内容本身就是绝对路径」的引号词（引号紧跟 `/`）。sanitize 会把引号整段抹掉以放行
+# push option value 里的 `/healthcheck` 等字面量，但这也让 `rm "/越界/路径"` 这类
+# **把写入目标加了引号**的越界写逃过路径扫描。故对原始命令补扫这类引号词。
+# push option value（内容以 `merge_request.` 等词起头、引号后不是 `/`）不命中，放行不受影响。
+_QUOTED_ABS_PATH = re.compile(r"""(['"])(/[^'"]*)\1""")
+
+# 真正的写命令（区别于 `>`/`>>` 纯重定向运算符）。补扫引号绝对路径时以「确有写命令」为
+# 前提，避免把 `grep "/x" 2>/dev/null` 这类读命令里的引号读参数误当成写目标。
+_WRITE_COMMANDS = re.compile(r"\b(rm|mv|cp|tee|install|chmod|chown|truncate|ln|dd)\b")
+
+# 重定向运算符后紧跟的引号绝对路径（写入目标），如 `> "/越界"` / `>> '/越界'`。
+_REDIRECT_TO_QUOTED_ABS = re.compile(r">>?\s*(['\"])(/[^'\"]*)\1")
+
+
+def _flag_outside_write(token: str, allowed_roots: list[Path]) -> str | None:
+    """单个候选写入目标：安全伪设备放行；绝对（或展开后）越出白名单则返回拦截原因，否则 None。"""
+    token = token.strip()
+    if not token or _is_safe_device(token):
+        return None
+    abs_path = Path(token).expanduser()
+    if abs_path.is_absolute() and not _is_within(abs_path, allowed_roots):
+        return f"禁止在工作目录外写入：{token}"
+    return None
 
 # 识别 heredoc 起始符：<<TAG / <<-TAG / <<'TAG' / <<"TAG" / <<\TAG。
 # 用 (?!<) 排除 here-string (<<<)，后者是单行字面量而非多行 body，不需要剥离。
@@ -269,15 +300,27 @@ def check_bash(command: str, allowed_roots: list[Path]) -> str | None:
     sanitized = _strip_shell_quotes(sanitized)
     sanitized = _strip_fd_dup(sanitized)
     if WRITE_TOKENS.search(sanitized):
-        for token in re.findall(r"(?<![\w/])/[\w./~-]+", sanitized):
-            # /dev/null 等安全伪设备是无副作用的丢弃/标准流目标，重定向到它们（如
-            # `2>/dev/null`）不算越界写入。精确匹配整个 token，`/dev/null/../etc/passwd`
-            # 这类穿越因不等于白名单项、也不以 /dev/fd/ 开头而仍会被拦。
-            if _is_safe_device(token):
-                continue
-            abs_path = Path(token).expanduser()
-            if abs_path.is_absolute() and not _is_within(abs_path, allowed_roots):
-                return f"禁止在工作目录外写入：{token}"
+        # (a) sanitized 里裸露的绝对路径 / 展开后越界的 ~/ 路径。
+        #     /dev/null 等安全伪设备是无副作用的丢弃/标准流目标，重定向到它们（如
+        #     `2>/dev/null`）不算越界写入（helper 内豁免）。`/dev/null/../etc/passwd`
+        #     这类穿越因不等于白名单项、也不以 /dev/fd/ 开头而仍会被拦。
+        for token in _PATH_TOKEN.findall(sanitized):
+            reason = _flag_outside_write(token, allowed_roots)
+            if reason:
+                return reason
+        # (b) 引号内被当作写入目标的绝对路径（sanitize 抹掉引号后 (a) 扫不到）。只在
+        #     「确有写命令」（如 `rm "/x"` / `cp a "/x"`）时补扫全部引号绝对路径；否则
+        #     仅补扫「重定向直接指向引号绝对路径」（如 `> "/x"`）。这样 `grep "/x"
+        #     2>/dev/null` 这类读命令里的引号读参数不会被误判成越界写。
+        if _WRITE_COMMANDS.search(sanitized):
+            for m in _QUOTED_ABS_PATH.finditer(command):
+                reason = _flag_outside_write(m.group(2), allowed_roots)
+                if reason:
+                    return reason
+        for m in _REDIRECT_TO_QUOTED_ABS.finditer(command):
+            reason = _flag_outside_write(m.group(2), allowed_roots)
+            if reason:
+                return reason
     return None
 
 
@@ -287,7 +330,13 @@ def check_file_write(file_path: str, allowed_roots: list[Path]) -> str | None:
         return "缺少 file_path"
     p = Path(file_path).expanduser()
     if not p.is_absolute():
-        # claude 通常把 file_path 给成绝对路径；相对路径默认相对 cwd（= 主 worktree），放行
+        # 相对路径按 cwd（= 主 worktree，白名单首项）解析后再校验：claude 的 cwd 就是
+        # worktree，普通相对路径落在其内可放行，但 `../../x` 这类相对穿越会逃出 worktree，
+        # 不能一律放行。无白名单时无从确定 cwd，维持旧的宽松放行。
+        if not allowed_roots:
+            return None
+        if not _is_within(allowed_roots[0] / p, allowed_roots):
+            return f"禁止在工作目录外写入：{file_path}"
         return None
     if not allowed_roots:
         # 未注入任何白名单，但写的是绝对路径 — 保守起见拒绝
