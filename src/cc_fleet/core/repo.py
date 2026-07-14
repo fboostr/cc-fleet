@@ -184,6 +184,43 @@ async def has_commits_ahead_remote(
         raise GitError(f"ssh {ssh_alias} 远端提交数输出非预期：{out!r}") from e
 
 
+async def head_sha(worktree_path: Path) -> str | None:
+    """worktree 当前 HEAD 的完整 sha；unborn（无任何提交）/ 失败返回 None。
+
+    仅用于 dev 阶段「本轮是否新增 commit」的诊断文案（PARK 通知里区分「本轮有/无新增
+    提交」），**不是**完成判定闸门，故与 ``has_commits_ahead`` 一样对失败容错（返回 None
+    退化到「未知」），绝不因这条诊断查询本身出错影响主流程。
+    """
+    rc, out, _ = await _run_git(worktree_path, "rev-parse", "HEAD")
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
+async def head_sha_remote(ssh_alias: str, remote_worktree: str) -> str:
+    """远端 worktree 当前 HEAD 的 sha（经 SSH 查，remote 模式用）。与 ``head_sha`` 同为
+    诊断用途，但为与 ``has_commits_ahead_remote`` 风格对仗，SSH / git 失败一律抛 ``GitError``
+    （由调用方 ``Session._safe_head_sha`` 兜住并降级为 None，不外溢到主流程）。"""
+    inner = f"cd {shlex.quote(remote_worktree)} && git rev-parse HEAD"
+    proc = await asyncio.create_subprocess_exec(
+        "ssh",
+        ssh_alias,
+        inner,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    out_b, err_b = await _communicate_or_timeout(
+        proc, _DEFAULT_GIT_TIMEOUT_SEC, f"ssh {ssh_alias} 查远端 HEAD"
+    )
+    rc = proc.returncode or 0
+    out = out_b.decode("utf-8", errors="replace").strip()
+    err = err_b.decode("utf-8", errors="replace").strip()
+    if rc != 0:
+        raise GitError(f"ssh {ssh_alias} 查远端 HEAD 失败（rc={rc}）：{err or out}")
+    return out
+
+
 async def has_uncommitted_changes(worktree_path: Path) -> bool:
     """worktree 是否有未提交改动（已改未 commit / 已 add 未 commit / 未跟踪新文件）。
 

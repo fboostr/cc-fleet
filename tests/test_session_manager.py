@@ -168,7 +168,7 @@ def _patch_claude_smart(
     monkeypatch: pytest.MonkeyPatch,
     *,
     plan_text: str = "plan ready\n\nSLUG: feat\nSTATUS: READY",
-    dev_text: str = "完成 ✅",
+    dev_text: str = "完成 ✅\n\nSTATUS: READY\n",
 ) -> None:
     """按 permission_mode 路由的 claude stub，并发场景下不会因为全局 call_count 串台。
 
@@ -217,7 +217,7 @@ def _patch_claude_clarification(
             else:
                 text = f"SLUG: {slug}\nSTATUS: READY"
         else:
-            text = "完成 ✅"
+            text = "完成 ✅\n\nSTATUS: READY\n"
         return ClaudeRunResult(
             exit_code=0,
             session_id=sid,
@@ -253,7 +253,7 @@ def _patch_claude_dev_clarification(
             seen_dev.add(sid)
             text = f"STATUS: NEED_CLARIFICATION\nQUESTIONS:\n1. {question}"
         else:
-            text = "完成 ✅"
+            text = "完成 ✅\n\nSTATUS: READY\n"
         return ClaudeRunResult(
             exit_code=0,
             session_id=sid,
@@ -516,7 +516,7 @@ async def test_continue_session_revive_acks_user(db, cfg, reply, replies, monkey
         return ClaudeRunResult(
             exit_code=0,
             session_id=kwargs.get("resume_from") or kwargs["session_id"],
-            text_output="二次开发完成 ✅",
+            text_output="二次开发完成 ✅\n\nSTATUS: READY\n",
             stream_log_path=kwargs["stream_log_path"],
             stderr_tail="",
             timed_out=False,
@@ -595,7 +595,7 @@ async def test_continue_session_revive_ack_includes_queue_position(
         return ClaudeRunResult(
             exit_code=0,
             session_id=sid,
-            text_output="二次开发完成 ✅",
+            text_output="二次开发完成 ✅\n\nSTATUS: READY\n",
             stream_log_path=kwargs["stream_log_path"],
             stderr_tail="",
             timed_out=False,
@@ -694,7 +694,7 @@ async def test_continue_session_revive_ack_no_queue_when_below_limit(
         return ClaudeRunResult(
             exit_code=0,
             session_id=sid,
-            text_output="二次开发完成 ✅",
+            text_output="二次开发完成 ✅\n\nSTATUS: READY\n",
             stream_log_path=kwargs["stream_log_path"],
             stderr_tail="",
             timed_out=False,
@@ -897,7 +897,7 @@ async def test_continue_session_revives_failed_session(db, cfg, reply, replies, 
         return ClaudeRunResult(
             exit_code=0,
             session_id=kwargs.get("resume_from") or kwargs["session_id"],
-            text_output="二次开发完成 ✅",
+            text_output="二次开发完成 ✅\n\nSTATUS: READY\n",
             stream_log_path=kwargs["stream_log_path"],
             stderr_tail="",
             timed_out=False,

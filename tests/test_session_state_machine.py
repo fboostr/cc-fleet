@@ -90,6 +90,12 @@ def stub_git_and_mr(monkeypatch: pytest.MonkeyPatch):
     async def fake_has_uncommitted_changes_remote(_alias: str, _wt: str) -> bool:
         return False
 
+    async def fake_head_sha(_path: Path) -> str | None:
+        return "sha-stub"
+
+    async def fake_head_sha_remote(_alias: str, _wt: str) -> str:
+        return "sha-stub"
+
     async def fake_mr_create(**_kwargs) -> str:
         return "https://gitlab/example/-/merge_requests/42"
 
@@ -101,6 +107,8 @@ def stub_git_and_mr(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         repo_module, "has_uncommitted_changes_remote", fake_has_uncommitted_changes_remote
     )
+    monkeypatch.setattr(repo_module, "head_sha", fake_head_sha)
+    monkeypatch.setattr(repo_module, "head_sha_remote", fake_head_sha_remote)
     monkeypatch.setattr(mr_module, "create_mr_via_push", fake_mr_create)
 
 
@@ -168,7 +176,7 @@ def make_recording_stub(scripted: list[str]) -> tuple[Callable, list[dict]]:
 async def test_happy_path_to_completed(db, cfg, repo_cfg, reply, replies):
     claude_stub = make_claude_stub([
         "plan 完成。\n\nSLUG: add-readme-line\nSTATUS: READY\n",
-        "开发完成，已 commit 并 push。\n",
+        "开发完成，已 commit 并 push。\n\nSTATUS: READY\n",
     ])
     session = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=claude_stub)
     await session.start(initial_request="加一行 readme", chatid="c1", userid="u1")
@@ -193,7 +201,7 @@ async def test_driven_session_writes_readable_session_log(db, cfg, repo_cfg, rep
     验证「一个文件看全」的两半：claude 事件（工具输入/守卫阻断，来自 stream 事件）
     + 主控侧信息（阶段流转、plan 就绪通知，stream.jsonl 里没有）。
     """
-    scripted = ["plan 完成。\n\nSLUG: demo-x\nSTATUS: READY\n", "开发完成，已 push。\n"]
+    scripted = ["plan 完成。\n\nSLUG: demo-x\nSTATUS: READY\n", "开发完成，已 push。\n\nSTATUS: READY\n"]
     calls = {"n": 0}
 
     async def stub(**kwargs) -> ClaudeRunResult:
@@ -261,7 +269,7 @@ async def test_clarification_then_ready(db, cfg, repo_cfg, reply, replies):
         # 用户回复后第二次 plan：ready
         "好的，明确了。\n\nSLUG: add-login\nSTATUS: READY\n",
         # dev
-        "完成 ✅",
+        "完成 ✅\n\nSTATUS: READY\n",
     ])
     session = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=claude_stub)
     await session.start(initial_request="加个登录", chatid="c1", userid="u1")
@@ -325,7 +333,7 @@ async def test_dev_clarification_then_ready(db, cfg, repo_cfg, reply, replies):
         # dev 首轮：需要用户拍板，不 commit
         "我需要你决定。\n\nSTATUS: NEED_CLARIFICATION\nQUESTIONS:\n1. A 还是 B？\n",
         # 用户答复后 dev 二轮：完成
-        "已按你的选择完成开发并 commit。\n",
+        "已按你的选择完成开发并 commit。\n\nSTATUS: READY\n",
     ])
     s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
     await s.start(initial_request="做个 x", chatid="c1", userid="u1")
@@ -392,7 +400,7 @@ async def test_dev_clarification_remote(db, cfg, tmp_path, reply, replies):
         # remote dev 首轮：需要用户决策
         "远端拿不准。\n\nSTATUS: NEED_CLARIFICATION\nQUESTIONS:\n1. A 还是 B？\n",
         # 答复后 dev 二轮：完成开发（有 commit）
-        "已在远端完成开发并 commit。\n",
+        "已在远端完成开发并 commit。\n\nSTATUS: READY\n",
         # publish 阶段：push + MR
         "完成报告：push 完成。\n\nMR_URL: https://gitlab.example/g/r/-/merge_requests/77\n",
     ])
@@ -568,6 +576,9 @@ async def test_remote_happy_path_completed(db, cfg, tmp_path, reply, replies):
     repo_cfg = _make_remote_repo_cfg(tmp_path)
     claude_stub = make_claude_stub([
         "plan ready\n\nSLUG: add-pipeline\nSTATUS: READY\n",
+        # remote：dev 只 commit，须显式声明完成
+        "已在远端完成开发并 commit。\n\nSTATUS: READY\n",
+        # publish 阶段：push + 建 MR
         "完成报告：在远端建了 worktree、改了代码、push 完成。\n\n"
         "MR_URL: https://gitlab.example/group/repo/-/merge_requests/99\n",
     ])
@@ -587,6 +598,9 @@ async def test_remote_missing_mr_url_fails(db, cfg, tmp_path, reply, replies):
     repo_cfg = _make_remote_repo_cfg(tmp_path)
     claude_stub = make_claude_stub([
         "SLUG: foo-bar\nSTATUS: READY",
+        # remote dev：只 commit 并声明完成
+        "已在远端完成开发并 commit。\n\nSTATUS: READY\n",
+        # publish：忘了输出 MR_URL → 失败
         "完成了，但忘了输出 MR URL。",
     ])
     s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=claude_stub)
@@ -641,7 +655,7 @@ async def test_mr_failure_fails_session(db, cfg, repo_cfg, reply, replies, monke
 
     claude_stub = make_claude_stub([
         "SLUG: foo-bar\nSTATUS: READY",
-        "完成",
+        "完成\n\nSTATUS: READY\n",
     ])
     s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=claude_stub)
     await s.start(initial_request="x", chatid="c1", userid="u1")
@@ -679,7 +693,7 @@ async def test_followup_failed_in_developing_resumes_developing(
                 timed_out=False,
             )
         else:
-            text = "二次开发完成 ✅"
+            text = "二次开发完成 ✅\n\nSTATUS: READY\n"
         return ClaudeRunResult(
             exit_code=0,
             session_id=kwargs.get("resume_from") or kwargs["session_id"],
@@ -722,7 +736,7 @@ async def test_followup_completed_session_routes_to_developing(
             kwargs,
             "SLUG: tweak-readme\nSTATUS: READY\n"
             if perm_mode(kwargs) == "plan"
-            else "完成 ✅",
+            else "完成 ✅\n\nSTATUS: READY\n",
         )
 
     s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
@@ -762,7 +776,7 @@ async def test_followup_completed_with_operational_request_goes_dev(
         captured_modes.append(mode)
         return fake_result(
             kwargs,
-            "SLUG: fix-http-filters\nSTATUS: READY\n" if mode == "plan" else "完成 ✅",
+            "SLUG: fix-http-filters\nSTATUS: READY\n" if mode == "plan" else "完成 ✅\n\nSTATUS: READY\n",
         )
 
     s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
@@ -1026,6 +1040,7 @@ async def test_mr_metadata_from_claude_protocol(
 
     dev_output = (
         "完成报告：已在 README 顶部新增一行项目简介。\n\n"
+        "STATUS: READY\n\n"
         "MR_TITLE: feat: 在 README 顶部新增项目简介行\n\n"
         "MR_DESCRIPTION_BEGIN\n"
         "## 背景\n"
@@ -1084,7 +1099,7 @@ async def test_mr_metadata_fallback_via_git_log(
 
     claude_stub = make_claude_stub([
         "plan 完成。\n\nSLUG: add-readme-line\nSTATUS: READY\n",
-        "开发完成。（忘了输出 MR 元数据协议）\n",
+        "开发完成。（忘了输出 MR 元数据协议）\n\nSTATUS: READY\n",
     ])
     s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=claude_stub)
     await s.start(initial_request="加一行 readme", chatid="c1", userid="u1")
@@ -1126,7 +1141,7 @@ async def test_mr_metadata_fallback_when_no_commit_log(
 
     claude_stub = make_claude_stub([
         "plan 完成。\n\nSLUG: x-y\nSTATUS: READY\n",
-        "完成。\n",
+        "完成。\n\nSTATUS: READY\n",
     ])
     s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=claude_stub)
     await s.start(initial_request="加一行 readme", chatid="c1", userid="u1")
@@ -1169,6 +1184,13 @@ def make_role_aware_stub(
         publish_texts = [
             "发布完成。\n\nMR_URL: https://gitlab.example/group/repo/-/merge_requests/7\n"
         ]
+    # dev 完成正向信号：主控现在要求 dev 做完必须显式输出 STATUS: READY，否则挂起等确认。
+    # helper 默认模拟「合规的已完成 dev 轮」——给每条 dev_text 补 STATUS: READY（除非已显式
+    # 含 STATUS 行，如个别用例要测 NEED_CLARIFICATION）。
+    dev_texts = [
+        t if "STATUS:" in t else (t.rstrip("\n") + "\n\nSTATUS: READY\n")
+        for t in dev_texts
+    ]
     counters = {"plan": 0, "review": 0, "dev": 0, "publish": 0}
     calls: list[dict] = []
 
@@ -1307,7 +1329,11 @@ async def test_reviewer_failure_is_skipped(db, cfg, reply, replies):
         on_event = kwargs.get("on_event")
         if on_event is not None and "reviewer" in getattr(on_event, "__name__", ""):
             raise RuntimeError("reviewer 子进程崩了")
-        text = "SLUG: foo-bar\nSTATUS: READY\n" if perm_mode(kwargs) == "plan" else "完成 ✅"
+        text = (
+            "SLUG: foo-bar\nSTATUS: READY\n"
+            if perm_mode(kwargs) == "plan"
+            else "完成 ✅\n\nSTATUS: READY\n"
+        )
         return fake_result(kwargs, text)
 
     s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
@@ -1560,7 +1586,7 @@ async def test_remote_code_review_failure_skips_to_publish(db, cfg, tmp_path, re
         elif perm_mode(kwargs) == "plan":
             text = "SLUG: add-w\nSTATUS: READY\n"
         else:
-            text = "已 commit。\n"
+            text = "已 commit。\n\nSTATUS: READY\n"
         return fake_result(kwargs, text)
 
     s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
@@ -1715,7 +1741,7 @@ async def test_plan_review_skip_reports_length_reason(db, cfg, reply, replies):
         text = (
             "初版 plan。\n\nSLUG: foo-bar\nSTATUS: READY\n"
             if perm_mode(kwargs) == "plan"
-            else "开发完成 ✅\n"
+            else "开发完成 ✅\n\nSTATUS: READY\n"
         )
         return fake_result(kwargs, text)
 
@@ -1748,7 +1774,7 @@ async def test_worktree_auto_derived_from_repo_path(
 
     claude_stub = make_claude_stub([
         "plan 完成。\n\nSLUG: auto-wt-test\nSTATUS: READY\n",
-        "开发完成 ✅\n",
+        "开发完成 ✅\n\nSTATUS: READY\n",
     ])
     s = Session(db=db, config=cfg, repo_cfg=rc, reply=reply, claude_run=claude_stub)
     await s.start(initial_request="x", chatid="c1", userid="u1")
@@ -1775,7 +1801,7 @@ async def test_worktree_auto_derived_from_fixture_repo(
     tmp_path/repo-worktrees/<slug>。"""
     claude_stub = make_claude_stub([
         "plan 完成。\n\nSLUG: fixture-wt\nSTATUS: READY\n",
-        "开发完成 ✅\n",
+        "开发完成 ✅\n\nSTATUS: READY\n",
     ])
     s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=claude_stub)
     await s.start(initial_request="x", chatid="c1", userid="u1")
@@ -1797,8 +1823,8 @@ async def test_resume_session_with_auto_derived_worktree(
 
     claude_stub = make_claude_stub([
         "plan 完成。\n\nSLUG: resume-auto-test\nSTATUS: READY\n",
-        "开发完成 ✅\n",
-        "再次开发 ✅\n",
+        "开发完成 ✅\n\nSTATUS: READY\n",
+        "再次开发 ✅\n\nSTATUS: READY\n",
     ])
     s = Session(db=db, config=cfg, repo_cfg=rc, reply=reply, claude_run=claude_stub)
     await s.start(initial_request="x", chatid="c1", userid="u1")
@@ -1817,3 +1843,193 @@ async def test_resume_session_with_auto_derived_worktree(
 
     session_dir = cfg.workspace_root / "sessions" / s.slug
     assert session_dir.is_dir()
+
+
+# ---- dev 完成正向信号（STATUS: READY）与「疑似未完成」挂起 ----
+
+
+async def test_dev_ahead_without_ready_parks(db, cfg, repo_cfg, reply, replies):
+    """回归线上 bug：dev 提交了部分成果、但以自然语言「还差 X…还是继续推进剩余部分？」
+    收尾且未输出 STATUS: READY → 不应误判完成，而应挂起（clarify_phase=dev_confirm）
+    等用户确认。"""
+    claude_stub = make_claude_stub([
+        "plan ok\n\nSLUG: add-x\nSTATUS: READY\n",
+        # dev：提交了部分成果，但自然语言提问收尾，没有 STATUS: READY
+        "已暂停。A 模块已落盘并 commit。还差 B、C 模块与文档。还是继续推进剩余部分？",
+    ])
+    s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=claude_stub)
+    await s.start(initial_request="做个 x", chatid="c1", userid="u1")
+
+    row = await db.get_session(s.slug)
+    assert row["state"] == SessionState.AWAITING_USER_CLARIFICATION.value
+    assert row["clarify_phase"] == "dev_confirm"
+    # 不是澄清，不该占用澄清轮数
+    assert row["clarify_rounds"] == 0
+    # 既不是完成也不是失败，也没建 MR
+    assert row["mr_url"] is None
+    # 挂起通知点明「未声明完成」并给「继续 / 完成」恢复入口
+    assert any("未声明完成" in t or "疑似" in t for _, t in replies)
+    assert any("继续" in t and "完成" in t for _, t in replies)
+
+
+async def test_dev_ready_and_ahead_completes(db, cfg, repo_cfg, reply, replies):
+    """dev 输出 STATUS: READY + 有 commit → 正常 COMPLETED（完成正向信号打通）。"""
+    stub = make_claude_stub([
+        "plan ok\n\nSLUG: add-x\nSTATUS: READY\n",
+        "开发完成并 commit。\n\nSTATUS: READY\n",
+    ])
+    s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s.start(initial_request="做个 x", chatid="c1", userid="u1")
+    row = await db.get_session(s.slug)
+    assert row["state"] == SessionState.COMPLETED.value
+    assert row["mr_url"].endswith("/42")
+
+
+async def test_dev_ready_but_no_commit_fails(db, cfg, repo_cfg, reply, replies, monkeypatch):
+    """声明 STATUS: READY 却无任何 commit → FAIL（无提交可发；不因声明完成就放行空 MR）。"""
+    async def fake_no_commits(_path, _base):
+        return False
+    monkeypatch.setattr(repo_module, "has_commits_ahead", fake_no_commits)
+
+    stub = make_claude_stub([
+        "plan ok\n\nSLUG: add-x\nSTATUS: READY\n",
+        "我声明完成了但其实没 commit。\n\nSTATUS: READY\n",
+    ])
+    s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s.start(initial_request="做个 x", chatid="c1", userid="u1")
+    row = await db.get_session(s.slug)
+    assert row["state"] == SessionState.FAILED.value
+    assert "无新 commit" in (row["last_error"] or "")
+
+
+async def test_dev_park_then_continue_completes(db, cfg, repo_cfg, reply, replies):
+    """park →「继续」→ 重跑 dev、这次声明 STATUS: READY → COMPLETED；
+    注入 prompt 用 dev-confirm 专属措辞（区别于澄清回路「待确认问题」）。"""
+    stub, calls = make_recording_stub([
+        "plan ok\n\nSLUG: add-x\nSTATUS: READY\n",
+        "提交了 A，还差 B，继续吗？",                # dev 首轮：有 commit、无 READY → PARK
+        "B 也做完了并 commit。\n\nSTATUS: READY\n",   # dev 二轮：完成
+    ])
+    s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s.start(initial_request="做个 x", chatid="c1", userid="u1")
+    assert (await db.get_session(s.slug))["clarify_phase"] == "dev_confirm"
+
+    s2 = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s2.resume(s.slug)
+    await s2.handle_user_clarification("继续，把 B 补上", quote_text="[session: add-x]")
+
+    row = await db.get_session(s.slug)
+    assert row["state"] == SessionState.COMPLETED.value
+    dev2_prompt = calls[2]["prompt"]
+    assert "没有声明完成" in dev2_prompt
+    assert "继续，把 B 补上" in dev2_prompt
+
+
+async def test_dev_park_continue_no_new_commit_still_completes(db, cfg, repo_cfg, reply, replies):
+    """恢复不死循环关键：park →「继续」→ 模型确认已全部做完、本轮无新 commit（head_sha 不变），
+    只补 STATUS: READY → 仍 COMPLETE（commit-delta 不参与判定，不会因「本轮无新增」再挂起）。"""
+    stub, calls = make_recording_stub([
+        "plan ok\n\nSLUG: add-x\nSTATUS: READY\n",
+        "提交了全部改动，但忘了声明完成。",              # dev 首轮：有 commit、无 READY → PARK
+        "确认已全部做完，无需再改。\n\nSTATUS: READY\n",  # dev 二轮：只补 READY（fixture 下 head_sha 恒定 → 无新 commit）
+    ])
+    s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s.start(initial_request="做个 x", chatid="c1", userid="u1")
+    assert (await db.get_session(s.slug))["clarify_phase"] == "dev_confirm"
+
+    s2 = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s2.resume(s.slug)
+    await s2.handle_user_clarification("继续确认一下", quote_text="[session: add-x]")
+
+    row = await db.get_session(s.slug)
+    assert row["state"] == SessionState.COMPLETED.value
+
+
+async def test_dev_park_then_complete_forces_mr(db, cfg, repo_cfg, reply, replies):
+    """park →「完成」强制路径：绕过再跑 agent，直接建 MR → COMPLETED；claude 不再被调用。"""
+    stub, calls = make_recording_stub([
+        "plan ok\n\nSLUG: add-x\nSTATUS: READY\n",
+        "先把 A 提交了，还差 B。要不要继续？",   # dev：有 commit、无 READY → PARK
+    ])
+    s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s.start(initial_request="做个 x", chatid="c1", userid="u1")
+    assert (await db.get_session(s.slug))["state"] == SessionState.AWAITING_USER_CLARIFICATION.value
+    n_before = len(calls)  # plan + dev = 2
+
+    s2 = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s2.resume(s.slug)
+    await s2.handle_user_clarification("完成", quote_text="[session: add-x]")
+
+    row = await db.get_session(s.slug)
+    assert row["state"] == SessionState.COMPLETED.value
+    assert row["mr_url"].endswith("/42")
+    # 强制路径不再跑 agent（claude 调用次数不变）
+    assert len(calls) == n_before
+
+
+async def test_dev_confirm_does_not_consume_clarify_rounds(db, cfg, repo_cfg, reply, replies):
+    """dev-confirm 挂起不是澄清，多次「继续」都不累加 clarify_rounds、不触发 max 上限 FAIL。"""
+    stub = make_claude_stub([
+        "plan ok\n\nSLUG: add-x\nSTATUS: READY\n",
+        "提交了 A，还差 B。",              # dev 1：PARK
+        "提交了 B，还差 C。",              # dev 2（继续后）：又 PARK
+        "全做完了。\n\nSTATUS: READY\n",   # dev 3（再继续）：完成
+    ])
+    s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s.start(initial_request="做个 x", chatid="c1", userid="u1")
+    row = await db.get_session(s.slug)
+    assert row["state"] == SessionState.AWAITING_USER_CLARIFICATION.value
+    assert row["clarify_rounds"] == 0
+
+    for _ in range(2):  # 连续两轮「继续」（cfg.max_clarify_rounds=2，若被累加会误 FAIL）
+        s2 = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+        await s2.resume(s.slug)
+        await s2.handle_user_clarification("继续")
+
+    row = await db.get_session(s.slug)
+    assert row["state"] == SessionState.COMPLETED.value
+    assert row["clarify_rounds"] == 0
+
+
+async def test_dev_complete_intent_negation_treated_as_continue(db, cfg, repo_cfg, reply, replies):
+    """意图匹配保守偏向继续：「还没完成，继续」含否定/继续词 → 判「继续」重跑 dev，不误 ship。"""
+    stub, calls = make_recording_stub([
+        "plan ok\n\nSLUG: add-x\nSTATUS: READY\n",
+        "提交了 A，还差 B。",             # dev1：PARK
+        "B 补完了。\n\nSTATUS: READY\n",  # dev2：完成
+    ])
+    s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s.start(initial_request="做个 x", chatid="c1", userid="u1")
+    n_before = len(calls)  # 2
+
+    s2 = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s2.resume(s.slug)
+    await s2.handle_user_clarification("还没完成，继续", quote_text="[session: add-x]")
+
+    row = await db.get_session(s.slug)
+    # 判「继续」→ 重跑了一轮 dev（call 数 +1），而非强制建 MR
+    assert len(calls) == n_before + 1
+    assert row["state"] == SessionState.COMPLETED.value
+
+
+async def test_dev_park_remote_symmetry(db, cfg, tmp_path, reply, replies):
+    """remote 对称：dev 无 READY + 远端有 commit → PARK；「完成」→ publish → COMPLETED。"""
+    repo_cfg = _make_remote_repo_cfg(tmp_path)
+    stub = make_claude_stub([
+        "plan ready\n\nSLUG: add-remote-x\nSTATUS: READY\n",
+        "在远端提交了部分改动，还没完全做完。",   # remote dev：无 READY → PARK
+        # publish（「完成」强制路径 reviewer off → MR_SUBMITTING → _do_publish_remote）
+        "已 push 并建 MR。\n\nMR_URL: https://gitlab.example/g/r/-/merge_requests/88\n",
+    ])
+    s = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s.start(initial_request="远端做个 x", chatid="c1", userid="u1")
+    row = await db.get_session(s.slug)
+    assert row["state"] == SessionState.AWAITING_USER_CLARIFICATION.value
+    assert row["clarify_phase"] == "dev_confirm"
+
+    s2 = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=stub)
+    await s2.resume(s.slug)
+    await s2.handle_user_clarification("完成", quote_text="[session: add-remote-x]")
+    row = await db.get_session(s.slug)
+    assert row["state"] == SessionState.COMPLETED.value
+    assert row["mr_url"].endswith("/merge_requests/88")

@@ -93,12 +93,16 @@ def stub_repo_and_mr(monkeypatch: pytest.MonkeyPatch):
     async def fake_has_commits_ahead(_path: Path, _base: str) -> bool:
         return True
 
+    async def fake_head_sha(_path: Path) -> str | None:
+        return "sha-stub"
+
     async def fake_mr_create(**_kwargs) -> str:
         return "https://gitlab/example/-/merge_requests/1"
 
     monkeypatch.setattr(repo_module, "fetch_default_branch", fake_fetch)
     monkeypatch.setattr(repo_module, "create_worktree", fake_create_worktree)
     monkeypatch.setattr(repo_module, "has_commits_ahead", fake_has_commits_ahead)
+    monkeypatch.setattr(repo_module, "head_sha", fake_head_sha)
     monkeypatch.setattr(mr_module, "create_mr_via_push", fake_mr_create)
 
 
@@ -121,7 +125,7 @@ def _patch_pipeline_runner(
     *,
     calls: list | None = None,
     plan_text: str = "plan ready\n\nSLUG: feat\nSTATUS: READY",
-    dev_text: str = "完成 ✅",
+    dev_text: str = "完成 ✅\n\nSTATUS: READY\n",
 ) -> None:
     async def stub(**kwargs) -> ClaudeRunResult:
         if calls is not None:

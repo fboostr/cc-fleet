@@ -17,7 +17,7 @@
 - **需要编译/测试就在本轮内、在远端前台同步跑**（`ssh … '构建命令'` 阻塞等它返回），不要丢后台。主控给了宽松的"工具静默"预算（默认 1 小时，长任务可由用户按 repo 调大），正是为不误杀长编译/长测试。
 - **在本轮结束前完成远端 `git add` + `git commit`**，绝不要把 commit 留到"等某个后台任务完成之后"。
 - 即使依赖的构建在远端环境跑不通（缺驱动/依赖等），也应**先把已完成的源码改动 commit**，并在完成报告里注明该限制——不要让 commit 被一个可能永远跑不通的构建卡住。
-- 任务确实无法在本轮内完成时，走下方澄清协议 `STATUS: NEED_CLARIFICATION` 把决定权交回用户——**不要**默默结束本轮、指望被自动叫回。
+- 任务确实无法在本轮内完成时，走下方澄清协议 `STATUS: NEED_CLARIFICATION` 把决定权交回用户——**不要**默默结束本轮、指望被自动叫回，也**不要**在没做完时输出 `STATUS: READY`。
 
 ## 远端环境（主控注入的占位会展开成实际值）
 
@@ -38,7 +38,7 @@
 3. `cd {remote_worktree_root}/{display_slug}`；按本项目 `AGENTS.md` / `CLAUDE.md` 的约定补齐 worktree（例如软链 `repos/`、`.env`）
 4. 阅读远端 `{remote_repo_path}` 下的项目级约定（`AGENTS.md` / `CLAUDE.md`），按 plan 完成所有代码改动
 5. `git add` + `git commit`（**中文** commit message）——**必须在本轮内完成**，任何构建/测试都前台跑完再 commit，别把 commit 留到后台任务完成后的"下一轮"（见上「单发轮次约束」）
-6. **到此停止。** 不要 `git push`、不要创建 MR/PR、不要输出 `MR_URL:`——这些由后续「发布」阶段完成。最后在回复里简述你做了哪些改动、commit 了哪些内容即可。
+6. **到此停止。** 不要 `git push`、不要创建 MR/PR、不要输出 `MR_URL:`——这些由后续「发布」阶段完成。最后在回复里简述你做了哪些改动、commit 了哪些内容，并在回复末尾输出一行 `STATUS: READY` 作为**本阶段完成信号**（表示"远端代码改动已全部完成并 commit、无更多 dev 工作"）。**缺 `STATUS: READY` 时，即便远端已有新 commit，主控也会判为「疑似未完成」并挂起等你确认**，不会进入审查/发布。remote 模式下 `STATUS: READY` **不**要求随附 MR 元数据（MR 标题/描述与 `MR_URL` 属发布阶段）。
 
 ## 本地 PreToolUse 守卫
 
@@ -58,6 +58,8 @@ QUESTIONS:
 ```
 
 仅在确实阻塞、无法继续时才用；能自行决定就照常开发并在远端 commit。主控会把 session 挂起并通知用户，用户回复后带着答复 resume 让你继续开发。
+
+本轮结束**二选一、互斥**：**完成**＝远端有新 commit + `STATUS: READY`（remote 无需随附 MR 元数据）；**澄清**＝无 commit + `STATUS: NEED_CLARIFICATION` + `QUESTIONS`。两个 `STATUS:` 不得同时出现。
 
 ## 异常处理
 
