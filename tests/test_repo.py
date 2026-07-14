@@ -179,3 +179,48 @@ async def test_has_uncommitted_changes_remote_timeout_raises(monkeypatch: pytest
 
     assert "超时" in str(ei.value)
     assert proc.waited
+
+
+async def test_head_sha_real_git(tmp_path: Path):
+    """真 git：返回当前 HEAD 完整 sha，新 commit 后 sha 变化；非 git 目录 → 容错返回 None。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    await _git(src, "init", "-q", "-b", "main")
+    await _git(src, "config", "user.email", "t@example.com")
+    await _git(src, "config", "user.name", "t")
+    (src / "f.txt").write_text("v1")
+    await _git(src, "add", "-A")
+    await _git(src, "commit", "-qm", "c1")
+
+    sha = await repo.head_sha(src)
+    assert sha and len(sha) == 40  # 完整 sha
+    # 新 commit 后 sha 变化——正是「本轮是否新增 commit」的诊断依据
+    (src / "f.txt").write_text("v2")
+    await _git(src, "commit", "-qam", "c2")
+    sha2 = await repo.head_sha(src)
+    assert sha2 and sha2 != sha
+
+    # 非 git 目录：rev-parse rc!=0 → 容错返回 None（诊断用途，不抛）
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert await repo.head_sha(plain) is None
+
+
+async def test_head_sha_remote_raises_on_ssh_failure(monkeypatch: pytest.MonkeyPatch):
+    """head_sha_remote 的 SSH 调用 rc!=0 → 抛 GitError（由调用方 Session._safe_head_sha 兜住降级）。"""
+
+    class _FailProc:
+        pid = 1
+        returncode = 128
+
+        async def communicate(self):
+            return b"", b"fatal: not a git repository\n"
+
+    async def fake_exec(*_a, **_k):
+        return _FailProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(repo.GitError) as ei:
+        await repo.head_sha_remote("devbox", "/remote/wt")
+    assert "HEAD" in str(ei.value)

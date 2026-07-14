@@ -18,9 +18,12 @@ stateDiagram-v2
     plan_reviewing --> planning: APPROVED（Coder 据可选建议再完善一轮，下次跳过审查）
     plan_reviewing --> developing: 审查失败/跳过
     developing --> awaiting_user_clarification: NEED_CLARIFICATION（clarify_phase=developing）
-    awaiting_user_clarification --> developing: apply_clarification（clarify_phase=developing）
-    developing --> code_reviewing: 已 commit（Reviewer 开启）
-    developing --> mr_submitting: 已 commit（Reviewer 关闭）
+    developing --> awaiting_user_clarification: 有 commit 但未声明 STATUS READY（clarify_phase=dev_confirm）
+    awaiting_user_clarification --> developing: apply_clarification（developing / dev_confirm「继续」）
+    awaiting_user_clarification --> mr_submitting: dev_confirm「完成」（Reviewer 关闭）
+    awaiting_user_clarification --> code_reviewing: dev_confirm「完成」（Reviewer 开启）
+    developing --> code_reviewing: 有 commit + STATUS READY（Reviewer 开启）
+    developing --> mr_submitting: 有 commit + STATUS READY（Reviewer 关闭）
     code_reviewing --> developing: NEEDS_REVISION（计 rounds）
     code_reviewing --> developing: APPROVED（Coder 据可选建议再调整一轮，下次跳过审查）
     code_reviewing --> mr_submitting: 审查失败/跳过
@@ -48,7 +51,7 @@ stateDiagram-v2
 四个集合，注意 `is_open` 与 `is_terminal` **不互补**：
 
 - **WORKING_STATES**：有子进程 / 任务在跑（`new` / `planning` / `plan_reviewing` / `developing` / `code_reviewing` / `mr_submitting`）
-- **AWAITING_USER_CLARIFICATION**：plan 或 dev 阶段 claude 反问用户、等待澄清（来源阶段记在 `clarify_phase`，决定回复后 resume 回 planning 还是 developing）
+- **AWAITING_USER_CLARIFICATION**：plan / dev 阶段 claude 反问用户等待澄清，**或** dev 结束时「有 commit 但未声明 `STATUS: READY`」被判「疑似未完成」而挂起等确认（来源与语义记在 `clarify_phase`：`planning` / `developing` / `dev_confirm`）
 - **RESUMABLE_TERMINAL_STATES**：状态机当前一轮已结，但用户引用 bot 回执回复可以唤醒进入下一轮（`failed` / `timeout` / `completed`）
 - **CANCELLED**：用户已明确放弃，引用回复按"发新需求"对待
 
@@ -86,9 +89,10 @@ RESUMABLE_TERMINAL 同时满足 `is_open=True` 与 `is_terminal=True`。`cancell
 |---|---|---|
 | `planning` | `planning` | plan 阶段澄清（`STATUS: NEED_CLARIFICATION`），复用 plan 澄清回路 |
 | `developing` | `developing` | dev 阶段澄清，答复注入 dev prompt、`--resume` 续跑开发 |
+| `dev_confirm` | `developing`（「继续」）/ `mr_submitting` \| `code_reviewing`（「完成」） | dev「疑似未完成」挂起。回复含「完成」类词 → 强制建 MR（绕过再跑 agent，Reviewer 开则先审）；否则 → 重跑 dev 补完并要求 `STATUS: READY`。意图匹配保守偏向「继续」 |
 | `NULL`（老 row） | `planning` | 向后兼容：改动前 awaiting 只从 plan 来，缺省按 plan 处理 |
 
-进入 awaiting 的每一处都显式写 `clarify_phase`（plan 写 `planning`、dev 写 `developing`），故不会读到陈旧值，也无需在 resume 后清回 NULL。plan 与 dev 澄清**共享** `clarify_rounds` / `max_clarify_rounds`（默认 5）预算——即「一个 session 总共打扰用户几次」的全局上限，超限落 `failed`（`failed_phase` 记当时阶段）。
+进入 awaiting 的每一处都显式写 `clarify_phase`（plan 写 `planning`、dev 澄清写 `developing`、dev「疑似未完成」写 `dev_confirm`），故不会读到陈旧值，也无需在 resume 后清回 NULL。plan 与 dev 澄清**共享** `clarify_rounds` / `max_clarify_rounds`（默认 5）预算——即「一个 session 总共打扰用户几次」的全局上限，超限落 `failed`（`failed_phase` 记当时阶段）。`dev_confirm`（dev「疑似未完成」挂起）**不**占用 `clarify_rounds`——它是「完成确认」而非「反问」，不应被澄清轮数上限枪毙。
 
 ## `completed` 走 `developing` 而非 `planning` 的理由
 
