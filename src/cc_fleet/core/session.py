@@ -62,6 +62,7 @@ import importlib.resources as resources
 import logging
 import os
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -565,10 +566,22 @@ class Session:
             await self._fail("plan 阶段未按协议输出 STATUS 字段，无法继续。")
             return
 
-        # 首次拿到 slug，做冲突解决并存 display_slug
+        # 首次拿到 slug，做冲突解决并存 display_slug。display_slug 有 UNIQUE 约束，
+        # 「查空位」与「写入」之间存在 TOCTOU：两个并发 session 可能都解析到同一个空位，
+        # 后写者撞 UNIQUE 抛 IntegrityError。捕获后重新解析重试（重解析会看到对方已占用
+        # 的 slug 而顺延到 base-2…），避免把本可推进的 session 误判为 FAILED。
         if self.row.get("display_slug") is None and protocol.slug:
-            display = await resolve_slug_conflict(protocol.slug, self.db.display_slug_exists)
-            await self._update(display_slug=display)
+            for _ in range(5):
+                display = await resolve_slug_conflict(
+                    protocol.slug, self.db.display_slug_exists
+                )
+                try:
+                    await self._update(display_slug=display)
+                    break
+                except sqlite3.IntegrityError:
+                    logger.warning(
+                        "session %s display_slug=%s 并发冲突，重新解析", self.slug, display
+                    )
 
         # 把 plan 正文（剥协议尾）落到 sessions/<slug>/plan.md，覆盖上一轮
         plan_path = self._write_plan_md(result.text_output)

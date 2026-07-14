@@ -195,6 +195,47 @@ async def test_happy_path_to_completed(db, cfg, repo_cfg, reply, replies):
     assert any("plan 已就绪" in t and "plan.md" in t for _, t in replies)
 
 
+async def test_display_slug_conflict_retries_on_integrity_error(
+    db, cfg, repo_cfg, reply, monkeypatch
+):
+    """display_slug UNIQUE 冲突（并发 TOCTOU）不再让 session 假失败：捕获 IntegrityError
+    后重解析拿到 -2 后缀继续推进。"""
+    # 预置一个已占用 "add-readme-line" 的竞争 row（模拟并发 session A 已提交）
+    await db.insert_session(
+        {
+            "slug": "rival-session",
+            "display_slug": "add-readme-line",
+            "repo": "demo",
+            "state": SessionState.COMPLETED.value,
+            "default_branch": "main",
+            "initial_request": "rival",
+        }
+    )
+    real_exists = db.display_slug_exists
+    state = {"lied": False}
+
+    async def racy_exists(slug: str) -> bool:
+        # 首次问 base 时假装“空位”（模拟 A 尚未提交时看到的 TOCTOU），触发后写 UNIQUE 冲突；
+        # 之后一律走真实查询（base 已被占用 → 顺延到 -2）。
+        if slug == "add-readme-line" and not state["lied"]:
+            state["lied"] = True
+            return False
+        return await real_exists(slug)
+
+    monkeypatch.setattr(db, "display_slug_exists", racy_exists)
+
+    claude_stub = make_claude_stub([
+        "plan 完成。\n\nSLUG: add-readme-line\nSTATUS: READY\n",
+        "开发完成，已 commit 并 push。\n\nSTATUS: READY\n",
+    ])
+    session = Session(db=db, config=cfg, repo_cfg=repo_cfg, reply=reply, claude_run=claude_stub)
+    await session.start(initial_request="加一行 readme", chatid="c1", userid="u1")
+
+    row = await db.get_session(session.slug)
+    assert row["state"] == SessionState.COMPLETED.value
+    assert row["display_slug"] == "add-readme-line-2"
+
+
 async def test_driven_session_writes_readable_session_log(db, cfg, repo_cfg, reply):
     """驱动一条 session：session.log 落盘，含阶段流转、工具调用/守卫阻断、以及通知。
 

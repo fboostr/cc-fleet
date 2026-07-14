@@ -11,8 +11,21 @@ import asyncio
 import os
 from pathlib import Path
 
+import pytest
+
 from cc_fleet.core.runners.base import TimeoutPolicy
 from cc_fleet.core.runners.engine import _ActivityTracker, _overrun, run_subprocess
+
+
+def _pid_alive(pid: int) -> bool:
+    """POSIX：pid 是否仍存在（signal 0 只做存在性探测，不实际发信号）。"""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 class _FakeInterp:
@@ -177,3 +190,42 @@ async def test_run_subprocess_kill_event_hard_kills(tmp_path: Path):
     assert res.killed is True
     assert res.timed_out is False
     assert res.timeout_kind is None
+
+
+async def test_run_subprocess_kills_process_on_cancel(tmp_path: Path):
+    """协程被取消（主控 shutdown / cancel 触发 task.cancel）时，run_subprocess 的
+    finally 必须杀掉子进程组、不留孤儿。子进程把 pid 写盘，取消后校验它确已消失。"""
+    pidfile = tmp_path / "child.pid"
+    # 写 pid（sh 自身，start_new_session 下即进程组组长）后长睡，不写 stdout：模拟
+    # 正在跑、暂无输出的 agent。
+    argv = ["sh", "-c", f'echo $$ > "{pidfile}"; sleep 30']
+    task = asyncio.create_task(
+        run_subprocess(
+            argv=argv,
+            cwd=tmp_path,
+            stdin_text="",
+            env=os.environ.copy(),
+            timeout=TimeoutPolicy(idle_sec=60, tool_sec=60, hard_cap_sec=60),
+            stream_log_path=tmp_path / "s.jsonl",
+            interpreter=_FakeInterp(),
+        )
+    )
+
+    pid: int | None = None
+    for _ in range(250):
+        await asyncio.sleep(0.02)
+        if pidfile.exists() and pidfile.read_text().strip():
+            pid = int(pidfile.read_text().strip())
+            break
+    assert pid is not None and _pid_alive(pid), "子进程未按预期起来"
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # finally 应已 SIGKILL 进程组并收尸——子进程不应残留
+    for _ in range(250):
+        if not _pid_alive(pid):
+            break
+        await asyncio.sleep(0.02)
+    assert not _pid_alive(pid), f"子进程 {pid} 在取消后仍存活（孤儿泄漏）"

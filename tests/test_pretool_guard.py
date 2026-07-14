@@ -418,3 +418,82 @@ def test_extra_roots_empty_pieces_ignored(
     }
     reason = pretool_guard.evaluate(payload)
     assert reason is not None and "工作目录外" in reason
+
+
+# --- force push 合并短选项（-uf / -fu 等含 f 的单横杠簇）也应拦 ---
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git push -uf origin main",
+        "git push -fu origin main",
+        "git push -vf origin HEAD",
+        "git push -fq origin HEAD",
+    ],
+)
+def test_force_push_combined_short_flags_blocked(command: str, worktree: Path):
+    payload = {"tool_name": "Bash", "tool_input": {"command": command}}
+    reason = pretool_guard.evaluate(payload)
+    assert reason is not None, f"应拦截合并短选项 force push：{command}"
+
+
+def test_set_upstream_without_force_allowed(worktree: Path):
+    # -u（set-upstream）不含 f，正常推送不应被误拦
+    payload = {"tool_name": "Bash", "tool_input": {"command": "git push -u origin feature/x"}}
+    assert pretool_guard.evaluate(payload) is None
+
+
+# --- 把越界写入目标加引号不能绕过“工作目录外禁写” ---
+# 修复点：sanitize 会剥掉引号内容（为放行 push option value 里的 /healthcheck），
+# 但这也让 `rm "/越界/路径"` 逃过路径扫描。守卫现在对原始命令补扫“内容本身就是
+# 绝对路径”的引号词。
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'rm "/tmp/should-not-write"',
+        "cp secret.txt '/etc/cron.d/evil'",
+        'tee "/tmp/outside" <<<x',
+    ],
+)
+def test_quoted_absolute_write_target_blocked(command: str, worktree: Path):
+    payload = {"tool_name": "Bash", "tool_input": {"command": command}}
+    reason = pretool_guard.evaluate(payload)
+    assert reason is not None and "工作目录外" in reason, f"应拦截：{command}"
+
+
+def test_quoted_inside_worktree_write_allowed(worktree: Path):
+    # 引号内是 worktree 内的绝对路径 → 放行（补扫不能误伤合法写）
+    inside = worktree / "sub dir" / "f.txt"
+    payload = {"tool_name": "Bash", "tool_input": {"command": f'tee "{inside}"'}}
+    assert pretool_guard.evaluate(payload) is None
+
+
+def test_tilde_write_outside_worktree_blocked(worktree: Path):
+    # 未加引号的 ~/ 在 bash 里展开到 home（worktree 外）→ 应拦
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": "echo pwned > ~/cc_fleet_guard_probe_outside"},
+    }
+    reason = pretool_guard.evaluate(payload)
+    assert reason is not None and "工作目录外" in reason
+
+
+# --- Write/Edit 相对路径的 ../ 穿越应拦 ---
+
+def test_write_relative_parent_traversal_blocked(worktree: Path):
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {"file_path": "../../etc/evil.txt", "content": "x"},
+    }
+    reason = pretool_guard.evaluate(payload)
+    assert reason is not None and "工作目录外" in reason
+
+
+def test_write_relative_within_worktree_allowed(worktree: Path):
+    # 普通相对子路径仍应放行（相对 cwd=worktree 解析后仍在其内）
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {"file_path": "sub/dir/new.py", "content": "x"},
+    }
+    assert pretool_guard.evaluate(payload) is None

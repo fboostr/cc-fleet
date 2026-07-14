@@ -34,6 +34,11 @@ flowchart LR
 3. `SessionManager(db, config, reply)` —— 持有 semaphore、`_repo_locks`、`_sessions` 字典
 4. `WebServer(db, http_cfg, workspace_root).start()` —— 起 aiohttp 监听 127.0.0.1:8787
 
+装配完成后 `App.run` 在 `_run_until_signal` 里跑 bot 长轮询，同时监听 `SIGTERM` / `SIGINT`：
+任一信号到达即返回、进入 `finally` 优雅退出（取消 session task → `engine.run_subprocess`
+的 `finally` SIGKILL 回收 agent 子进程组），避免收到停止信号时把正在跑的 agent 子进程
+留成孤儿。`SIGKILL` 无法拦截，仍会留下 DB 里的 working 孤儿行（用 `/resume` 拉起）。
+
 主消息流（`App._on_message`）：
 
 1. `dispatcher.classify(msg, config, is_open_session)` 把消息归类。普通消息（无命令/引用/显式
