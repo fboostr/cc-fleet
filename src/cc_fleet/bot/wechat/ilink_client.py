@@ -76,6 +76,9 @@ class IlinkMessage:
 
     - text：拼接后的文本（非文本 item 已忽略，可能为空字符串）
     - context_token：回复该会话必须带回的 token（见 runner 的 _context_tokens）
+    - msg_id：本条入站消息的唯一 id（ilink snowflake 形态）。供 runner 做入站去重——
+      长轮询游标在整批处理成功后才推进，崩溃 / 出站失败重取整批时据此跳过已处理的消息，
+      避免同一需求被重复处理（重复建 session）。缺失时为空串（该条不参与去重）。
     - quote_text：被引用消息文本（旧版 ilink 会内联；新版只给指针，故常为空）
     - ref_create_ms：被引用消息的创建时间戳（ms）。新版 ilink 引用只回传它、不含文本，
       runner 据此按时间戳反查我们发出的 session 标签（见 WechatBotRunner._resolve_ref_by_time）
@@ -85,6 +88,7 @@ class IlinkMessage:
     to_user_id: str
     context_token: str
     text: str
+    msg_id: str = ""
     quote_text: str = ""
     ref_create_ms: int | None = None
     raw: dict = field(default_factory=dict)
@@ -184,6 +188,8 @@ def _parse_message(m: dict) -> IlinkMessage:
         to_user_id=m.get("to_user_id", "") or "",
         context_token=m.get("context_token", "") or "",
         text="".join(texts).strip(),
+        # 顶层 msg_id 为本条消息的唯一 id（与 ref_msg 里回传的 msg_id 同字段名）；缺失留空串。
+        msg_id=str(m.get("msg_id") or ""),
         quote_text=quote,
         ref_create_ms=ref_create_ms,
         raw=m,

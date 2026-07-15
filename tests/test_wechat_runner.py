@@ -73,6 +73,13 @@ def _raw(from_user: str, ctx: str, *texts: str) -> dict:
     }
 
 
+def _raw_id(from_user: str, ctx: str, text: str, msg_id: str) -> dict:
+    """带顶层 msg_id 的入站报文（用于入站去重相关用例）。"""
+    r = _raw(from_user, ctx, text)
+    r["msg_id"] = msg_id
+    return r
+
+
 def _raw_new_quote(from_user: str, ctx: str, text: str, ref_create_ms: int) -> dict:
     """新版 ilink 引用报文（照抄真机结构）：ref_msg.message_item 只有 msg_id +
     create_time_ms，不含被引用文本。用于验证「时间戳关联」还原。"""
@@ -617,6 +624,92 @@ async def test_run_forever_does_not_advance_cursor_when_batch_fails(tmp_path, mo
     await runner.run_forever()
     assert runner._cursor == ""
     assert not (tmp_path / "cur.txt").exists()
+
+
+async def test_handle_dedupes_repeated_msg_id(tmp_path):
+    # 同一 msg_id 重投（游标未推进导致整批重取）→ 只处理一次
+    seen: list[str] = []
+
+    async def on_msg(m):
+        seen.append(m.text)
+
+    runner = _runner(tmp_path, on_message=on_msg)
+    runner._client = FakeClient()
+    await runner._handle(_parse_message(_raw_id("alice@im.wechat", "ctx", "需求X", "MID-1")))
+    await runner._handle(_parse_message(_raw_id("alice@im.wechat", "ctx", "需求X", "MID-1")))
+    assert seen == ["需求X"]
+
+
+async def test_handle_swallows_delivery_error_and_marks_processed(tmp_path):
+    # 出站失败（BotDeliveryError）：_handle 不 re-raise（不阻塞游标），且记为已处理→重投跳过
+    calls = {"n": 0}
+
+    async def on_msg(_m):
+        calls["n"] += 1
+        raise BotDeliveryError("ack 发送失败")
+
+    runner = _runner(tmp_path, on_message=on_msg)
+    runner._client = FakeClient()
+    await runner._handle(_parse_message(_raw_id("alice@im.wechat", "ctx", "需求X", "MID-2")))
+    assert calls["n"] == 1  # 未抛
+    await runner._handle(_parse_message(_raw_id("alice@im.wechat", "ctx", "需求X", "MID-2")))
+    assert calls["n"] == 1  # 重投被去重，未二次处理
+
+
+async def test_handle_reraises_non_delivery_error_and_does_not_mark(tmp_path):
+    # 真正的处理失败（非 BotDeliveryError）：re-raise（阻塞游标以便重投重试），不记为已处理
+    calls = {"n": 0}
+
+    async def on_msg(_m):
+        calls["n"] += 1
+        raise RuntimeError("dispatch failed")
+
+    runner = _runner(tmp_path, on_message=on_msg)
+    runner._client = FakeClient()
+    with pytest.raises(RuntimeError):
+        await runner._handle(_parse_message(_raw_id("alice@im.wechat", "ctx", "需求X", "MID-3")))
+    assert not runner._already_processed("MID-3")  # 未标记 → 重投会重试
+
+
+async def test_processed_ids_persist_across_restart(tmp_path):
+    # 已处理记录持久化：新实例（模拟进程重启）从同一文件加载，重投仍被去重
+    seen: list[str] = []
+
+    async def on_msg(m):
+        seen.append(m.text)
+
+    r1 = _runner(tmp_path, on_message=on_msg)
+    r1._client = FakeClient()
+    await r1._handle(_parse_message(_raw_id("alice@im.wechat", "ctx", "需求X", "MID-4")))
+    assert seen == ["需求X"]
+
+    r2 = _runner(tmp_path, on_message=on_msg)
+    r2._client = FakeClient()
+    await r2._handle(_parse_message(_raw_id("alice@im.wechat", "ctx", "需求X", "MID-4")))
+    assert seen == ["需求X"]  # 重启后重投被去重
+
+
+async def test_run_forever_advances_cursor_when_only_delivery_fails(tmp_path):
+    # 仅出站失败（BotDeliveryError）不应阻塞游标——对照 batch_fails 用例的 RuntimeError
+    async def on_msg(_m):
+        raise BotDeliveryError("ack 失败")
+
+    runner = _runner(tmp_path, on_message=on_msg)
+    fake = FakeClient()
+    batch = [_parse_message(_raw_id("alice", "c", "hi", "MID-5"))]
+    n = {"i": 0}
+
+    async def fake_get_updates(_buf):
+        n["i"] += 1
+        if n["i"] == 1:
+            return batch, "buf-1"
+        runner._stop = True
+        return [], runner._cursor
+
+    fake.get_updates = fake_get_updates
+    runner._client = fake
+    await runner.run_forever()
+    assert runner._cursor == "buf-1"
 
 
 def test_cursor_persist_roundtrip(tmp_path):

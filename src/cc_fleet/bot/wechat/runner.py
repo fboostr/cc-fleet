@@ -6,6 +6,11 @@
   from_user_id），故在本层补齐 token（详见 plan 风险 1：token 有效期需联调确认）
 - 收到消息即 best-effort 发一次 typing「正在输入」
 - 长轮询游标 ``get_updates_buf`` 在整批消息处理成功后持久化，避免崩溃丢消息
+- **入站去重**：整批成功后才推进游标是 at-least-once 语义，崩溃 / 出站失败重取整批时
+  会重复投递。据入站 ``msg_id`` 去重（持久化，抗进程重启）跳过已处理的消息，避免同一
+  需求被重复处理（重复建 session）。另：``_on_message`` 只抛 ``BotDeliveryError``（回执
+  发送失败）时按「已处理」对待、不重投——durable 处理已完成，重投只会重复建 session；
+  其它异常（真正的处理失败）仍 re-raise 阻塞游标以便重投重试，不丢消息
 - 内置最小节流：全局最小发送间隔 + 每用户 60s 滑动窗口
 """
 
@@ -44,6 +49,12 @@ _REF_MATCH_TOLERANCE_MS = 5_000
 _OUTBOUND_REF_RETENTION_MS = 30 * 24 * 3600 * 1000
 _OUTBOUND_REF_MAX = 5000
 
+# ── 入站去重 ─────────────────────────────────────────────────
+# 长轮询游标在整批处理成功后才推进（见 run_forever）。崩溃后重启会用未推进的游标重取
+# 上一批（at-least-once），已处理的消息据 msg_id 跳过，避免同一需求被重复处理（重复建
+# session）。已处理 id 持久化到文件以抗进程重启；保留最近 _PROCESSED_MAX 条。
+_PROCESSED_MAX = 5000
+
 
 class WechatBotRunner(BotRunner):
     def __init__(
@@ -55,6 +66,7 @@ class WechatBotRunner(BotRunner):
         on_message: OnMessage,
         cursor_path: Path,
         refs_path: Path | None = None,
+        processed_path: Path | None = None,
     ) -> None:
         super().__init__(on_message=on_message)
         self._allowed = set(allowed_user_ids or [])
@@ -68,6 +80,14 @@ class WechatBotRunner(BotRunner):
             else self._cursor_path.parent / "wechat_outbound_refs.jsonl"
         )
         self._outbound_refs: list[tuple[int, str]] = self._load_outbound_refs()
+        # 已处理入站消息 id（抗重投去重），持久化以抗进程重启。
+        self._processed_path = (
+            Path(processed_path)
+            if processed_path is not None
+            else self._cursor_path.parent / "wechat_processed_msgs.jsonl"
+        )
+        self._processed_ids: list[str] = self._load_processed()
+        self._processed_set: set[str] = set(self._processed_ids)
         # from_user_id → (最近一次 context_token, 捕获时的 monotonic 时刻)。
         # 存捕获时刻是为了在发送时打出 token 年龄，便于判断回复失败是否因 token 过期。
         self._context_tokens: dict[str, tuple[str, float]] = {}
@@ -162,9 +182,73 @@ class WechatBotRunner(BotRunner):
                 best_tag = tag
         return best_tag if best_delta <= _REF_MATCH_TOLERANCE_MS else ""
 
+    # ---------- 入站去重（抗重投）----------
+
+    def _load_processed(self) -> list[str]:
+        """从 jsonl 加载已处理入站消息 id 列表（保序，保留最近 _PROCESSED_MAX 条）。"""
+        ids: list[str] = []
+        try:
+            with self._processed_path.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        mid = str(json.loads(line)["id"])
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    if mid:
+                        ids.append(mid)
+        except FileNotFoundError:
+            return []
+        except Exception:  # noqa: BLE001
+            logger.warning("读取 ilink 已处理消息记录失败，从空开始", exc_info=True)
+            return []
+        if len(ids) > _PROCESSED_MAX:  # 启动时压缩超额历史
+            ids = ids[-_PROCESSED_MAX:]
+            self._rewrite_processed(ids)
+        return ids
+
+    def _rewrite_processed(self, ids: list[str]) -> None:
+        try:
+            self._processed_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._processed_path.open("w", encoding="utf-8") as f:
+                for mid in ids:
+                    f.write(json.dumps({"id": mid}, ensure_ascii=False) + "\n")
+        except Exception:  # noqa: BLE001
+            logger.warning("重写 ilink 已处理消息记录失败", exc_info=True)
+
+    def _already_processed(self, msg_id: str) -> bool:
+        return bool(msg_id) and msg_id in self._processed_set
+
+    def _mark_processed(self, msg_id: str) -> None:
+        """记一条已处理入站消息 id（内存 + 追加落盘），超额时压缩。"""
+        if not msg_id or msg_id in self._processed_set:
+            return
+        self._processed_ids.append(msg_id)
+        self._processed_set.add(msg_id)
+        if len(self._processed_ids) > _PROCESSED_MAX:
+            self._processed_ids = self._processed_ids[-_PROCESSED_MAX:]
+            self._processed_set = set(self._processed_ids)
+            self._rewrite_processed(self._processed_ids)
+            return
+        try:
+            self._processed_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._processed_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"id": msg_id}, ensure_ascii=False) + "\n")
+        except Exception:  # noqa: BLE001
+            logger.warning("持久化 ilink 已处理消息记录失败", exc_info=True)
+
     # ---------- 收消息 ----------
 
     async def _handle(self, m: IlinkMessage) -> None:
+        # 抗重投去重：整批处理成功后才推进游标，崩溃/出站失败重取整批时，已处理的消息据
+        # msg_id 跳过，避免同一需求被重复处理（重复建 session）。msg_id 缺失则不去重。
+        if self._already_processed(m.msg_id):
+            logger.info(
+                "跳过重复投递的入站消息 msg_id=%s from=%s", m.msg_id, m.from_user_id
+            )
+            return
         try:
             # 完整原始报文，便于排查引用/媒体等结构差异（DEBUG，平时不打）
             logger.debug("ilink inbound 原始报文: %r", m.raw)
@@ -204,9 +288,20 @@ class WechatBotRunner(BotRunner):
                 userid=m.from_user_id,
             )
             await self._on_message(msg)
+        except BotDeliveryError:
+            # 出站 ack/通知发送失败：durable 处理已完成（session 已建 / 消息已注入），
+            # 不能因回执没发出去就让整批重投——那会重复建 session。按「已处理」对待、
+            # 落 msg_id 去重记录、正常返回（不阻塞游标推进）。真正的处理失败走下面的
+            # 分支 raise，仍会阻塞游标以便重投重试（不丢消息）。
+            logger.warning(
+                "出站发送失败，入站消息按已处理对待（不重投）from=%s msg_id=%s",
+                m.from_user_id, m.msg_id or "-",
+            )
         except Exception:  # noqa: BLE001
             logger.exception("处理 ilink 消息失败 from=%s", m.from_user_id)
             raise
+        # 未 re-raise 抵达此处 = 本条已处理（成功，或仅出站失败）→ 记 msg_id，重投时跳过。
+        self._mark_processed(m.msg_id)
 
     async def _maybe_send_typing(self, user_id: str) -> None:
         """best-effort：失败不影响主流程。"""
