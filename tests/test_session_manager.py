@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
@@ -92,6 +93,64 @@ async def test_cleanup_only_removes_expired_completed_or_cancelled_local_worktre
     assert removed == [old_wt.resolve()]
     assert (await db.get_session("old-completed"))["worktree_path"] is None
     assert (await db.get_session("old-failed"))["worktree_path"] == str(failed_wt)
+
+
+async def test_cleanup_skips_chat_sessions_without_error(
+    db, cfg, reply, monkeypatch, caplog
+):
+    """chat 会话共用只读 _chat 或 provisioning 失败时降级回主目录，都不归过期清理管。
+
+    回归点：这类 cancelled chat 行以前每小时命中守卫、刷「越出预期根目录」ERROR。
+    改后它们被提前跳过——不删、worktree_path 原样保留、不产生 ERROR；同批的 pipeline
+    会话仍照常清理，确保过滤没写宽。
+    """
+    cfg.worktree_retention_hours = 1
+    repo = cfg.repos[0]
+    root = repo.path.with_name(repo.path.name + "-worktrees")
+    chat_wt = root / "_chat"          # 共享只读 chat worktree，守卫本就护住
+    pipeline_wt = root / "old-pipeline"
+    chat_wt.mkdir(parents=True)
+    pipeline_wt.mkdir(parents=True)
+    old = (datetime.now().astimezone() - timedelta(hours=2)).isoformat()
+    base = {
+        "display_slug": None,
+        "repo": repo.name,
+        "default_branch": "main",
+        "initial_request": "x",
+        "chatid": "c",
+        "userid": "u",
+        "created_at": old,
+        "updated_at": old,
+    }
+    await db.insert_session(
+        {**base, "slug": "chat-on-chat-wt", "state": "cancelled",
+         "session_kind": "chat", "worktree_path": str(chat_wt)}
+    )
+    await db.insert_session(  # 降级兜底：worktree_path 落在仓库主目录本身
+        {**base, "slug": "chat-degraded", "state": "cancelled",
+         "session_kind": "chat", "worktree_path": str(repo.path)}
+    )
+    await db.insert_session(
+        {**base, "slug": "old-pipeline", "state": "cancelled",
+         "session_kind": "pipeline", "worktree_path": str(pipeline_wt)}
+    )
+    removed: list[Path] = []
+
+    async def fake_remove(_root: Path, path: Path, force: bool = False):
+        assert force is True
+        removed.append(path)
+
+    monkeypatch.setattr(repo_module, "remove_worktree", fake_remove)
+    mgr = SessionManager(db, cfg, reply)
+    with caplog.at_level(logging.ERROR, logger="cc_fleet.core.session_manager"):
+        assert await mgr.cleanup_expired_worktrees() == 1
+    # 只有 pipeline worktree 被清理；两条 chat 会话被跳过、worktree_path 原样保留
+    assert removed == [pipeline_wt.resolve()]
+    assert (await db.get_session("chat-on-chat-wt"))["worktree_path"] == str(chat_wt)
+    assert (await db.get_session("chat-degraded"))["worktree_path"] == str(repo.path)
+    assert (await db.get_session("old-pipeline"))["worktree_path"] is None
+    # 关键：不再对 chat 会话刷「越出预期根目录」ERROR
+    assert not any("越出预期根目录" in r.getMessage() for r in caplog.records)
 
 
 @pytest.fixture
