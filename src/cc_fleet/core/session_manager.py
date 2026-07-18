@@ -757,6 +757,11 @@ class SessionManager:
                 SessionState.CANCELLED.value,
             }:
                 continue
+            # chat 会话共用只读 _chat worktree，或在 _chat provisioning 失败时降级回仓库主目录
+            # 只读运行（chat.py 的 GitError 兜底）。二者都不是「每会话专属、可丢弃」的 worktree，
+            # 不归本清理管；不跳过的话它们会持续命中下方 expected_root/_chat 守卫，每小时刷 ERROR。
+            if row.get("session_kind") == "chat":
+                continue
             raw_path = row.get("worktree_path")
             if not raw_path:
                 continue
@@ -777,6 +782,8 @@ class SessionManager:
             expected_root = repo_cfg.path.with_name(
                 repo_cfg.path.name + "-worktrees"
             ).resolve()
+            # 到这里只剩 pipeline/dev 会话：其 worktree 必在 <repo>-worktrees/<slug> 下。
+            # 若越出预期根目录、或落到共享 _chat，说明记录异常，才值得 ERROR 并拒绝删除。
             if not worktree.is_relative_to(expected_root) or worktree.name == "_chat":
                 logger.error(
                     "session %s worktree=%s 越出预期根目录 %s，拒绝自动清理",
